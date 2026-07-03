@@ -3,23 +3,6 @@ use std::rc::Rc;
 
 use crate::ast::Span;
 
-// ---- Errors -----------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct LexError {
-    pub span: Span,
-    pub kind: LexErrorKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum LexErrorKind {
-    NoDigitsInNumber,
-    NoDigitsInExponent,
-    EndOfInput,
-    UnexpectedCharacter(char),
-    InvalidEscapeSequence(char),
-}
-
 // ---- LiteralNumber ----------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

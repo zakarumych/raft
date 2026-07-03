@@ -1,48 +1,42 @@
 use std::rc::Rc;
 use unicode_ident::{is_xid_continue, is_xid_start};
 
-use crate::ast::{Atom, BinaryOp, Ident, Pattern, PatternKind, RecordPatternField, Span, Spanned, UnaryOp};
-use crate::literal::{LexError, LexErrorKind, Literal};
+use crate::{
+    ast::{
+        Atom, BinaryOp, Expr, ExprKind, ExprRecordField, Ident, Pattern, PatternKind,
+        RecordPatternField, Span, Spanned, Stmt, StmtKind, UnaryOp,
+    },
+    literal::Literal,
+};
 
 #[derive(Debug)]
 pub enum ParseError {
     UnexpectedChar(usize, char),
+    UnexpectedKeyword(usize, Keyword),
     UnexpectedEof(usize),
     ExpectedAtom(usize),
     ExpectedIdent(usize),
-    Literal(LexError),
+    UnexpectedIndent(usize, usize),
+    InvalidAssignmentTarget(usize),
+    NoDigitsInNumber,
+    NoDigitsInExponent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Keyword {
+    Return,
+    If,
+    Else,
+    While,
+    For,
+    Break,
+    Continue,
+    Fn,
+    Def,
+    Let,
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;
-
-// ---- Expr -------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct Expr {
-    pub kind: ExprKind,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub enum ExprKind {
-    Literal(Literal),
-    Ident(Ident),
-    Atom(Atom),
-    List(Vec<Expr>),
-    Record(Vec<ExprRecordField>),
-    Unary(Spanned<UnaryOp>, Box<Expr>),
-    Binary(Box<Expr>, Spanned<BinaryOp>, Box<Expr>),
-    Apply(Box<Expr>, Vec<Expr>),
-    Field(Box<Expr>, Ident),
-    Index(Box<Expr>, Box<Expr>),
-}
-
-#[derive(Debug, Clone)]
-pub struct ExprRecordField {
-    pub key: Ident,
-    pub value: Expr,
-    pub span: Span,
-}
 
 // ---- Stream -----------------------------------------------------------------
 
@@ -82,7 +76,7 @@ impl Iterator for StreamCharIndices<'_> {
 fn parse_escape(
     start: usize,
     mut chars: impl Iterator<Item = (usize, char)>,
-) -> Result<char, LexError> {
+) -> Result<char, ParseError> {
     match chars.next() {
         Some((_, 'n')) => Ok('\n'),
         Some((_, 't')) => Ok('\t'),
@@ -91,14 +85,8 @@ fn parse_escape(
         Some((_, '\'')) => Ok('\''),
         Some((_, '"')) => Ok('"'),
         Some((_, '0')) => Ok('\0'),
-        Some((pos, ch)) => Err(LexError {
-            span: Span::new(start + pos, start + pos + ch.len_utf8()),
-            kind: LexErrorKind::InvalidEscapeSequence(ch),
-        }),
-        None => Err(LexError {
-            span: Span::new(start, start),
-            kind: LexErrorKind::EndOfInput,
-        }),
+        Some((pos, ch)) => Err(ParseError::UnexpectedChar(start + pos, ch)),
+        None => Err(ParseError::UnexpectedEof(start)),
     }
 }
 
@@ -145,6 +133,30 @@ impl<'src> Stream<'src> {
         }
     }
 
+    /// Skip horizontal whitespace and return number of spaces/tabs skipped
+    fn count_indent(&mut self) -> usize {
+        let mut cnt = 0usize;
+        while matches!(self.peek(), Some(' ') | Some('\t')) {
+            let ch = self.advance().unwrap();
+            // treat tab as single indent column for now
+            if ch == '\t' {
+                // Round up to next multiple of 4 spaces (tab stop)
+                cnt = (cnt + 4) & !3;
+            } else {
+                cnt += 1;
+            }
+        }
+        cnt
+    }
+
+    fn is_at_line_start(&self) -> bool {
+        if self.pos == 0 {
+            return true;
+        }
+        // previous char is newline?
+        self.src[..self.pos].chars().rev().next() == Some('\n')
+    }
+
     fn expect_char(&mut self, expected: char) -> Result<(), ParseError> {
         match self.peek() {
             Some(ch) if ch == expected => {
@@ -171,7 +183,40 @@ impl<'src> Stream<'src> {
                 break;
             }
         }
-        Some((name, Span { start, end: self.pos() }))
+        Some((
+            name,
+            Span {
+                start,
+                end: self.pos(),
+            },
+        ))
+    }
+
+    fn parse_keyword(&mut self) -> Option<(Keyword, Span)> {
+        let start = self.pos();
+        if let Some((name, span)) = self.parse_word() {
+            let kw = match name.as_str() {
+                "return" => Some(Keyword::Return),
+                "if" => Some(Keyword::If),
+                "else" => Some(Keyword::Else),
+                "while" => Some(Keyword::While),
+                "for" => Some(Keyword::For),
+                "break" => Some(Keyword::Break),
+                "continue" => Some(Keyword::Continue),
+                "fn" => Some(Keyword::Fn),
+                "def" => Some(Keyword::Def),
+                "let" => Some(Keyword::Let),
+                _ => None,
+            };
+            if let Some(k) = kw {
+                return Some((k, span));
+            } else {
+                // not a keyword -> rollback
+                self.pos = start;
+                return None;
+            }
+        }
+        None
     }
 
     pub fn parse_ident(&mut self) -> ParseResult<Ident> {
@@ -185,6 +230,14 @@ impl<'src> Stream<'src> {
             _ => {}
         }
         let (name, span) = self.parse_word().unwrap();
+        // fail if name is a keyword
+        match name.as_str() {
+            "return" | "if" | "else" | "while" | "for" | "break" | "continue" | "fn" | "def"
+            | "let" => {
+                return Err(ParseError::ExpectedIdent(span.start));
+            }
+            _ => {}
+        }
         Ok(Ident { name, span })
     }
 
@@ -276,9 +329,15 @@ impl<'src> Stream<'src> {
                             }
                             loop {
                                 match chars.next() {
-                                    None => { len = chars.offset(); break; }
+                                    None => {
+                                        len = chars.offset();
+                                        break;
+                                    }
                                     Some((_, ch)) if is_xid_continue(ch) => {}
-                                    Some((pos, _)) => { len = pos; break; }
+                                    Some((pos, _)) => {
+                                        len = pos;
+                                        break;
+                                    }
                                 }
                             }
                             break;
@@ -293,16 +352,10 @@ impl<'src> Stream<'src> {
                 drop(chars);
 
                 if digits == 0 {
-                    return Err(ParseError::Literal(LexError {
-                        span: Span::new(start_pos, start_pos + len),
-                        kind: LexErrorKind::NoDigitsInNumber,
-                    }));
+                    return Err(ParseError::NoDigitsInNumber);
                 }
                 if has_exponent && exponent_digits == 0 {
-                    return Err(ParseError::Literal(LexError {
-                        span: Span::new(start_pos, start_pos + len),
-                        kind: LexErrorKind::NoDigitsInExponent,
-                    }));
+                    return Err(ParseError::NoDigitsInExponent);
                 }
 
                 let repr = Rc::from(self.consume(len));
@@ -326,17 +379,13 @@ impl<'src> Stream<'src> {
                             return Ok(Literal::new_string(repr, Span::new(start_pos, end_pos)));
                         }
                         '\\' => {
-                            parse_escape(pos, chars.by_ref().map(|(p, c)| (p - pos - 1, c)))
-                                .map_err(ParseError::Literal)?;
+                            parse_escape(pos, chars.by_ref().map(|(p, c)| (p - pos - 1, c)))?;
                         }
                         _ => {}
                     }
                 }
 
-                Err(ParseError::Literal(LexError {
-                    span: Span::new(self.pos, self.pos),
-                    kind: LexErrorKind::EndOfInput,
-                }))
+                Err(ParseError::UnexpectedEof(self.pos))
             }
 
             Some(ch) if ch == '\'' || ch.is_ascii_alphabetic() && self.peek2() == Some('\'') => {
@@ -348,21 +397,14 @@ impl<'src> Stream<'src> {
 
                 match chars.next() {
                     Some((pos, '\'')) => {
-                        return Err(ParseError::Literal(LexError {
-                            span: Span::new(start_pos, start_pos + pos + 1),
-                            kind: LexErrorKind::UnexpectedCharacter('\''),
-                        }));
+                        return Err(ParseError::UnexpectedChar(start_pos + pos, '\''));
                     }
                     Some((pos, '\\')) => {
-                        parse_escape(pos, chars.by_ref().map(|(p, c)| (p - pos - 1, c)))
-                            .map_err(ParseError::Literal)?;
+                        parse_escape(pos, chars.by_ref().map(|(p, c)| (p - pos - 1, c)))?;
                     }
                     Some(_) => {}
                     None => {
-                        return Err(ParseError::Literal(LexError {
-                            span: Span::new(start_pos, start_pos),
-                            kind: LexErrorKind::EndOfInput,
-                        }));
+                        return Err(ParseError::UnexpectedEof(start_pos));
                     }
                 }
 
@@ -373,25 +415,13 @@ impl<'src> Stream<'src> {
                         let end_pos = self.pos;
                         Ok(Literal::new_char(repr, Span::new(start_pos, end_pos)))
                     }
-                    Some((pos, c)) => Err(ParseError::Literal(LexError {
-                        span: Span::new(start_pos, start_pos + pos + c.len_utf8()),
-                        kind: LexErrorKind::UnexpectedCharacter(c),
-                    })),
-                    None => Err(ParseError::Literal(LexError {
-                        span: Span::new(start_pos, start_pos),
-                        kind: LexErrorKind::EndOfInput,
-                    })),
+                    Some((pos, c)) => Err(ParseError::UnexpectedChar(start_pos + pos, c)),
+                    None => Err(ParseError::UnexpectedEof(start_pos)),
                 }
             }
 
-            Some(c) => Err(ParseError::Literal(LexError {
-                span: Span::new(start_pos, start_pos + c.len_utf8()),
-                kind: LexErrorKind::UnexpectedCharacter(c),
-            })),
-            None => Err(ParseError::Literal(LexError {
-                span: Span::new(start_pos, start_pos),
-                kind: LexErrorKind::EndOfInput,
-            })),
+            Some(c) => Err(ParseError::UnexpectedChar(self.pos, c)),
+            None => Err(ParseError::UnexpectedEof(self.pos)),
         }
     }
 
@@ -404,7 +434,13 @@ impl<'src> Stream<'src> {
             _ => return None,
         };
         self.advance();
-        Some(Spanned { node: op, span: Span { start, end: self.pos() } })
+        Some(Spanned {
+            node: op,
+            span: Span {
+                start,
+                end: self.pos(),
+            },
+        })
     }
 
     // Multi-char ops advance the first char in the match arm, then fall through
@@ -415,40 +451,363 @@ impl<'src> Stream<'src> {
             ('&', _) => BinaryOp::BitAnd,
             ('|', _) => BinaryOp::BitOr,
             ('^', _) => BinaryOp::BitXor,
-            ('<', Some('<')) => { self.advance(); BinaryOp::Shl }
-            ('>', Some('>')) => { self.advance(); BinaryOp::Shr }
-            ('*', Some('*')) => { self.advance(); BinaryOp::Pow }
+            ('<', Some('<')) => {
+                self.advance();
+                BinaryOp::Shl
+            }
+            ('>', Some('>')) => {
+                self.advance();
+                BinaryOp::Shr
+            }
+            ('*', Some('*')) => {
+                self.advance();
+                BinaryOp::Pow
+            }
             ('*', _) => BinaryOp::Mul,
             ('/', _) => BinaryOp::Div,
             ('+', _) => BinaryOp::Add,
             ('-', _) => BinaryOp::Sub,
-            ('=', Some('=')) => { self.advance(); BinaryOp::Eq }
-            ('!', Some('=')) => { self.advance(); BinaryOp::Ne }
-            ('<', Some('=')) => { self.advance(); BinaryOp::Le }
-            ('>', Some('=')) => { self.advance(); BinaryOp::Ge }
+            ('=', Some('=')) => {
+                self.advance();
+                BinaryOp::Eq
+            }
+            ('!', Some('=')) => {
+                self.advance();
+                BinaryOp::Ne
+            }
+            ('<', Some('=')) => {
+                self.advance();
+                BinaryOp::Le
+            }
+            ('>', Some('=')) => {
+                self.advance();
+                BinaryOp::Ge
+            }
             ('<', _) => BinaryOp::Lt,
             ('>', _) => BinaryOp::Gt,
             _ => return None,
         };
         self.advance();
-        Some(Spanned { node: op, span: Span { start, end: self.pos() } })
+        Some(Spanned {
+            node: op,
+            span: Span {
+                start,
+                end: self.pos(),
+            },
+        })
     }
 
     pub fn parse_pattern(&mut self) -> ParseResult<Pattern> {
         match self.peek() {
             Some('[') => self.parse_list_pattern(),
             Some('{') => self.parse_record_pattern(),
+            _ if self.at_literal() => {
+                let lit = self.parse_literal()?;
+                Ok(Pattern {
+                    span: lit.span(),
+                    kind: PatternKind::Literal(lit),
+                })
+            }
             Some(ch) if ch.is_uppercase() && is_xid_start(ch) => {
                 let atom = self.parse_atom()?;
-                Ok(Pattern { span: atom.span, kind: PatternKind::Atom(atom) })
+                Ok(Pattern {
+                    span: atom.span,
+                    kind: PatternKind::Atom(atom),
+                })
             }
             Some(ch) if is_xid_start(ch) || ch == '_' => {
                 let ident = self.parse_ident()?;
-                Ok(Pattern { span: ident.span, kind: PatternKind::Ident(ident) })
+                Ok(Pattern {
+                    span: ident.span,
+                    kind: PatternKind::Ident(ident),
+                })
             }
             Some(ch) => Err(ParseError::UnexpectedChar(self.pos, ch)),
             None => Err(ParseError::UnexpectedEof(self.pos)),
         }
+    }
+
+    // ---- Statement / Block parsing ----------------------------------------
+
+    /// Parse a single statement at current line. Caller must be positioned at first non-indent char of the line.
+    pub fn parse_simple_stmt(&mut self) -> ParseResult<Stmt> {
+        let start: usize = self.pos;
+
+        // parse left-hand side expression (could be pattern or field/index target)
+        let lhs = self.parse_expr()?;
+        self.skip_whitespace_inline();
+        if self.peek() == Some('=') {
+            // assignment
+            self.advance();
+            self.skip_whitespace_inline();
+            let rhs = self.parse_expr()?;
+            // after rhs, must be newline or EOF
+            self.skip_whitespace_inline();
+
+            // determine assignment type
+            match &lhs.kind {
+                ExprKind::Field(obj, field_ident) => {
+                    let span = Span {
+                        start,
+                        end: self.pos,
+                    };
+                    return Ok(Stmt {
+                        kind: StmtKind::AssignField {
+                            target: obj.clone(),
+                            field: field_ident.clone(),
+                            value: rhs,
+                        },
+                        span,
+                    });
+                }
+                ExprKind::Index(obj, idx) => {
+                    let span = Span {
+                        start,
+                        end: self.pos,
+                    };
+                    return Ok(Stmt {
+                        kind: StmtKind::AssignIndex {
+                            target: obj.clone(),
+                            index: idx.clone(),
+                            value: rhs,
+                        },
+                        span,
+                    });
+                }
+                _ => {
+                    // try convert lhs expr into pattern
+                    if let Some(pat) = self.expr_to_pattern(&lhs) {
+                        let span = Span {
+                            start,
+                            end: self.pos,
+                        };
+                        return Ok(Stmt {
+                            kind: StmtKind::AssignPattern(pat, rhs),
+                            span,
+                        });
+                    } else {
+                        return Err(ParseError::InvalidAssignmentTarget(self.pos));
+                    }
+                }
+            }
+        } else {
+            // expression statement
+            self.skip_whitespace_inline();
+            let span = Span {
+                start,
+                end: self.pos,
+            };
+            Ok(Stmt {
+                kind: StmtKind::Expr(lhs),
+                span,
+            })
+        }
+    }
+
+    fn try_parse_else_branch(&mut self, current_indent: usize) -> ParseResult<Option<Vec<Stmt>>> {
+        if self.peek().is_none() {
+            return Ok(None);
+        }
+
+        let start = self.pos;
+
+        if self.peek() == Some('\n') {
+            self.advance();
+            let indent = self.count_indent();
+
+            if indent < current_indent {
+                // rollback to start of line so caller can see this line
+                self.pos = start;
+                return Ok(None);
+            }
+
+            if indent > current_indent {
+                return Err(ParseError::UnexpectedIndent(self.pos, indent));
+            }
+        }
+
+        if let Some((kw, _)) = self.parse_keyword() {
+            if matches!(kw, Keyword::Else) {
+                self.skip_whitespace_inline();
+                self.expect_char(':')?;
+                self.skip_whitespace_inline();
+                match self.peek() {
+                    Some('\n') => {
+                        self.advance();
+                        let body = self.parse_block(Some(current_indent))?;
+                        return Ok(Some(body));
+                    }
+                    None => return Ok(Some(Vec::new())),
+                    _ => {
+                        let stmt = self.parse_simple_stmt()?;
+                        return Ok(Some(vec![stmt]));
+                    }
+                }
+            } else {
+                self.pos = start;
+                return Ok(None);
+            }
+        } else {
+            self.pos = start;
+            return Ok(None);
+        }
+    }
+
+    /// Parse a single statement at current line. Caller must be positioned at first non-indent char of the line.
+    pub fn parse_stmt(&mut self, current_indent: usize) -> ParseResult<Stmt> {
+        let start: usize = self.pos;
+
+        // check for keyword-first statements (like `return` or `if`)
+        if let Some((kw, span)) = self.parse_keyword() {
+            match kw {
+                Keyword::Return => {
+                    self.skip_whitespace_inline();
+                    // return <expr>
+                    let expr = self.parse_expr()?;
+                    self.skip_whitespace_inline();
+
+                    let span = Span {
+                        start,
+                        end: self.pos,
+                    };
+                    return Ok(Stmt {
+                        kind: StmtKind::Return(expr),
+                        span,
+                    });
+                }
+                Keyword::If => {
+                    // parse condition
+                    self.skip_whitespace_inline();
+                    let cond = self.parse_expr()?;
+                    self.skip_whitespace_inline();
+                    // expect ':'
+                    self.expect_char(':')?;
+                    // after ':' either inline stmt or newline + block
+                    self.skip_whitespace_inline();
+                    match self.peek() {
+                        None => {
+                            return Ok(Stmt {
+                                kind: StmtKind::If {
+                                    cond,
+                                    then_branch: vec![],
+                                    else_branch: None,
+                                },
+                                span: Span {
+                                    start,
+                                    end: self.pos,
+                                },
+                            });
+                        }
+                        Some('\n') => {
+                            self.advance();
+
+                            // block form: consume newline then parse block whose indent must be > current_indent
+                            let then_branch = self.parse_block(Some(current_indent))?;
+                            self.skip_whitespace_inline();
+                            let else_branch = self.try_parse_else_branch(current_indent)?;
+
+                            let span = Span {
+                                start,
+                                end: self.pos,
+                            };
+
+                            return Ok(Stmt {
+                                kind: StmtKind::If {
+                                    cond,
+                                    then_branch,
+                                    else_branch,
+                                },
+                                span,
+                            });
+                        }
+                        _ => {
+                            // inline form: parse single stmt as then_branch
+                            let then_stmt = self.parse_simple_stmt()?;
+                            self.skip_whitespace_inline();
+                            let else_branch = self.try_parse_else_branch(current_indent)?;
+
+                            let span = Span {
+                                start,
+                                end: self.pos,
+                            };
+
+                            return Ok(Stmt {
+                                kind: StmtKind::If {
+                                    cond,
+                                    then_branch: vec![then_stmt],
+                                    else_branch,
+                                },
+                                span,
+                            });
+                        }
+                    }
+                }
+                k => {
+                    return Err(ParseError::UnexpectedKeyword(span.start, k));
+                }
+            }
+        }
+
+        // not a keyword-first stmt: parse simple stmt normally
+        self.parse_simple_stmt()
+    }
+
+    /// Parse sequence of statements where each statement starts at indent == outer_indent.
+    /// Returns when encountering a line with indent < outer_indent or blank line or EOF.
+    pub fn parse_block(&mut self, outer_indent: Option<usize>) -> ParseResult<Vec<Stmt>> {
+        let mut current_indent = None;
+        let mut stmts = Vec::new();
+        loop {
+            // if EOF -> done
+            if self.peek().is_none() {
+                break;
+            }
+
+            let line_start = self.pos;
+
+            // count indentation
+            let indent = self.count_indent();
+
+            // Empty line may have indentation, and it's length does not matter.
+            // We treat it as a blank line and skip it.
+            if self.peek() == Some('\n') {
+                // blank line: skip or continue if last line was also blank
+                self.advance();
+                continue;
+            }
+
+            if let Some(o) = outer_indent {
+                if indent <= o {
+                    // rollback to start of line so caller can see this line
+                    self.pos = line_start;
+                    break;
+                }
+            }
+
+            let current_indent = *current_indent.get_or_insert(indent);
+
+            if indent > current_indent {
+                // unexpected deeper indent without explicit block header
+                return Err(ParseError::UnexpectedIndent(self.pos, indent));
+            }
+
+            // indent == outer_indent: parse statement
+            // Try parse statement; if it fails, assume this line does not belong to block.
+            match self.parse_stmt(indent) {
+                Ok(stmt) => {
+                    stmts.push(stmt);
+                    if self.peek() == Some('\n') {
+                        self.advance();
+                    }
+                }
+                Err(_) => {
+                    // rollback to start of offending line so caller can handle it
+                    self.pos = line_start;
+                    break;
+                }
+            }
+        }
+        Ok(stmts)
     }
 
     fn parse_list_pattern(&mut self) -> ParseResult<Pattern> {
@@ -467,7 +826,13 @@ impl<'src> Stream<'src> {
             }
         }
         self.expect_char(']')?;
-        Ok(Pattern { span: Span { start, end: self.pos }, kind: PatternKind::List(elements) })
+        Ok(Pattern {
+            span: Span {
+                start,
+                end: self.pos,
+            },
+            kind: PatternKind::List(elements),
+        })
     }
 
     fn parse_record_pattern(&mut self) -> ParseResult<Pattern> {
@@ -486,7 +851,13 @@ impl<'src> Stream<'src> {
             }
         }
         self.expect_char('}')?;
-        Ok(Pattern { span: Span { start, end: self.pos }, kind: PatternKind::Record(fields) })
+        Ok(Pattern {
+            span: Span {
+                start,
+                end: self.pos,
+            },
+            kind: PatternKind::Record(fields),
+        })
     }
 
     fn parse_record_pattern_field(&mut self) -> ParseResult<RecordPatternField> {
@@ -499,9 +870,75 @@ impl<'src> Stream<'src> {
             self.parse_pattern()?
         } else {
             // shorthand: { foo } == { foo: foo }
-            Pattern { span: key.span, kind: PatternKind::Ident(key.clone()) }
+            Pattern {
+                span: key.span,
+                kind: PatternKind::Ident(key.clone()),
+            }
         };
-        Ok(RecordPatternField { span: Span { start, end: self.pos }, key, pattern })
+        Ok(RecordPatternField {
+            span: Span {
+                start,
+                end: self.pos,
+            },
+            key,
+            pattern,
+        })
+    }
+
+    fn expr_to_pattern(&self, expr: &Expr) -> Option<Pattern> {
+        match &expr.kind {
+            ExprKind::Ident(i) => Some(Pattern {
+                span: i.span,
+                kind: PatternKind::Ident(i.clone()),
+            }),
+            ExprKind::Atom(a) => Some(Pattern {
+                span: a.span,
+                kind: PatternKind::Atom(a.clone()),
+            }),
+            ExprKind::Literal(lit) => Some(Pattern {
+                span: lit.span(),
+                kind: PatternKind::Literal(lit.clone()),
+            }),
+            ExprKind::List(items) => {
+                let mut pats = Vec::new();
+                for it in items {
+                    if let Some(p) = self.expr_to_pattern(it) {
+                        pats.push(p);
+                    } else {
+                        return None;
+                    }
+                }
+                Some(Pattern {
+                    span: Span {
+                        start: items.first().map(|e| e.span.start).unwrap_or(0),
+                        end: items.last().map(|e| e.span.end).unwrap_or(0),
+                    },
+                    kind: PatternKind::List(pats),
+                })
+            }
+            ExprKind::Record(fields) => {
+                let mut pats = Vec::new();
+                for f in fields {
+                    if let Some(pat) = self.expr_to_pattern(&f.value) {
+                        pats.push(RecordPatternField {
+                            key: f.key.clone(),
+                            pattern: pat,
+                            span: f.span,
+                        });
+                    } else {
+                        return None;
+                    }
+                }
+                Some(Pattern {
+                    span: Span {
+                        start: fields.first().map(|f| f.span.start).unwrap_or(0),
+                        end: fields.last().map(|f| f.span.end).unwrap_or(0),
+                    },
+                    kind: PatternKind::Record(pats),
+                })
+            }
+            _ => None,
+        }
     }
 
     // ---- Expression parsing -------------------------------------------------
@@ -524,7 +961,10 @@ impl<'src> Stream<'src> {
                         op.node.precedence()
                     };
                     let rhs = self.parse_binary(rhs_min)?;
-                    let span = Span { start: lhs.span.start, end: rhs.span.end };
+                    let span = Span {
+                        start: lhs.span.start,
+                        end: rhs.span.end,
+                    };
                     lhs = Expr {
                         kind: ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)),
                         span,
@@ -549,21 +989,38 @@ impl<'src> Stream<'src> {
             if !self.can_start_argument() {
                 break;
             }
-            args.push(self.parse_unary()?);
+
+            let saved = self.pos;
+            if let Ok(arg) = self.parse_unary() {
+                args.push(arg);
+            } else {
+                self.pos = saved;
+                break;
+            }
         }
+
         if args.is_empty() {
             Ok(func)
         } else {
             let end = args.last().unwrap().span.end;
-            Ok(Expr { kind: ExprKind::Apply(Box::new(func), args), span: Span { start, end } })
+            Ok(Expr {
+                kind: ExprKind::Apply(Box::new(func), args),
+                span: Span { start, end },
+            })
         }
     }
 
     fn parse_unary(&mut self) -> ParseResult<Expr> {
         if let Some(op) = self.try_unary_op() {
             let operand = self.parse_unary()?;
-            let span = Span { start: op.span.start, end: operand.span.end };
-            Ok(Expr { kind: ExprKind::Unary(op, Box::new(operand)), span })
+            let span = Span {
+                start: op.span.start,
+                end: operand.span.end,
+            };
+            Ok(Expr {
+                kind: ExprKind::Unary(op, Box::new(operand)),
+                span,
+            })
         } else {
             self.parse_accessor()
         }
@@ -576,8 +1033,14 @@ impl<'src> Stream<'src> {
                 Some('.') => {
                     self.advance();
                     let field = self.parse_ident()?;
-                    let span = Span { start: expr.span.start, end: field.span.end };
-                    expr = Expr { kind: ExprKind::Field(Box::new(expr), field), span };
+                    let span = Span {
+                        start: expr.span.start,
+                        end: field.span.end,
+                    };
+                    expr = Expr {
+                        kind: ExprKind::Field(Box::new(expr), field),
+                        span,
+                    };
                 }
                 Some('[') => {
                     self.advance();
@@ -585,8 +1048,14 @@ impl<'src> Stream<'src> {
                     let index = self.parse_expr()?;
                     self.skip_whitespace_inline();
                     self.expect_char(']')?;
-                    let span = Span { start: expr.span.start, end: self.pos };
-                    expr = Expr { kind: ExprKind::Index(Box::new(expr), Box::new(index)), span };
+                    let span = Span {
+                        start: expr.span.start,
+                        end: self.pos,
+                    };
+                    expr = Expr {
+                        kind: ExprKind::Index(Box::new(expr), Box::new(index)),
+                        span,
+                    };
                 }
                 _ => break,
             }
@@ -603,22 +1072,34 @@ impl<'src> Stream<'src> {
                 let mut expr = self.parse_expr()?;
                 self.skip_whitespace_inline();
                 self.expect_char(')')?;
-                expr.span = Span { start: pos, end: self.pos };
+                expr.span = Span {
+                    start: pos,
+                    end: self.pos,
+                };
                 Ok(expr)
             }
             Some('[') => self.parse_list_expr(),
             Some('{') => self.parse_record_expr(),
             _ if self.at_literal() => {
                 let lit = self.parse_literal()?;
-                Ok(Expr { span: lit.span(), kind: ExprKind::Literal(lit) })
+                Ok(Expr {
+                    span: lit.span(),
+                    kind: ExprKind::Literal(lit),
+                })
             }
             Some(ch) if ch.is_uppercase() && is_xid_start(ch) => {
                 let atom = self.parse_atom()?;
-                Ok(Expr { span: atom.span, kind: ExprKind::Atom(atom) })
+                Ok(Expr {
+                    span: atom.span,
+                    kind: ExprKind::Atom(atom),
+                })
             }
             Some(ch) if is_xid_start(ch) || ch == '_' => {
                 let ident = self.parse_ident()?;
-                Ok(Expr { span: ident.span, kind: ExprKind::Ident(ident) })
+                Ok(Expr {
+                    span: ident.span,
+                    kind: ExprKind::Ident(ident),
+                })
             }
             Some(ch) => Err(ParseError::UnexpectedChar(pos, ch)),
             None => Err(ParseError::UnexpectedEof(pos)),
@@ -641,7 +1122,13 @@ impl<'src> Stream<'src> {
             }
         }
         self.expect_char(']')?;
-        Ok(Expr { kind: ExprKind::List(elements), span: Span { start, end: self.pos } })
+        Ok(Expr {
+            kind: ExprKind::List(elements),
+            span: Span {
+                start,
+                end: self.pos,
+            },
+        })
     }
 
     fn parse_record_expr(&mut self) -> ParseResult<Expr> {
@@ -660,7 +1147,13 @@ impl<'src> Stream<'src> {
             }
         }
         self.expect_char('}')?;
-        Ok(Expr { kind: ExprKind::Record(fields), span: Span { start, end: self.pos } })
+        Ok(Expr {
+            kind: ExprKind::Record(fields),
+            span: Span {
+                start,
+                end: self.pos,
+            },
+        })
     }
 
     fn parse_record_expr_field(&mut self) -> ParseResult<ExprRecordField> {
@@ -670,7 +1163,14 @@ impl<'src> Stream<'src> {
         self.expect_char(':')?;
         self.skip_whitespace_inline();
         let value = self.parse_expr()?;
-        Ok(ExprRecordField { span: Span { start, end: self.pos }, key, value })
+        Ok(ExprRecordField {
+            span: Span {
+                start,
+                end: self.pos,
+            },
+            key,
+            value,
+        })
     }
 
     // `-` is excluded: `f - a` is binary subtraction, not application.
@@ -689,7 +1189,6 @@ impl<'src> Stream<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::BinaryOp;
 
     #[test]
     fn idents() {
@@ -698,7 +1197,10 @@ mod tests {
         assert_eq!(i.span, Span { start: 0, end: 3 });
 
         assert_eq!(Stream::new("_bar").parse_ident().unwrap().name, "_bar");
-        assert_eq!(Stream::new("foo_bar").parse_ident().unwrap().name, "foo_bar");
+        assert_eq!(
+            Stream::new("foo_bar").parse_ident().unwrap().name,
+            "foo_bar"
+        );
         assert_eq!(Stream::new("x1").parse_ident().unwrap().name, "x1");
     }
 
@@ -768,9 +1270,33 @@ mod tests {
 
     #[test]
     fn literal_char_escape() {
-        assert_eq!(Stream::new("'\\n'").parse_literal().unwrap().as_char().unwrap().unescape(), '\n');
-        assert_eq!(Stream::new("'\\t'").parse_literal().unwrap().as_char().unwrap().unescape(), '\t');
-        assert_eq!(Stream::new("'\\\\'").parse_literal().unwrap().as_char().unwrap().unescape(), '\\');
+        assert_eq!(
+            Stream::new("'\\n'")
+                .parse_literal()
+                .unwrap()
+                .as_char()
+                .unwrap()
+                .unescape(),
+            '\n'
+        );
+        assert_eq!(
+            Stream::new("'\\t'")
+                .parse_literal()
+                .unwrap()
+                .as_char()
+                .unwrap()
+                .unescape(),
+            '\t'
+        );
+        assert_eq!(
+            Stream::new("'\\\\'")
+                .parse_literal()
+                .unwrap()
+                .as_char()
+                .unwrap()
+                .unescape(),
+            '\\'
+        );
     }
 
     #[test]
@@ -802,7 +1328,10 @@ mod tests {
     fn unary_ops() {
         assert_eq!(Stream::new("!").try_unary_op().unwrap().node, UnaryOp::Not);
         assert_eq!(Stream::new("-").try_unary_op().unwrap().node, UnaryOp::Neg);
-        assert_eq!(Stream::new("~").try_unary_op().unwrap().node, UnaryOp::BitNot);
+        assert_eq!(
+            Stream::new("~").try_unary_op().unwrap().node,
+            UnaryOp::BitNot
+        );
         assert!(Stream::new("+").try_unary_op().is_none());
     }
 
@@ -863,7 +1392,9 @@ mod tests {
         assert!(matches!(&p.kind, PatternKind::List(els) if els.is_empty()));
 
         let p = Stream::new("[a, b, c]").parse_pattern().unwrap();
-        let PatternKind::List(els) = &p.kind else { panic!() };
+        let PatternKind::List(els) = &p.kind else {
+            panic!()
+        };
         assert_eq!(els.len(), 3);
         assert!(matches!(&els[0].kind, PatternKind::Ident(i) if i.name == "a"));
         assert!(matches!(&els[2].kind, PatternKind::Ident(i) if i.name == "c"));
@@ -878,7 +1409,9 @@ mod tests {
     #[test]
     fn pattern_record_shorthand() {
         let p = Stream::new("{ foo, bar }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else { panic!() };
+        let PatternKind::Record(fields) = &p.kind else {
+            panic!()
+        };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].key.name, "foo");
         assert!(matches!(&fields[0].pattern.kind, PatternKind::Ident(i) if i.name == "foo"));
@@ -888,7 +1421,9 @@ mod tests {
     #[test]
     fn pattern_record_explicit() {
         let p = Stream::new("{ x: foo, y: bar }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else { panic!() };
+        let PatternKind::Record(fields) = &p.kind else {
+            panic!()
+        };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].key.name, "x");
         assert!(matches!(&fields[0].pattern.kind, PatternKind::Ident(i) if i.name == "foo"));
@@ -897,7 +1432,9 @@ mod tests {
     #[test]
     fn pattern_record_nested() {
         let p = Stream::new("{ x: [a, b] }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else { panic!() };
+        let PatternKind::Record(fields) = &p.kind else {
+            panic!()
+        };
         assert!(matches!(&fields[0].pattern.kind, PatternKind::List(_)));
     }
 
@@ -925,7 +1462,9 @@ mod tests {
     #[test]
     fn expr_unary() {
         let e = Stream::new("!a").parse_expr().unwrap();
-        let ExprKind::Unary(op, inner) = &e.kind else { panic!() };
+        let ExprKind::Unary(op, inner) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, UnaryOp::Not);
         assert!(matches!(&inner.kind, ExprKind::Ident(i) if i.name == "a"));
         assert_eq!(e.span, Span::new(0, 2));
@@ -935,7 +1474,9 @@ mod tests {
     fn expr_unary_chain() {
         // !!a = !(!a)
         let e = Stream::new("!!a").parse_expr().unwrap();
-        let ExprKind::Unary(op, inner) = &e.kind else { panic!() };
+        let ExprKind::Unary(op, inner) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, UnaryOp::Not);
         assert!(matches!(&inner.kind, ExprKind::Unary(_, _)));
     }
@@ -943,7 +1484,9 @@ mod tests {
     #[test]
     fn expr_binary_simple() {
         let e = Stream::new("1 + 2").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Add);
         assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
         assert!(matches!(&rhs.kind, ExprKind::Literal(_)));
@@ -954,10 +1497,14 @@ mod tests {
     fn expr_precedence() {
         // 1 + 2 * 3 = 1 + (2 * 3)
         let e = Stream::new("1 + 2 * 3").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Add);
         assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
-        let ExprKind::Binary(_, inner_op, _) = &rhs.kind else { panic!() };
+        let ExprKind::Binary(_, inner_op, _) = &rhs.kind else {
+            panic!()
+        };
         assert_eq!(inner_op.node, BinaryOp::Mul);
     }
 
@@ -965,7 +1512,9 @@ mod tests {
     fn expr_left_assoc() {
         // a - b - c = (a - b) - c
         let e = Stream::new("a - b - c").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Sub);
         assert!(matches!(&lhs.kind, ExprKind::Binary(_, _, _)));
         assert!(matches!(&rhs.kind, ExprKind::Ident(i) if i.name == "c"));
@@ -975,7 +1524,9 @@ mod tests {
     fn expr_right_assoc() {
         // 2 ** 3 ** 4 = 2 ** (3 ** 4)
         let e = Stream::new("2 ** 3 ** 4").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Pow);
         assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
         assert!(matches!(&rhs.kind, ExprKind::Binary(_, _, _)));
@@ -984,7 +1535,9 @@ mod tests {
     #[test]
     fn expr_apply() {
         let e = Stream::new("f a b").parse_expr().unwrap();
-        let ExprKind::Apply(func, args) = &e.kind else { panic!() };
+        let ExprKind::Apply(func, args) = &e.kind else {
+            panic!()
+        };
         assert!(matches!(&func.kind, ExprKind::Ident(i) if i.name == "f"));
         assert_eq!(args.len(), 2);
         assert!(matches!(&args[0].kind, ExprKind::Ident(i) if i.name == "a"));
@@ -995,7 +1548,9 @@ mod tests {
     fn expr_apply_unary_arg() {
         // f !a — ! is unambiguously unary, so it's an argument
         let e = Stream::new("f !a").parse_expr().unwrap();
-        let ExprKind::Apply(_, args) = &e.kind else { panic!() };
+        let ExprKind::Apply(_, args) = &e.kind else {
+            panic!()
+        };
         assert_eq!(args.len(), 1);
         assert!(matches!(&args[0].kind, ExprKind::Unary(op, _) if op.node == UnaryOp::Not));
     }
@@ -1004,7 +1559,9 @@ mod tests {
     fn expr_apply_then_binary() {
         // f a + b = (f a) + b
         let e = Stream::new("f a + b").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, _) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, _) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Add);
         assert!(matches!(&lhs.kind, ExprKind::Apply(_, _)));
     }
@@ -1019,7 +1576,9 @@ mod tests {
     #[test]
     fn expr_field() {
         let e = Stream::new("foo.bar").parse_expr().unwrap();
-        let ExprKind::Field(obj, field) = &e.kind else { panic!() };
+        let ExprKind::Field(obj, field) = &e.kind else {
+            panic!()
+        };
         assert!(matches!(&obj.kind, ExprKind::Ident(i) if i.name == "foo"));
         assert_eq!(field.name, "bar");
         assert_eq!(e.span, Span::new(0, 7));
@@ -1028,7 +1587,9 @@ mod tests {
     #[test]
     fn expr_index() {
         let e = Stream::new("arr[0]").parse_expr().unwrap();
-        let ExprKind::Index(obj, _) = &e.kind else { panic!() };
+        let ExprKind::Index(obj, _) = &e.kind else {
+            panic!()
+        };
         assert!(matches!(&obj.kind, ExprKind::Ident(i) if i.name == "arr"));
         assert_eq!(e.span, Span::new(0, 6));
     }
@@ -1037,10 +1598,16 @@ mod tests {
     fn expr_chained_accessor() {
         // foo.bar[0].baz = Field(Index(Field(foo, bar), 0), baz)
         let e = Stream::new("foo.bar[0].baz").parse_expr().unwrap();
-        let ExprKind::Field(indexed, baz) = &e.kind else { panic!() };
+        let ExprKind::Field(indexed, baz) = &e.kind else {
+            panic!()
+        };
         assert_eq!(baz.name, "baz");
-        let ExprKind::Index(field_expr, _) = &indexed.kind else { panic!() };
-        let ExprKind::Field(root, bar) = &field_expr.kind else { panic!() };
+        let ExprKind::Index(field_expr, _) = &indexed.kind else {
+            panic!()
+        };
+        let ExprKind::Field(root, bar) = &field_expr.kind else {
+            panic!()
+        };
         assert!(matches!(&root.kind, ExprKind::Ident(i) if i.name == "foo"));
         assert_eq!(bar.name, "bar");
     }
@@ -1049,7 +1616,9 @@ mod tests {
     fn expr_apply_with_field_arg() {
         // f a.b = f (a.b)
         let e = Stream::new("f a.b").parse_expr().unwrap();
-        let ExprKind::Apply(_, args) = &e.kind else { panic!() };
+        let ExprKind::Apply(_, args) = &e.kind else {
+            panic!()
+        };
         assert_eq!(args.len(), 1);
         assert!(matches!(&args[0].kind, ExprKind::Field(_, _)));
     }
@@ -1057,7 +1626,9 @@ mod tests {
     #[test]
     fn expr_list() {
         let e = Stream::new("[1, 2, 3]").parse_expr().unwrap();
-        let ExprKind::List(els) = &e.kind else { panic!() };
+        let ExprKind::List(els) = &e.kind else {
+            panic!()
+        };
         assert_eq!(els.len(), 3);
         assert_eq!(e.span, Span::new(0, 9));
     }
@@ -1071,7 +1642,9 @@ mod tests {
     #[test]
     fn expr_record() {
         let e = Stream::new("{x: 1, y: 2}").parse_expr().unwrap();
-        let ExprKind::Record(fields) = &e.kind else { panic!() };
+        let ExprKind::Record(fields) = &e.kind else {
+            panic!()
+        };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].key.name, "x");
         assert!(matches!(&fields[0].value.kind, ExprKind::Literal(_)));
@@ -1081,7 +1654,9 @@ mod tests {
     fn expr_paren_grouping() {
         // (1 + 2) * 3 — parens override precedence
         let e = Stream::new("(1 + 2) * 3").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, _) = &e.kind else { panic!() };
+        let ExprKind::Binary(lhs, op, _) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Mul);
         // lhs is the parenthesized addition; span includes parens
         assert_eq!(lhs.span, Span::new(0, 7));
@@ -1092,14 +1667,253 @@ mod tests {
     fn expr_complex() {
         // a + b * c ** d / e > f * g - h ** i / j
         // = (a + ((b * (c ** d)) / e)) > ((f * g) - ((h ** i) / j))
-        let e = Stream::new("a + b * c ** d / e > f * g - h ** i / j").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else { panic!() };
+        let e = Stream::new("a + b * c ** d / e > f * g - h ** i / j")
+            .parse_expr()
+            .unwrap();
+        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+            panic!()
+        };
         assert_eq!(op.node, BinaryOp::Gt);
         // lhs = a + ((b * (c**d)) / e)
-        let ExprKind::Binary(_, add_op, _) = &lhs.kind else { panic!() };
+        let ExprKind::Binary(_, add_op, _) = &lhs.kind else {
+            panic!()
+        };
         assert_eq!(add_op.node, BinaryOp::Add);
         // rhs = (f*g) - ((h**i)/j)
-        let ExprKind::Binary(_, sub_op, _) = &rhs.kind else { panic!() };
+        let ExprKind::Binary(_, sub_op, _) = &rhs.kind else {
+            panic!()
+        };
         assert_eq!(sub_op.node, BinaryOp::Sub);
+    }
+
+    // ---- Statement parsing tests -----------------------------------------
+
+    #[test]
+    fn stmt_expr_statement() {
+        let stmt = Stream::new("foo").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::Expr(e) => {
+                assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "foo"));
+            }
+            _ => panic!("expected expr stmt"),
+        }
+    }
+
+    #[test]
+    fn ident_is_keyword() {
+        // parse_ident should fail for keywords
+        assert!(Stream::new("return").parse_ident().is_err());
+    }
+
+    #[test]
+    fn stmt_return() {
+        let stmt = Stream::new("return 5").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::Return(e) => {
+                assert!(matches!(&e.kind, ExprKind::Literal(l) if l.is_number()));
+            }
+            _ => panic!("expected return stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_if_inline() {
+        let stmt = Stream::new("if x: y").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch: None,
+            } => {
+                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert_eq!(then_branch.len(), 1);
+                match &then_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                    }
+                    _ => panic!("expected inline expr as then-branch"),
+                }
+            }
+            _ => panic!("expected if stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_if_block() {
+        let src = "if x:\n    y";
+        let stmt = Stream::new(src).parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch: None,
+            } => {
+                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert_eq!(then_branch.len(), 1);
+                match &then_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                    }
+                    _ => panic!("expected expr in block"),
+                }
+            }
+            _ => panic!("expected if stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_if_inline_else_same_line() {
+        let stmt = Stream::new("if x: y else: z").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch: Some(else_branch),
+            } => {
+                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert_eq!(then_branch.len(), 1);
+                match &then_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                    }
+                    _ => panic!("expected inline expr as then-branch"),
+                }
+                assert_eq!(else_branch.len(), 1);
+                match &else_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                    }
+                    _ => panic!("expected inline expr as else-branch"),
+                }
+            }
+            _ => panic!("expected if-else stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_if_inline_else_next_line() {
+        let src = "if x: y\nelse: z";
+        let stmt = Stream::new(src).parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch: Some(else_branch),
+            } => {
+                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                match &then_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                    }
+                    _ => panic!("expected inline expr as then-branch"),
+                }
+                assert_eq!(else_branch.len(), 1);
+                match &else_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                    }
+                    _ => panic!("expected inline expr as else-branch"),
+                }
+            }
+            _ => panic!("expected if-else stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_if_block_else_block() {
+        let src = "if x:\n    y\nelse:\n    z";
+        let stmt = Stream::new(src).parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch: Some(else_branch),
+            } => {
+                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert_eq!(then_branch.len(), 1);
+                match &then_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                    }
+                    _ => panic!("expected expr in block"),
+                }
+                assert_eq!(else_branch.len(), 1);
+                match &else_branch[0].kind {
+                    StmtKind::Expr(e) => {
+                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                    }
+                    _ => panic!("expected expr in else block"),
+                }
+            }
+            _ => panic!("expected if-else stmt"),
+        }
+    }
+
+    #[test]
+    fn stmt_assign_pattern_ident() {
+        let stmt = Stream::new("x = 1\n").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::AssignPattern(pat, rhs) => {
+                assert!(matches!(pat.kind, PatternKind::Ident(ref id) if id.name == "x"));
+                assert!(matches!(&rhs.kind, ExprKind::Literal(l) if l.is_number()));
+            }
+            _ => panic!("expected assign pattern"),
+        }
+    }
+
+    #[test]
+    fn stmt_assign_pattern_list() {
+        let stmt = Stream::new("[a, b] = [1, 2]\n").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::AssignPattern(pat, rhs) => {
+                if let PatternKind::List(items) = &pat.kind {
+                    assert_eq!(items.len(), 2);
+                    assert!(matches!(&items[0].kind, PatternKind::Ident(i) if i.name == "a"));
+                    assert!(matches!(&items[1].kind, PatternKind::Ident(i) if i.name == "b"));
+                } else {
+                    panic!("expected list pattern")
+                }
+                if let ExprKind::List(vals) = &rhs.kind {
+                    assert_eq!(vals.len(), 2);
+                } else {
+                    panic!("expected list rhs")
+                }
+            }
+            _ => panic!("expected assign pattern list"),
+        }
+    }
+
+    #[test]
+    fn stmt_assign_field() {
+        let stmt = Stream::new("obj.x = 5\n").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::AssignField {
+                target,
+                field,
+                value,
+            } => {
+                assert_eq!(field.name, "x");
+                assert!(matches!(&target.kind, ExprKind::Ident(i) if i.name == "obj"));
+                assert!(matches!(&value.kind, ExprKind::Literal(l) if l.is_number()));
+            }
+            _ => panic!("expected assign field"),
+        }
+    }
+
+    #[test]
+    fn stmt_assign_index() {
+        let stmt = Stream::new("arr[0] = 7\n").parse_stmt(0).unwrap();
+        match &stmt.kind {
+            StmtKind::AssignIndex {
+                target,
+                index,
+                value,
+            } => {
+                assert!(matches!(&target.kind, ExprKind::Ident(i) if i.name == "arr"));
+                assert!(matches!(&index.kind, ExprKind::Literal(l) if l.is_number()));
+                assert!(matches!(&value.kind, ExprKind::Literal(l) if l.is_number()));
+            }
+            _ => panic!("expected assign index"),
+        }
     }
 }
