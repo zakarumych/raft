@@ -848,3 +848,153 @@ fn eval_binary(op: crate::ast::BinaryOp, a: &Any, b: &Any) -> Result<Any, Runtim
         Ge => Ok(Any::Atom(bool_atom(matches!(a.cmp(b), Some(Ordering::Greater | Ordering::Equal))))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::Stream;
+
+    #[test]
+    fn assign_pattern_ident_binds_var() {
+        let src = "x = 1";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        let v = rt.get_var("x").expect("x bound");
+        match v {
+            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+            _ => panic!("expected integer"),
+        }
+    }
+
+    #[test]
+    fn assign_pattern_list_binds_vars() {
+        let src = "[a, b] = [1, 2]";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        let va = rt.get_var("a").expect("a bound");
+        let vb = rt.get_var("b").expect("b bound");
+        match va {
+            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+            _ => panic!("expected integer for a"),
+        }
+        match vb {
+            Any::Number(Number::Integer(i)) => assert_eq!(i, 2),
+            _ => panic!("expected integer for b"),
+        }
+    }
+
+    #[test]
+    fn literal_pattern_match_success_and_failure() {
+        let ok_src = "'a' = 'a'";
+        let ok_stmts = Stream::new(ok_src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&ok_stmts).unwrap().is_none());
+
+        let bad_src = "'a' = 'b'";
+        let bad_stmts = Stream::new(bad_src).parse_block(None).unwrap();
+        let mut rt2 = Runtime::new();
+        assert!(rt2.exec_block(&bad_stmts).is_err());
+    }
+
+    #[test]
+    fn field_and_index_assignment() {
+        let src = "obj = { x: 1 }\nobj.x = 5\narr = [0, 1]\narr[0] = 7";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&stmts).unwrap().is_none());
+
+        // check obj.x
+        let objv = rt.get_var("obj").expect("obj bound");
+        match objv {
+            Any::Object(o) => {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjectKind::Record(map) => {
+                        let vx = map.get("x").expect("field x present");
+                        match vx {
+                            Any::Number(Number::Integer(i)) => assert_eq!(*i, 5),
+                            _ => panic!("expected integer in obj.x"),
+                        }
+                    }
+                    _ => panic!("obj not record"),
+                }
+            }
+            _ => panic!("obj not object"),
+        }
+
+        // check arr[0]
+        let arrv = rt.get_var("arr").expect("arr bound");
+        match arrv {
+            Any::Object(o) => {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjectKind::List(vec) => {
+                        match &vec[0] {
+                            Any::Number(Number::Integer(i)) => assert_eq!(*i, 7),
+                            _ => panic!("expected integer in arr[0]"),
+                        }
+                    }
+                    _ => panic!("arr not list"),
+                }
+            }
+            _ => panic!("arr not object"),
+        }
+    }
+
+    #[test]
+    fn return_short_circuits_block() {
+        let src = "return 5\nx = 1";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        let res = rt.exec_block(&stmts).unwrap();
+        match res {
+            Some(Any::Number(Number::Integer(i))) => assert_eq!(i, 5),
+            _ => panic!("expected return value"),
+        }
+        assert!(rt.get_var("x").is_none());
+    }
+
+    #[test]
+    fn if_else_execution() {
+        let src = "if True:\n    x = 1";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        match rt.get_var("x").expect("x bound") {
+            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+            _ => panic!("expected integer"),
+        }
+
+        let src2 = "if False:\n    x = 1\nelse:\n    x = 2";
+        let stmts2 = Stream::new(src2).parse_block(None).unwrap();
+        let mut rt2 = Runtime::new();
+        assert!(rt2.exec_block(&stmts2).unwrap().is_none());
+        match rt2.get_var("x").expect("x bound") {
+            Any::Number(Number::Integer(i)) => assert_eq!(i, 2),
+            _ => panic!("expected integer"),
+        }
+    }
+
+    #[test]
+    fn frozen_object_mutation_errors() {
+        let src = "r = { x: 1 }";
+        let stmts = Stream::new(src).parse_block(None).unwrap();
+        let mut rt = Runtime::new();
+        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        // freeze object
+        let rv = rt.get_var("r").expect("r bound");
+        match rv {
+            Any::Object(o) => {
+                o.borrow_mut().freeze();
+            }
+            _ => panic!("r not object"),
+        }
+        // attempt mutation
+        let mut rt2 = rt; // move ownership
+        let bad_src = "r.x = 2";
+        let bad_stmts = Stream::new(bad_src).parse_block(None).unwrap();
+        assert!(rt2.exec_block(&bad_stmts).is_err());
+    }
+}
