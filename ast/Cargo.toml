@@ -1,0 +1,11 @@
+[package]
+name = "raft-ast"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+std = []
+default = ["std"]
+
+[dependencies]
+raft-lexer = { path = "../lexer" }
