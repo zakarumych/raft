@@ -130,6 +130,15 @@ impl fmt::Debug for Number {
     }
 }
 
+impl fmt::Display for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Number::Integer(i) => write!(f, "{i}"),
+            Number::Float(fl) => write!(f, "{fl}"),
+        }
+    }
+}
+
 // Object kinds
 #[derive(Debug)]
 pub enum ObjectKind {
@@ -144,6 +153,33 @@ pub struct Object {
     pub frozen: bool,
     /// mutable by default
     pub mutable: bool,
+}
+
+impl fmt::Display for Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            ObjectKind::List(elements) => {
+                write!(f, "[")?;
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, "]")
+            }
+            ObjectKind::Record(fields) => {
+                write!(f, "{{")?;
+                for (i, (key, value)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", key, value)?;
+                }
+                write!(f, "}}")
+            }
+        }
+    }
 }
 
 impl Object {
@@ -211,31 +247,45 @@ impl fmt::Debug for Any {
     }
 }
 
+impl fmt::Display for Any {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Any::Number(n) => write!(f, "{}", n),
+            Any::Char(c) => write!(f, "{}", c),
+            Any::String(s) => write!(f, "{}", s),
+            Any::Atom(a) => write!(f, "{}", a),
+            Any::Object(o) => write!(f, "{}", o.borrow()),
+            Any::External(_) => write!(f, "External(<fn>)"),
+            Any::Opaque(val) => write!(f, "{:p}", &**val),
+        }
+    }
+}
+
 impl Any {
-    fn bool_(b: bool) -> Self {
+    pub fn bool_(b: bool) -> Self {
         match b {
             true => Any::Atom(KnownAtoms::true_()),
             false => Any::Atom(KnownAtoms::false_()),
         }
     }
 
-    // fn true_() -> Any {
-    //     Any::Atom(KnownAtoms::true_())
-    // }
+    pub fn true_() -> Any {
+        Any::Atom(KnownAtoms::true_())
+    }
 
-    // fn false_() -> Any {
-    //     Any::Atom(KnownAtoms::false_())
-    // }
+    pub fn false_() -> Any {
+        Any::Atom(KnownAtoms::false_())
+    }
 
-    fn nil() -> Any {
+    pub fn nil() -> Any {
         Any::Atom(KnownAtoms::nil_())
     }
 
-    fn new_record(fields: BTreeMap<Rc<str>, Any>) -> Any {
+    pub fn new_record(fields: BTreeMap<Rc<str>, Any>) -> Any {
         Any::Object(Rc::new(RefCell::new(Object::new_record(fields))))
     }
 
-    fn new_list(elements: Vec<Any>) -> Any {
+    pub fn new_list(elements: Vec<Any>) -> Any {
         Any::Object(Rc::new(RefCell::new(Object::new_list(elements))))
     }
 
@@ -511,7 +561,7 @@ impl Any {
     }
 }
 
-// External function type. Receives runtime and evaluated args, returns Any or error string.
+/// External function type. Receives runtime and evaluated args, returns Any or error string.
 pub type ExternalFn = dyn Fn(&mut Runtime, &[Any]) -> Any;
 
 // Runtime with two scopes: global and optional local
@@ -1061,10 +1111,9 @@ mod tests {
     use super::*;
 
     fn ast_from_str(s: &str) -> Vec<Stmt> {
-        let mut stream = raft_ast::parse::Stream::from_str(s);
-        let tokens = raft_ast::parse::parse_stream(&mut stream).unwrap();
-        let mut stream = raft_ast::parse::TokenStream::new(tokens);
-        raft_ast::Stmt::parse_block(&mut stream).unwrap()
+        let tokens = raft_ast::lexer::parse_str(s, &raft_ast::lexer::Options::wss()).unwrap();
+        let mut stream = raft_ast::parser::TokenStream::new(tokens);
+        raft_ast::Stmt::parse_many(&mut stream).unwrap()
     }
 
     #[test]

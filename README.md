@@ -1,124 +1,217 @@
-# Raft — Minimal Indentation-Based Interpreter
+# Raft — a simplicity-first programming language
 
-Raft is a small experimental interpreted language and runtime implemented in Rust. It focuses on a compact, indentation-significant syntax (inspired by Python) and a simple, explicit object model that separates cheap clonable values from heap-backed mutable objects.
+Raft is a small, dynamically-typed scripting language implemented in Rust.
+It favors a minimal syntax and a small set of orthogonal features over a large
+surface area — the goal is a language that is easy to read, easy to embed,
+and easy to reason about.
 
-This repository contains:
-- Parser for expressions, patterns, statements and indentation-based blocks
-- AST types and span-tracked nodes
-- Runtime with values (`Any`) and heap `Object`s (lists, records)
-- Scopes: global and per-call local scope
-- External host functions injection
-- Opaque values for host-managed data
-- Unit tests for parser and runtime
+> **Status: early / work in progress.** The lexer, parser and tree-walking
+> runtime are functional, but the language is still missing pieces you'd
+> expect from a "complete" language (user-defined functions, modules, a
+> standard library, a real REPL — see [Roadmap](#roadmap)). APIs and syntax
+> may change without notice.
 
-Goals
-- Provide a clear, minimal interpreter core suitable for experimentation and teaching
-- Keep interpreter implementation small and easy to reason about
-- Support pattern assignment, immutable literals, mutable heap objects, and host interop
+## Project layout
 
-Quick start
+This is a Cargo workspace made up of four crates:
 
-Prerequisites
-- Rust toolchain (stable) — https://www.rust-lang.org/tools/install
+| Crate               | Path        | Description                                                                 |
+| ------------------- | ----------- | ---------------------------------------------------------------------------- |
+| `raft-lexer`        | `lexer/`    | `no_std`-friendly tokenizer: idents, atoms, numbers, chars, strings, comments, punctuation and delimiter groups (including indentation-based blocks). |
+| `raft-ast`          | `ast/`      | AST types plus a recursive-descent parser built on top of the token stream. |
+| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST.                          |
+| `raft-repl`         | `repl/`     | Command-line front end (currently a placeholder — see [Roadmap](#roadmap)). |
 
-Build and run tests
+`raft-lexer`, `raft-ast` and `raft-runtime` support an optional `std`
+feature (enabled by default) so the front-end can, in principle, run in
+`no_std` environments.
 
-```bash
-# build
+## Building & testing
+
+```sh
+# Build everything
 cargo build
 
-# run full test suite
+# Run the test suite for lexer and parser
 cargo test
+
+# Run the REPL binary
+cargo run -p raft-repl
 ```
 
-Project layout
+## Language tour
 
-- src/
-  - ast.rs       — AST node definitions (Expr, Pattern, Stmt, Span)
-  - parse.rs     — Indentation-aware parser and unit tests
-  - runtime.rs   — Runtime, `Any`, object heap, evaluator and tests
-  - literal.rs   — Literal lexing and helpers
-  - main.rs      — optional entrypoint wiring
+The following describes the syntax and semantics currently supported by the
+parser and runtime.
 
-Language quick reference
+### Comments
 
-Expressions
-- Literals: numbers (ints, floats), strings, chars
-- Identifiers: names bound in scopes
-- Atoms: capitalized symbols (useful for booleans)
-- Lists: `[1, 2, 3]`
-- Records: `{ x: 1, y: 2 }`
-- Unary ops: `!a`, `-n`, `~bits`
-- Binary ops: arithmetic, bitwise, comparison, power (`**`), precedence handled in parser
-- Field / index access: `obj.field`, `arr[0]`
-- Function application: `f a b` (application is space-separated)
+```raft
+// a line comment
+/* a block comment */
+```
 
-Statements
-- Expression statement: `foo` on its own line
-- Assignment to pattern: `<pattern> = <expr>`
-  - Patterns: identifiers, atoms, lists, records, and constant literals (numbers/strings/chars)
-  - Pattern assignment performs structural match; identifier components bind to current scope
-- Field assignment: `<expr>.<ident> = <expr>` — mutate record fields
-- Index assignment: `<expr>[<expr>] = <expr>` — mutate list elements (integer index)
-- Return: `return <expr>` — immediate return from current block/call
-- If: `if <expr>: <stmt>` or `if <expr>:
-    <block>` with optional `else:` following rules (same-line inline else or next non-empty line)
+### Literals
 
-Blocks and indentation
-- Blocks are indentation-significant.
-- Block's indentation level is determined by the first non-empty line whose indent is greater than the outer block's indent (outer may be None for root).
-- A block ends when encountering a line with smaller or equal indent (or EOF).
-- Blank lines are ignored when locating block boundaries.
-- Tabs counted with tab-stop semantics (configurable in parser code).
+```raft
+42          // integer
+0x2A        // hexadecimal
+0o52        // octal
+0b101010    // binary
+1_000_000   // underscores allowed as digit separators
+3.14        // float
+6.02e23     // float with exponent
+1i          // explicit integer suffix
+1.0f        // explicit float suffix
 
-Runtime model
+'a'         // char
+'\n'        // char with escape
 
-Values (enum `Any`):
-- Number (integer/float) — cheaply clonable
-- Char, String, Atom — cheap values
-- Object (Rc<RefCell<Object>>) — lists and records live on heap, mutable by default
-  - `Object` has `frozen` flag: when true, mutation attempts fail
-  - `mutable` flag currently reserved for future use
-- External functions: host-provided callables
-- Opaque: host-managed opaque value not inspectable by Raft code
+"hello"     // string
+"line\n"    // string with escapes
+```
 
-Scopes
-- Two-level scoping: global scope (Runtime.global) and optional local scope (Runtime.local)
-- Setting variable inside a call (host call or function execution) sets it in the local scope; otherwise, sets global
-- Getting variable checks local first then global
+### Identifiers vs. atoms
 
-Host interop
-- Hosts can register external functions via `register_external(name, fn)`; those appear as callables in global scope
-- External functions receive `&mut Runtime` and evaluated `&[Any]` arguments and return `Any`
-- Opaque values can be stored in `Any::Opaque` and carried through Raft code without inspection
+Identifiers starting with a lowercase letter or `_` are ordinary variable
+names. Identifiers starting with an uppercase letter are **atoms** — inert,
+self-evaluating symbols (similar to symbols/keywords in other languages).
+The atoms `True`, `False` and `Nil` are used as the language's booleans and
+"no value" marker.
 
-Pattern matching and assignment
-- Assignment to a pattern evaluates RHS then attempts to match structure
-- Identifier pattern binds value into current scope
-- Literal patterns compare values for equality (numbers, strings, chars)
-- List/record patterns require structural match and bind subpatterns
-- Pattern match failures are runtime errors
+```raft
+x = 1
+Status      // an atom
+ok = True
+```
 
-Design decisions and caveats
-- Parser intentionally strict about structural tokens: `.` must be followed by identifier, `[` must close with `]`, required `:` tokens enforced.
-- Expression-to-pattern conversion accepts identifiers, atoms, lists, records, and now literal constants.
-- Runtime treats booleans as atoms: `True`/`False` atoms are canonicalized internally.
-- Function call semantics run inside a fresh local scope via `call_with_local` (future: implement user functions)
+### Collections
 
-Testing
-- Parser and runtime unit tests shipped under each module. Run with `cargo test`.
-- Add tests for new features as code evolves.
+Lists and records are the two built-in heap-allocated collection types:
 
-Contributing
-- Open issues for bugs or design discussions.
-- Keep changes small and focused; add unit tests for parser and runtime behavior.
-- Follow repository style: prefer precise, surgical edits.
+```raft
+xs = [1, 2, 3]
 
-License
-- (Add license file or statement here. Project currently unlicensed — add LICENSE if you intend to publish.)
+point = { x: 1, y: 2 }
 
-Contact / Notes
-- Experimental project meant for learning and prototyping interpreter ideas.
-- Parser and runtime live in a single binary crate for simplicity; splitting into library + binary is a future step.
+// shorthand field: takes the value from a variable of the same name
+name = "Ada"
+person = { name, age: 36 }
+```
 
-Enjoy exploring Raft. Contributions and feedback welcome.
+Access fields and indices with `.` and `[]`:
+
+```raft
+point.x
+xs[0]
+point.x = 10
+xs[0] = 10
+```
+
+### Operators
+
+From tightest to loosest binding:
+
+| Precedence   | Operators                     | Associativity  |
+| ------------ | ------------------------------ | -------------- |
+| 5 (tightest) | `&` `\|` `^` `<<` `>>`         | left-to-right  |
+| 4            | `**`                           | right-to-left  |
+| 3            | `*` `/`                        | left-to-right  |
+| 2            | `+` `-`                        | left-to-right  |
+| 1 (loosest)  | `==` `!=` `<` `>` `<=` `>=`     | left-to-right  |
+
+Unary operators: `!` (logical not), `~` (bitwise not), `+` (identity),
+`-` (negate).
+
+### Function application
+
+Function calls use juxtaposition rather than parentheses (parentheses are
+only needed for grouping):
+
+```raft
+print "hello"
+add 1 2
+```
+
+Only host-registered functions can currently be called this way — see
+[Embedding host functions](#embedding-host-functions).
+
+### Control flow
+
+Blocks are introduced with `:` and are either a single statement on the same
+line, or an indented block on the following lines (indentation is
+significant, similar to Python):
+
+```raft
+if x > 0:
+    print "positive"
+else if x < 0:
+    print "negative"
+else:
+    print "zero"
+
+while x > 0:
+    x = x - 1
+else:
+    print "done"
+
+for item in xs:
+    print item
+else:
+    print "no more items"
+```
+
+`break`, `continue` and `return` are supported inside the relevant blocks.
+`while`/`for` loops also support a trailing `else` clause, which runs when
+the loop completes without hitting a `break`.
+
+### Pattern matching & destructuring
+
+Assignment targets can be simple identifiers, or patterns that destructure
+lists and records:
+
+```raft
+[a, b, c] = xs
+{ x, y } = point
+```
+
+Patterns can also match literal values and atoms, which is used to
+accept/reject values during pattern-matching assignment.
+
+### Mutability
+
+Lists and records are mutable heap objects by default and can be frozen
+(from host code) to prevent further mutation.
+
+### Embedding host functions
+
+Since Raft doesn't yet have user-defined functions, functionality is exposed
+to scripts by registering Rust closures on the `Runtime`:
+
+```rust
+use raft_runtime::Runtime;
+
+let mut rt = Runtime::new();
+rt.register_external("print", |_rt, args| {
+    for a in args {
+        println!("{:?}", a);
+    }
+    // ... return some Any value
+});
+```
+
+## Roadmap
+
+Raft is under active development. Notable gaps today:
+
+- No user-defined functions/closures — only host-registered external
+  functions can be called.
+- No module or import system.
+- No standard library.
+- The `raft-repl` binary is a placeholder ("Hello, world!") and doesn't yet
+  wire the lexer/parser/runtime together into an interactive REPL.
+
+Contributions and ideas are welcome while the language design is still
+taking shape.
+
+

@@ -19,6 +19,10 @@ dependencies = [
 [[package]]
 name = "raft-repl"
 version = "0.1.0"
+dependencies = [
+ "raft-ast",
+ "raft-runtime",
+]
 
 [[package]]
 name = "raft-runtime"

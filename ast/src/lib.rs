@@ -6,7 +6,9 @@ use alloc::rc::Rc;
 
 pub use raft_lexer::{Span, LiteralNumber, LiteralChar, LiteralString};
 
-pub mod parse;
+pub mod parser;
+
+pub use raft_lexer as lexer;
 
 #[cfg(test)]
 mod tests;

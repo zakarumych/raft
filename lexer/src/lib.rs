@@ -2,16 +2,17 @@
 
 extern crate alloc;
 
-mod buffer;
 mod lex;
 mod stream;
+mod span;
 
 pub use self::{
     lex::{
-        Comment, Delimiter, Group, Ident, LexError, Literal, LexErrorKind, LiteralNumber, LiteralChar, LiteralString, Punct, Token,
-        parse_stream,
+        Comment, Delimiter, Group, Ident, LexError, LexErrorKind, Literal, LiteralChar,
+        LiteralNumber, LiteralString, Punct, Token, parse_str, parse_stream, Options
     },
-    stream::{Span, Stream},
+    stream::{Stream},
+    span::{Span, SpannedSource},
 };
 
 #[cfg(test)]

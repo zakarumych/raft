@@ -1,33 +1,37 @@
-use crate::{Stream, Token, lex::Delimiter, parse_stream};
+use crate::{
+    Stream, Token,
+    lex::{Delimiter, Options, parse_str, parse_stream},
+};
+
+use alloc::rc::Rc;
+
+fn tokens_from_str(s: &str) -> Rc<[Token]> {
+    parse_str(s, &Options::wss()).unwrap()
+}
 
 #[test]
 fn ident_token() {
-    let mut stream = Stream::from_str("foo");
-    let tokens = parse_stream(&mut stream).expect("expected ident");
+    let tokens = tokens_from_str("foo");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Ident(i) => assert_eq!(i.repr(), "foo"),
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn punct_token() {
-    let mut stream = Stream::from_str("+");
-    let tokens = parse_stream(&mut stream).expect("expected punct");
+    let tokens = tokens_from_str("+");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Punct(p) => assert_eq!(p.repr(), '+'),
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn number_literal_token() {
-    let mut stream = Stream::from_str("123");
-    let tokens = parse_stream(&mut stream).expect("expected number");
+    let tokens = tokens_from_str("123");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Literal(l) => {
@@ -36,13 +40,11 @@ fn number_literal_token() {
         }
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn string_literal_token() {
-    let mut stream = Stream::from_str("\"hi\"");
-    let tokens = parse_stream(&mut stream).expect("expected string");
+    let tokens = tokens_from_str("\"hi\"");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Literal(l) => {
@@ -51,13 +53,11 @@ fn string_literal_token() {
         }
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn char_literal_token() {
-    let mut stream = Stream::from_str("'a'");
-    let tokens = parse_stream(&mut stream).expect("expected char");
+    let tokens = tokens_from_str("'a'");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Literal(l) => {
@@ -66,25 +66,21 @@ fn char_literal_token() {
         }
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn block_comment_token() {
-    let mut stream = Stream::from_str("/*c*/");
-    let tokens = parse_stream(&mut stream).expect("expected comment");
+    let tokens = tokens_from_str("/*c*/");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Comment(c) => assert!(c.repr().starts_with("/*c*/")),
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn group_token() {
-    let mut stream = Stream::from_str("(a)");
-    let tokens = parse_stream(&mut stream).expect("expected group");
+    let tokens = tokens_from_str("(a)");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Group(g) => {
@@ -98,13 +94,11 @@ fn group_token() {
         }
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn group_multiline_token() {
-    let mut stream = Stream::from_str("(\n\na\n)");
-    let tokens = parse_stream(&mut stream).expect("expected group");
+    let tokens = tokens_from_str("(\n\na\n)");
     assert_eq!(tokens.len(), 1);
     match &tokens[0] {
         Token::Group(g) => {
@@ -126,13 +120,11 @@ fn group_multiline_token() {
         }
         other => panic!("unexpected token: {:?}", other),
     }
-    assert!(stream.is_empty());
 }
 
 #[test]
 fn multiline_parse() {
-    let mut stream = Stream::from_str("a\nb\n+");
-    let tokens = parse_stream(&mut stream).expect("expected block group");
+    let tokens = tokens_from_str("a\nb\n+");
     assert_eq!(tokens.len(), 5);
     match &tokens[0] {
         Token::Ident(i) => assert_eq!(i.repr(), "a"),
@@ -158,8 +150,7 @@ fn multiline_parse() {
 
 #[test]
 fn block_group_parse() {
-    let mut stream = Stream::from_str("a\n  b\n    c\n  d\n+");
-    let tokens = parse_stream(&mut stream).expect("expected block group");
+    let tokens = tokens_from_str("a\n  b\n    c\n  d\n+");
 
     assert_eq!(tokens.len(), 4);
     match &tokens[0] {
@@ -219,7 +210,7 @@ fn block_group_parse() {
 #[test]
 fn group_close_in_outer_block_error() {
     let mut stream = Stream::from_str("  {\n}");
-    match parse_stream(&mut stream) {
+    match parse_stream(&mut stream, &Options::wss()) {
         Err(err) => assert_eq!(err.kind(), crate::lex::LexErrorKind::UnclosedDelimiter),
         Ok(_) => panic!("expected error, got Ok"),
     }
@@ -228,7 +219,7 @@ fn group_close_in_outer_block_error() {
 #[test]
 fn group_close_in_inner_block_error() {
     let mut stream = Stream::from_str("\n  {\n    }\n");
-    match parse_stream(&mut stream) {
+    match parse_stream(&mut stream, &Options::wss()) {
         Err(err) => assert_eq!(err.kind(), crate::lex::LexErrorKind::UnclosedDelimiter),
         Ok(_) => panic!("expected error, got Ok"),
     }
@@ -236,8 +227,7 @@ fn group_close_in_inner_block_error() {
 
 #[test]
 fn groups_mixed_nested_parse() {
-    let mut stream = Stream::from_str("(a)\n[b\n  {c\n  }\n]\n{d}\n");
-    let tokens = parse_stream(&mut stream).expect("expected block group");
+    let tokens = tokens_from_str("(a)\n[b\n  {c\n  }\n]\n{d}\n");
 
     assert_eq!(tokens.len(), 6);
     match &tokens[0] {

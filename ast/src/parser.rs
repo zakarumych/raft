@@ -1,18 +1,72 @@
-use std::rc::Rc;
+use core::fmt;
+use alloc::rc::Rc;
 
 use crate::{
     Atom, BinaryOp, BinaryOpKind, Expr, ExprKind, ExprRecordField, Ident, Literal, Pat, PatKind,
     PatRecordField, Span, Stmt, StmtKind, UnaryOp, UnaryOpKind,
 };
 
-pub use raft_lexer::{Token, Stream, parse_stream};
+use raft_lexer::{SpannedSource, Token};
 
-#[derive(Debug)]
-pub enum ParseError {
-    UnexpectedToken(Span),
-    UnexpectedEnd(Span),
-    InvalidAssignmentTarget(Span),
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ParseErrorKind {
+    UnexpectedToken,
+    UnexpectedEndOfInput,
+    InvalidAssignmentTarget,
 }
+
+impl fmt::Display for ParseErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseErrorKind::UnexpectedToken => write!(f, "Unexpected token"),
+            ParseErrorKind::UnexpectedEndOfInput => write!(f, "Unexpected end of input"),
+            ParseErrorKind::InvalidAssignmentTarget => write!(f, "Invalid assignment target"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ParseError {
+    span: Span,
+    kind: ParseErrorKind,
+}
+
+impl ParseError {
+    pub fn new(kind: ParseErrorKind, span: Span) -> Self {
+        Self { span, kind }
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
+
+    pub const fn print<'a>(&'a self, source: &'a str) -> PrintParseError<'a> {
+        PrintParseError {
+            kind: self.kind,
+            spanned_source: SpannedSource::new(source, self.span),
+        }
+    }
+}
+
+
+pub struct PrintParseError<'a> {
+    kind: ParseErrorKind,
+    spanned_source: SpannedSource<'a>,
+}
+
+impl fmt::Display for PrintParseError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.kind)?;
+        write!(f, "{}", self.spanned_source)
+    }
+}
+
+
+pub type ParseResult<T> = Result<T, ParseError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Keyword {
@@ -40,9 +94,17 @@ impl Keyword {
             _ => None,
         }
     }
-}
 
-pub type ParseResult<T> = Result<T, ParseError>;
+    
+    pub fn peek(stream: &mut TokenStream) -> Option<(Self, Span)> {
+        match stream.peek() {
+            Some(Token::Ident(i)) => {
+                Some((Self::from_ident(i.repr())?, i.span()))
+            }
+            _ => None,
+        }
+    }
+}
 
 // TokenStream: wrapper over token list produced by lexer
 pub struct TokenStream {
@@ -91,7 +153,7 @@ impl TokenStream {
         Stmt::parse(self)
     }
 
-    fn start_span(&self) -> Span {
+    pub fn start_span(&self) -> Span {
         if self.pos == self.tokens.len() {
             self.end_span()
         } else {
@@ -99,14 +161,14 @@ impl TokenStream {
         }
     }
 
-    fn end_span(&self) -> Span {
+    pub fn end_span(&self) -> Span {
         match self.tokens.last() {
             None => Span { start: 0, end: 0 },
             Some(tok) => tok.span().end(),
         }
     }
 
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         if self.pos == self.tokens.len() {
             self.end_span()
         } else {
@@ -116,23 +178,23 @@ impl TokenStream {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.pos >= self.tokens.len()
     }
 
-    fn peek(&self) -> Option<Token> {
+    pub fn peek(&self) -> Option<Token> {
         self.tokens.get(self.pos).cloned()
     }
 
-    fn peek1(&self) -> Option<Token> {
+    pub fn peek1(&self) -> Option<Token> {
         self.tokens.get(self.pos + 1).cloned()
     }
 
-    fn advance(&mut self) {
+    pub fn advance(&mut self) {
         self.pos += 1;
     }
 
-    fn skip_newlines(&mut self) -> bool {
+    pub fn skip_newline(&mut self) -> bool {
         if let Some(Token::Newline(_)) = self.peek() {
             self.advance();
             true
@@ -141,7 +203,7 @@ impl TokenStream {
         }
     }
 
-    fn skip_comments(&mut self) -> bool {
+    pub fn skip_comments(&mut self) -> bool {
         if let Some(Token::Comment(_)) = self.peek() {
             self.advance();
             true
@@ -150,7 +212,7 @@ impl TokenStream {
         }
     }
 
-    fn skip_comments_and_newlines(&mut self) -> bool {
+    pub fn skip_comments_and_newlines(&mut self) -> bool {
         let mut skipped = false;
         while let Some(tok) = self.peek() {
             match tok {
@@ -164,9 +226,9 @@ impl TokenStream {
         skipped
     }
 
-    fn expect_end(&self) -> ParseResult<()> {
+    pub fn expect_end(&self) -> ParseResult<()> {
         if let Some(tok) = self.peek() {
-            Err(ParseError::UnexpectedToken(tok.span()))
+            Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()))
         } else {
             Ok(())
         }
@@ -198,7 +260,7 @@ impl Ident {
         match stream.peek() {
             Some(Token::Ident(i)) => {
                 if Keyword::from_ident(i.repr()).is_some() {
-                    return Err(ParseError::UnexpectedToken(i.span()));
+                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, i.span()));
                 }
 
 
@@ -209,11 +271,11 @@ impl Ident {
                     let span = i.span();
                     Ok(Ident { name, span })
                 } else {
-                    Err(ParseError::UnexpectedToken(i.span()))
+                    Err(ParseError::new(ParseErrorKind::UnexpectedToken, i.span()))
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -243,7 +305,7 @@ impl Atom {
         match stream.peek() {
             Some(Token::Ident(i)) => {
                 if Keyword::from_ident(i.repr()).is_some() {
-                    return Err(ParseError::UnexpectedToken(i.span()));
+                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, i.span()));
                 }
 
                 let s = i.repr();
@@ -253,11 +315,11 @@ impl Atom {
                     let span = i.span();
                     Ok(Atom { name, span })
                 } else {
-                    Err(ParseError::UnexpectedToken(i.span()))
+                    Err(ParseError::new(ParseErrorKind::UnexpectedToken, i.span()))
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -288,8 +350,8 @@ impl Literal {
                     raft_lexer::Literal::String(s) => Ok(Literal::String(s)),
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -333,11 +395,11 @@ impl UnaryOp {
                     stream.advance();
                     Ok(UnaryOp { kind: k, span })
                 } else {
-                    Err(ParseError::UnexpectedToken(p.span()))
+                    Err(ParseError::new(ParseErrorKind::UnexpectedToken, p.span()))
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -571,11 +633,11 @@ impl BinaryOp {
                     });
                 }
                 (_, _) => {
-                    return Err(ParseError::UnexpectedToken(p1.span()));
+                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, p1.span()));
                 }
             },
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -752,7 +814,7 @@ impl Expr {
                             group_stream.skip_comments_and_newlines();
                             continue;
                         }
-                        Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
+                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
                         None => break,
                     }
                 }
@@ -793,7 +855,7 @@ impl Expr {
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::UnexpectedToken(tok.span()));
+                                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
                                 }
                                 None => break,
                             }
@@ -812,7 +874,7 @@ impl Expr {
                             continue;
                         }
                         Some(tok) => {
-                            return Err(ParseError::UnexpectedToken(tok.span()));
+                            return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
                         }
                         None => {
                             let key_span = key.span;
@@ -873,34 +935,9 @@ impl Expr {
                     }
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
-    }
-}
-
-fn peek_keyword(stream: &mut TokenStream) -> Option<(Keyword, Span)> {
-    match stream.peek() {
-        Some(Token::Ident(i)) => {
-            let s = i.repr();
-            let kw = match s {
-                "return" => Some(Keyword::Return),
-                "if" => Some(Keyword::If),
-                "else" => Some(Keyword::Else),
-                "while" => Some(Keyword::While),
-                "for" => Some(Keyword::For),
-                "break" => Some(Keyword::Break),
-                "continue" => Some(Keyword::Continue),
-                "in" => Some(Keyword::In),
-                _ => None,
-            };
-            if let Some(k) = kw {
-                let span = i.span();
-                return Some((k, span));
-            }
-            None
-        }
-        _ => None,
     }
 }
 
@@ -999,7 +1036,7 @@ impl Pat {
                             group_stream.skip_comments_and_newlines();
                             continue;
                         }
-                        Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
+                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
                         None => break,
                     }
                 }
@@ -1037,7 +1074,7 @@ impl Pat {
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::UnexpectedToken(tok.span()));
+                                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
                                 }
                                 None => break,
                             }
@@ -1055,7 +1092,7 @@ impl Pat {
                             continue;
                         }
                         Some(tok) => {
-                            return Err(ParseError::UnexpectedToken(tok.span()));
+                            return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
                         }
                         None => {
                             let key_span = key.span;
@@ -1113,8 +1150,8 @@ impl Pat {
                     }
                 }
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEnd(stream.span())),
+            Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 }
@@ -1159,7 +1196,7 @@ impl Stmt {
                                 },
                             });
                         } else {
-                            return Err(ParseError::InvalidAssignmentTarget(lhs.span));
+                            return Err(ParseError::new(ParseErrorKind::InvalidAssignmentTarget, lhs.span));
                         }
                     }
                 }
@@ -1174,7 +1211,7 @@ impl Stmt {
     }
 
     pub fn parse_line(stream: &mut TokenStream) -> ParseResult<Self> {
-        if let Some((kw, kw_span)) = peek_keyword(stream) {
+        if let Some((kw, kw_span)) = Keyword::peek(stream) {
             match kw {
                 Keyword::Return => {
                     stream.advance();
@@ -1207,7 +1244,7 @@ impl Stmt {
                         kind: StmtKind::Continue,
                     });
                 }
-                _ => return Err(ParseError::UnexpectedToken(kw_span)),
+                _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }
         }
 
@@ -1215,7 +1252,7 @@ impl Stmt {
     }
 
     pub fn parse(stream: &mut TokenStream) -> ParseResult<Self> {
-        if let Some((kw, kw_span)) = peek_keyword(stream) {
+        if let Some((kw, kw_span)) = Keyword::peek(stream) {
             match kw {
                 Keyword::Return => {
                     stream.advance();
@@ -1256,14 +1293,14 @@ impl Stmt {
                 Keyword::For => {
                     return Self::parse_for(stream, kw_span);
                 }
-                _ => return Err(ParseError::UnexpectedToken(kw_span)),
+                _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }
         }
 
         Self::parse_simple(stream)
     }
 
-    pub fn parse_block(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
+    pub fn parse_many(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
         let mut stmts = Vec::new();
         stream.skip_comments_and_newlines();
         while !stream.is_empty() {
@@ -1274,19 +1311,19 @@ impl Stmt {
         Ok(stmts)
     }
 
-    fn parse_branch(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
+    pub fn parse_branch(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
         match stream.peek() {
             Some(Token::Punct(p)) if p.repr() == ':' => {
                 stream.advance();
                 stream.skip_comments();
-                if stream.skip_newlines() {
+                if stream.skip_newline() {
                     stream.skip_comments_and_newlines();
                     match stream.peek() {
                         Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Block => {
                             stream.advance();
 
                             let mut group_stream = TokenStream::new(g.rc_tokens());
-                            return Stmt::parse_block(&mut group_stream);
+                            return Stmt::parse_many(&mut group_stream);
                         }
                         _ => return Ok(Vec::new()),
                     }
@@ -1295,12 +1332,12 @@ impl Stmt {
                     return Ok(vec![stmt]);
                 }
             }
-            Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
-            None => return Err(ParseError::UnexpectedEnd(stream.span())),
+            Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+            None => return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
         }
     }
 
-    fn parse_if(stream: &mut TokenStream, if_span: Span) -> ParseResult<Self> {
+    pub fn parse_if(stream: &mut TokenStream, if_span: Span) -> ParseResult<Self> {
         stream.advance();
         let cond = Expr::parse(stream)?;
         let then_branch = Self::parse_branch(stream)?;
@@ -1324,11 +1361,11 @@ impl Stmt {
         })
     }
 
-    fn parse_else(stream: &mut TokenStream) -> ParseResult<Option<Vec<Self>>> {
-        if let Some((Keyword::Else, _else_span)) = peek_keyword(stream) {
+    pub fn parse_else(stream: &mut TokenStream) -> ParseResult<Option<Vec<Self>>> {
+        if let Some((Keyword::Else, _else_span)) = Keyword::peek(stream) {
             stream.advance();
 
-            let stmts = if let Some((Keyword::If, if_span)) = peek_keyword(stream) {
+            let stmts = if let Some((Keyword::If, if_span)) = Keyword::peek(stream) {
                 vec![Self::parse_if(stream, if_span)?]
             } else {
                 Self::parse_branch(stream)?
@@ -1340,7 +1377,7 @@ impl Stmt {
         }
     }
 
-    fn parse_while(stream: &mut TokenStream, while_span: Span) -> ParseResult<Self> {
+    pub fn parse_while(stream: &mut TokenStream, while_span: Span) -> ParseResult<Self> {
         stream.advance();
         let cond = Expr::parse(stream)?;
         let body = Self::parse_branch(stream)?;
@@ -1361,19 +1398,19 @@ impl Stmt {
         })
     }
 
-    fn parse_for(stream: &mut TokenStream, for_span: Span) -> ParseResult<Self> {
+    pub fn parse_for(stream: &mut TokenStream, for_span: Span) -> ParseResult<Self> {
         stream.advance();
         let target = Pat::parse(stream)?;
 
-        match peek_keyword(stream) {
+        match Keyword::peek(stream) {
             Some((Keyword::In, _)) => {
                 stream.advance();
             }
             Some((_, kw_span)) => {
-                return Err(ParseError::UnexpectedToken(kw_span));
+                return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));
             }
             None => {
-                return Err(ParseError::UnexpectedToken(stream.start_span()));
+                return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span()));
             }
         }
 

@@ -2,12 +2,71 @@ use core::{char, fmt, ops::Range};
 
 use alloc::{borrow::ToOwned, rc::Rc, string::String, vec::Vec};
 
-use crate::stream::{Span, Stream};
+use crate::{stream::Stream, span::{Span, SpannedSource}};
+
+/// Options for the lexer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// If true, the lexer will emit comments as tokens. If false, comments will be skipped.
+    pub emit_comments: bool,
+
+    /// If true, the lexer will emit newlines as tokens. If false, newlines will be skipped.
+    pub emit_newlines: bool,
+
+    /// If true, the lexer will emit blocks as tokens. If false, blocks will be flattened.
+    pub group_blocks: bool,
+
+    /// If true, the lexer will treat EOF as a block end,
+    /// allowing the last block to be closed without an decreased indentation.
+    pub block_end_on_eof: bool,
+
+    /// If true, whenever the lexer encounters a blank line, it will skip it and continue lexing.
+    /// If false, blank lines will be treated as a newline token and their indentation will be considered for block grouping.
+    pub ignore_blank_lines: bool,
+}
+
+impl Options {
+    /// Returns default whitespace-sensitive options,
+    /// which emit newlines and group blocks.
+    pub const fn wss() -> Self {
+        Options {
+            emit_comments: true,
+            emit_newlines: true,
+            group_blocks: true,
+            block_end_on_eof: true,
+            ignore_blank_lines: true,
+        }
+    }
+    
+    /// Returns REPL whitespace-sensitive options,
+    /// which emit newlines and group blocks.
+    pub const fn wss_repl() -> Self {
+        Options {
+            emit_comments: true,
+            emit_newlines: true,
+            group_blocks: true,
+            block_end_on_eof: false,    // in REPL we don't want to treat EOF as block end, because we want to allow the user to continue typing in the next line.
+            ignore_blank_lines: false,  // in REPL we don't want to ignore blank lines, because we want user to use blank lines to separate blocks.
+        }
+    }
+
+    /// Returns default whitespace-insensitive options,
+    /// which do not emit newlines and do not group blocks.
+    pub const fn wsi() -> Self {
+        Options {
+            emit_comments: true,
+            emit_newlines: false,
+            group_blocks: false,
+            block_end_on_eof: false,
+            ignore_blank_lines: true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LexErrorKind {
     /// The input ended unexpectedly while parsing a token.
-    EndOfInput,
+    UnexpectedEndOfInput,
 
     /// An unexpected character was encountered while parsing a token.
     UnexpectedCharacter(char),
@@ -28,7 +87,7 @@ pub enum LexErrorKind {
 impl fmt::Display for LexErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LexErrorKind::EndOfInput => write!(f, "Unexpected end of input"),
+            LexErrorKind::UnexpectedEndOfInput => write!(f, "Unexpected end of input"),
             LexErrorKind::UnexpectedCharacter(c) => write!(f, "Unexpected character: '{}'", c),
             LexErrorKind::InvalidEscapedCharacter(code) => {
                 write!(f, "Invalid escaped character: code point U+{:X}", code)
@@ -40,7 +99,7 @@ impl fmt::Display for LexErrorKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LexError {
     span: Span,
     kind: LexErrorKind,
@@ -61,70 +120,23 @@ impl LexError {
         self.kind
     }
 
-    pub fn print<'a>(&'a self, source: &'a str) -> PrintLexError<'a> {
+    pub const fn print<'a>(&'a self, source: &'a str) -> PrintLexError<'a> {
         PrintLexError {
-            error: self,
-            source,
+            kind: self.kind,
+            spanned_source: SpannedSource::new(source, self.span),
         }
     }
 }
 
 pub struct PrintLexError<'a> {
-    error: &'a LexError,
-    source: &'a str,
-}
-
-fn digits(mut n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-
-    let mut count = 0;
-    while n > 0 {
-        count += 1;
-        n /= 10;
-    }
-
-    count
+    kind: LexErrorKind,
+    spanned_source: SpannedSource<'a>,
 }
 
 impl fmt::Display for PrintLexError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.error.kind)?;
-
-        let start_line = self.error.span.start().get_line(self.source);
-        let start_column = self.error.span.start().get_column(self.source);
-        let end_line = self.error.span.end().get_line(self.source);
-        let end_column = self.error.span.end().get_column(self.source);
-
-        let mut source_lines = self.source.lines();
-
-        if start_line > 0 {
-            source_lines.nth(start_line - 1);
-        }
-
-        let width = digits(end_line);
-
-        for (idx, line) in (start_line..=end_line).zip(source_lines.take(end_line - start_line + 1))
-        {
-            writeln!(f, "{idx:>width$}: {}", line)?;
-            if idx == start_line && idx == end_line {
-                let len = end_column - start_column;
-                writeln!(f, "{:width$}  {:^^len$}", "", "")?;
-            } else if idx == start_line {
-                let len = line.len() - start_column;
-                let skip = start_column;
-                writeln!(f, "{:width$}  {:skip$}{:^^len$}", "", "", "")?;
-            } else if idx == end_line {
-                let len = end_column;
-                writeln!(f, "{:width$}  {:^^len$}", "", "")?;
-            } else {
-                let len = line.len();
-                writeln!(f, "{:width$}  {:^^len$}", "", "")?;
-            }
-        }
-
-        Ok(())
+        writeln!(f, "{}", self.kind)?;
+        write!(f, "{}", self.spanned_source)
     }
 }
 
@@ -209,7 +221,7 @@ impl Punct {
         let start_pos = stream.pos();
         let ch = stream.peek_char().ok_or(LexError {
             span: Span::new(start_pos, start_pos),
-            kind: LexErrorKind::EndOfInput,
+            kind: LexErrorKind::UnexpectedEndOfInput,
         })?;
 
         if !Self::is_punct_ch(ch) {
@@ -275,7 +287,7 @@ impl Ident {
             None => {
                 return Err(LexError {
                     span: Span::new(stream.pos(), stream.pos()),
-                    kind: LexErrorKind::EndOfInput,
+                    kind: LexErrorKind::UnexpectedEndOfInput,
                 });
             }
         };
@@ -938,7 +950,7 @@ impl Literal {
 
                 Err(LexError {
                     span: stream.span(),
-                    kind: LexErrorKind::EndOfInput,
+                    kind: LexErrorKind::UnexpectedEndOfInput,
                 })
             }
             Some(ch)
@@ -970,7 +982,7 @@ impl Literal {
                     None => {
                         return Err(LexError {
                             span: Span::new(start_pos, start_pos),
-                            kind: LexErrorKind::EndOfInput,
+                            kind: LexErrorKind::UnexpectedEndOfInput,
                         });
                     }
                 }
@@ -994,7 +1006,7 @@ impl Literal {
                     }),
                     None => Err(LexError {
                         span: Span::new(start_pos, start_pos),
-                        kind: LexErrorKind::EndOfInput,
+                        kind: LexErrorKind::UnexpectedEndOfInput,
                     }),
                 }
             }
@@ -1004,7 +1016,7 @@ impl Literal {
             }),
             None => Err(LexError {
                 span: Span::new(start_pos, start_pos),
-                kind: LexErrorKind::EndOfInput,
+                kind: LexErrorKind::UnexpectedEndOfInput,
             }),
         }
     }
@@ -1084,29 +1096,36 @@ impl Group {
         start_pos: usize,
         stream: &mut Stream,
         indent: usize,
+        options: &Options,
     ) -> Result<Self, LexError> {
         let mut tokens = Vec::new();
 
         loop {
-            if let Some(token) = Newline::try_parse(stream) {
-                tokens.push(Token::Newline(token));
-                debug_assert!(
-                    Newline::try_parse(stream).is_none(),
-                    "Newline::try_parse should consume all consecutive newlines"
-                );
+            while let Ok(token) = Newline::parse(stream) {
+                if options.ignore_blank_lines {
+                    stream.skip_blank_lines();
+                }
+
+                if options.emit_newlines {
+                    tokens.push(Token::Newline(token));
+                }
             }
 
-            if stream.is_empty() {
-                return Ok(Group::new(open_delim, tokens, Span::new(start_pos, stream.pos())));
+            if options.ignore_blank_lines {
+                stream.skip_blank_lines();
             }
 
-            if stream.is_linestart() {
-                // Blank lines would be skipped and consumed by Newline::try_parse, so if we are at the start of a line, it must be a non-blank line.
+            if options.group_blocks && stream.is_linestart() {
                 let line_indent = stream.line_indent();
 
                 if line_indent > indent {
-                    let block_group =
-                        Group::parse_body(Delimiter::Block, stream.pos(), stream, line_indent)?;
+                    let block_group = Group::parse_body(
+                        Delimiter::Block,
+                        stream.pos(),
+                        stream,
+                        line_indent,
+                        options,
+                    )?;
 
                     tokens.push(Token::Group(block_group));
                     continue;
@@ -1115,7 +1134,11 @@ impl Group {
                 if line_indent < indent {
                     // Indentation decreased, so this is the end of the block.
                     if open_delim == Delimiter::Block {
-                        return Ok(Group::new(open_delim, tokens, Span::new(start_pos, stream.pos())));
+                        return Ok(Group::new(
+                            open_delim,
+                            tokens,
+                            Span::new(start_pos, stream.pos()),
+                        ));
                     } else {
                         return Err(LexError {
                             span: Span::new(start_pos, stream.pos()),
@@ -1128,13 +1151,32 @@ impl Group {
             // Can skip whitespace after indentation was handled.
             stream.skip_whitespace();
 
+            if stream.is_empty() {
+                if open_delim == Delimiter::Block && options.block_end_on_eof {
+                    return Ok(Group::new(
+                        open_delim,
+                        tokens,
+                        Span::new(start_pos, stream.pos()),
+                    ));
+                } else {
+                    return Err(LexError {
+                        span: Span::new(start_pos, stream.pos()),
+                        kind: LexErrorKind::UnclosedDelimiter,
+                    });
+                }
+            }
+
+            if Newline::peek(stream) {
+                continue;
+            }
+
             // Check for group start symbols.
             if let Some(open_delim) = Self::peek_open(stream) {
                 let start_pos = stream.pos();
                 stream.consume(1);
                 stream.skip_whitespace();
 
-                let group = Group::parse_body(open_delim, start_pos, stream, indent)?;
+                let group = Group::parse_body(open_delim, start_pos, stream, indent, options)?;
 
                 tokens.push(Token::Group(group));
                 continue;
@@ -1157,7 +1199,7 @@ impl Group {
                 }
             }
 
-            let token = next_token(stream)?;
+            let token = next_token(stream, options)?;
             tokens.push(token);
         }
     }
@@ -1208,12 +1250,12 @@ impl Comment {
         match stream.peek_char() {
             None => Err(LexError {
                 span: stream.span(),
-                kind: LexErrorKind::EndOfInput,
+                kind: LexErrorKind::UnexpectedEndOfInput,
             }),
             Some('/') => match stream.peek_char2() {
                 None => Err(LexError {
                     span: stream.span(),
-                    kind: LexErrorKind::EndOfInput,
+                    kind: LexErrorKind::UnexpectedEndOfInput,
                 }),
                 Some('/') => {
                     // Line comment, consume until end of line or end of input
@@ -1240,7 +1282,7 @@ impl Comment {
                             None => {
                                 return Err(LexError {
                                     span: Span::new(start_pos, start_pos + chars.offset()),
-                                    kind: LexErrorKind::EndOfInput,
+                                    kind: LexErrorKind::UnexpectedEndOfInput,
                                 });
                             }
                             Some((_, '*')) => {
@@ -1288,13 +1330,38 @@ impl Newline {
         self.span
     }
 
-    fn try_parse(stream: &mut Stream) -> Option<Self> {
+    fn peek(stream: &Stream) -> bool {
+        match stream.peek_char() {
+            Some('\n' | '\r') => true,
+            _ => false,
+        }
+    }
+
+    fn parse(stream: &mut Stream) -> Result<Self, LexError> {
         let start_pos = stream.pos();
 
-        if stream.consume_blank_lines() {
-            Some(Newline::new(Span::new(start_pos, stream.pos())))
-        } else {
-            None
+        match stream.peek_char() {
+            Some('\n') => {
+                stream.consume(1);
+                let end_pos = stream.pos();
+                Ok(Newline::new(Span::new(start_pos, end_pos)))
+            }
+            Some('\r') => {
+                stream.consume(1);
+                if stream.peek_char() == Some('\n') {
+                    stream.consume(1);
+                }
+                let end_pos = stream.pos();
+                Ok(Newline::new(Span::new(start_pos, end_pos)))
+            }
+            Some(c) => Err(LexError {
+                span: Span::new(start_pos, start_pos + c.len_utf8()),
+                kind: LexErrorKind::UnexpectedCharacter(c),
+            }),
+            None => Err(LexError {
+                span: Span::new(start_pos, start_pos),
+                kind: LexErrorKind::UnexpectedEndOfInput,
+            }),
         }
     }
 }
@@ -1328,56 +1395,126 @@ impl Token {
 ///
 /// Returns error if the next token is malformed
 /// or if the end of input is reached.
-fn next_token(stream: &mut Stream) -> Result<Token, LexError> {
-    if stream.is_empty() {
-        return Err(LexError {
-            span: Span::new(stream.pos(), stream.pos()),
-            kind: LexErrorKind::EndOfInput,
-        });
-    }
+fn next_token(stream: &mut Stream, options: &Options) -> Result<Token, LexError> {
+    loop {
+        if stream.is_empty() {
+            return Err(LexError {
+                span: Span::new(stream.pos(), stream.pos()),
+                kind: LexErrorKind::UnexpectedEndOfInput,
+            });
+        }
 
-    // Must precede punct, as "//" and "/*" would be parsed as two puncts otherwise.
-    if Comment::is_comment(stream) {
-        let comment = Comment::parse(stream)?;
-        stream.skip_whitespace();
-        return Ok(Token::Comment(comment));
-    }
+        // Must precede punct, as "//" and "/*" would be parsed as two puncts otherwise.
+        if Comment::is_comment(stream) {
+            let comment = Comment::parse(stream)?;
 
-    if Punct::is_punct(stream) {
-        let punct = Punct::parse(stream)?;
-        stream.skip_whitespace();
-        return Ok(Token::Punct(punct));
-    }
+            if !options.emit_comments {
+                continue;
+            }
+            stream.skip_whitespace();
+            return Ok(Token::Comment(comment));
+        }
 
-    if Ident::is_ident(stream) {
-        let ident = Ident::parse(stream)?;
-        stream.skip_whitespace();
-        return Ok(Token::Ident(ident));
-    }
+        if Punct::is_punct(stream) {
+            let punct = Punct::parse(stream)?;
+            stream.skip_whitespace();
+            return Ok(Token::Punct(punct));
+        }
 
-    if Literal::is_literal(stream) {
-        let literal = Literal::parse(stream)?;
-        stream.skip_whitespace();
-        return Ok(Token::Literal(literal));
-    }
+        if Ident::is_ident(stream) {
+            let ident = Ident::parse(stream)?;
+            stream.skip_whitespace();
+            return Ok(Token::Ident(ident));
+        }
 
-    let pos = stream.pos();
-    match stream.peek_char() {
-        None => Err(LexError {
-            span: Span::new(pos, pos),
-            kind: LexErrorKind::EndOfInput,
-        }),
-        Some(ch) => Err(LexError {
-            span: Span::new(pos, pos + ch.len_utf8()),
-            kind: LexErrorKind::UnexpectedCharacter(ch),
-        }),
+        if Literal::is_literal(stream) {
+            let literal = Literal::parse(stream)?;
+            stream.skip_whitespace();
+            return Ok(Token::Literal(literal));
+        }
+
+        let pos = stream.pos();
+
+        match stream.peek_char() {
+            None => unreachable!(),
+            Some(ch) => {
+                return Err(LexError {
+                    span: Span::new(pos, pos + ch.len_utf8()),
+                    kind: LexErrorKind::UnexpectedCharacter(ch),
+                });
+            }
+        }
     }
 }
 
-pub fn parse_stream(stream: &mut Stream) -> Result<Rc<[Token]>, LexError> {
-    let start_pos = stream.pos();
-    let group = Group::parse_body(Delimiter::Block, start_pos, stream, 0)?;
-    Ok(group.tokens)
+pub fn parse_stream(stream: &mut Stream, options: &Options) -> Result<Rc<[Token]>, LexError> {
+    let mut tokens = Vec::new();
+
+    loop {
+        while let Ok(token) = Newline::parse(stream) {
+            if options.ignore_blank_lines {
+                stream.skip_blank_lines();
+            }
+
+            if options.emit_newlines {
+                tokens.push(Token::Newline(token));
+            }
+        }
+
+        if options.ignore_blank_lines {
+            stream.skip_blank_lines();
+        }
+
+        if options.group_blocks && stream.is_linestart() {
+            let line_indent = stream.line_indent();
+
+            if line_indent > 0 {
+                let block_group = Group::parse_body(
+                    Delimiter::Block,
+                    stream.pos(),
+                    stream,
+                    line_indent,
+                    options,
+                )?;
+
+                tokens.push(Token::Group(block_group));
+                continue;
+            }
+        }
+
+        // Can skip whitespace after indentation was handled.
+        stream.skip_whitespace();
+
+        if stream.is_empty() {
+            break;
+        }
+
+        if Newline::peek(stream) {
+            continue;
+        }
+
+        // Check for group start symbols.
+        if let Some(open_delim) = Group::peek_open(stream) {
+            let start_pos = stream.pos();
+            stream.consume(1);
+            stream.skip_whitespace();
+
+            let group = Group::parse_body(open_delim, start_pos, stream, 0, options)?;
+
+            tokens.push(Token::Group(group));
+            continue;
+        }
+
+        let token = next_token(stream, options)?;
+        tokens.push(token);
+    }
+
+    Ok(Rc::from(tokens))
+}
+
+pub fn parse_str(string: &str, options: &Options) -> Result<Rc<[Token]>, LexError> {
+    let mut stream = Stream::from_str(string);
+    parse_stream(&mut stream, options)
 }
 
 fn parse_escape(
@@ -1388,7 +1525,7 @@ fn parse_escape(
     match chars.next() {
         None => Err(LexError {
             span: Span::point(span_offset),
-            kind: LexErrorKind::EndOfInput,
+            kind: LexErrorKind::UnexpectedEndOfInput,
         }),
         Some((_, '\\')) => Ok('\\'),
         Some((_, '\'')) => Ok('\''),
@@ -1405,7 +1542,7 @@ fn parse_escape(
                     None => {
                         return Err(LexError {
                             span: Span::new(span_offset, span_offset + i + 1),
-                            kind: LexErrorKind::EndOfInput,
+                            kind: LexErrorKind::UnexpectedEndOfInput,
                         });
                     }
                     Some((_, ch)) if ch.is_ascii_hexdigit() => {
@@ -1430,7 +1567,7 @@ fn parse_escape(
             None => {
                 return Err(LexError {
                     span: Span::new(span_offset, span_offset + 1),
-                    kind: LexErrorKind::EndOfInput,
+                    kind: LexErrorKind::UnexpectedEndOfInput,
                 });
             }
             Some((_, ch)) if ch.is_ascii_hexdigit() => {
@@ -1443,7 +1580,7 @@ fn parse_escape(
                         None => {
                             return Err(LexError {
                                 span: Span::new(span_offset, span_offset + i + 2),
-                                kind: LexErrorKind::EndOfInput,
+                                kind: LexErrorKind::UnexpectedEndOfInput,
                             });
                         }
                         Some((_, ch)) if ch.is_ascii_hexdigit() => {
@@ -1480,7 +1617,7 @@ fn parse_escape(
                         None => {
                             return Err(LexError {
                                 span: Span::new(span_offset, span_offset + i + 2),
-                                kind: LexErrorKind::EndOfInput,
+                                kind: LexErrorKind::UnexpectedEndOfInput,
                             });
                         }
                         Some((pos, '}')) => {
@@ -1511,7 +1648,7 @@ fn parse_escape(
                         None => {
                             return Err(LexError {
                                 span: Span::new(span_offset, span_offset + 8),
-                                kind: LexErrorKind::EndOfInput,
+                                kind: LexErrorKind::UnexpectedEndOfInput,
                             });
                         }
                         Some((pos, ch)) => {
@@ -1555,7 +1692,7 @@ fn parse_escape(
                     None => {
                         return Err(LexError {
                             span: Span::new(span_offset, span_offset + i + 1),
-                            kind: LexErrorKind::EndOfInput,
+                            kind: LexErrorKind::UnexpectedEndOfInput,
                         });
                     }
                     Some((_, ch)) if ch.is_ascii_hexdigit() => {

@@ -1,10 +1,10 @@
 use raft_lexer::Span;
 
-use crate::{BinaryOpKind, ExprKind, PatKind, StmtKind, UnaryOpKind, parse::TokenStream};
+use crate::{BinaryOpKind, ExprKind, PatKind, StmtKind, UnaryOpKind, parser::TokenStream};
 
 fn tokens_from_str(s: &str) -> TokenStream {
-    let mut stream = raft_lexer::Stream::from_str(s);
-    TokenStream::new(raft_lexer::parse_stream(&mut stream).unwrap())
+    let tokens = raft_lexer::parse_str(s, &raft_lexer::Options::wss()).unwrap();
+    TokenStream::new(tokens)
 }
 
 #[test]
