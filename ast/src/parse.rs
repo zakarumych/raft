@@ -1,21 +1,16 @@
 use std::rc::Rc;
 
 use crate::{
-    Atom, BinaryOp, Expr, ExprKind, ExprRecordField, Ident, Literal, Pattern, PatternKind,
-    PatternRecordField, Span, Stmt, StmtKind, UnaryOp,
+    Atom, BinaryOp, BinaryOpKind, Expr, ExprKind, ExprRecordField, Ident, Literal, Pat, PatKind,
+    PatRecordField, Span, Stmt, StmtKind, UnaryOp, UnaryOpKind,
 };
 
 use raft_lexer::Token;
 
 #[derive(Debug)]
 pub enum ParseError {
-    UnexpectedKeyword(Keyword, Span),
     UnexpectedToken(Span),
-    UnexpectedEof(Span),
-    ExpectedPunct(char, Span),
-    ExpectedAtom(Span),
-    ExpectedIdent(Span),
-    ExpectedKeyword(Keyword, Span),
+    UnexpectedEnd(Span),
     InvalidAssignmentTarget(Span),
 }
 
@@ -29,6 +24,22 @@ pub enum Keyword {
     While,
     For,
     In,
+}
+
+impl Keyword {
+    pub fn from_ident(ident: &str) -> Option<Self> {
+        match ident {
+            "return" => Some(Keyword::Return),
+            "break" => Some(Keyword::Break),
+            "continue" => Some(Keyword::Continue),
+            "if" => Some(Keyword::If),
+            "else" => Some(Keyword::Else),
+            "while" => Some(Keyword::While),
+            "for" => Some(Keyword::For),
+            "in" => Some(Keyword::In),
+            _ => None,
+        }
+    }
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -93,13 +104,79 @@ impl TokenStream {
             false
         }
     }
+
+    fn skip_comments(&mut self) -> bool {
+        if let Some(Token::Comment(_)) = self.peek() {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_comments_and_newlines(&mut self) -> bool {
+        let mut skipped = false;
+        while let Some(tok) = self.peek() {
+            match tok {
+                Token::Comment(_) | Token::Newline(_) => {
+                    self.advance();
+                    skipped = true;
+                }
+                _ => break,
+            }
+        }
+        skipped
+    }
+
+    fn expect_end(&self) -> ParseResult<()> {
+        if let Some(tok) = self.peek() {
+            Err(ParseError::UnexpectedToken(tok.span()))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn parse_ident(&mut self) -> ParseResult<Ident> {
+        Ident::parse(self)
+    }
+
+    pub fn parse_atom(&mut self) -> ParseResult<Atom> {
+        Atom::parse(self)
+    }
+
+    pub fn parse_literal(&mut self) -> ParseResult<Literal> {
+        Literal::parse(self)
+    }
+
+    pub fn parse_unary_op(&mut self) -> ParseResult<UnaryOp> {
+        UnaryOp::parse(self)
+    }
+
+    pub fn parse_binary_op(&mut self) -> ParseResult<BinaryOp> {
+        BinaryOp::parse(self)
+    }
+
+    pub fn parse_pat(&mut self) -> ParseResult<Pat> {
+        Pat::parse(self)
+    }
+
+    pub fn parse_expr(&mut self) -> ParseResult<Expr> {
+        Expr::parse(self)
+    }
+
+    pub fn parse_stmt(&mut self) -> ParseResult<Stmt> {
+        Stmt::parse(self)
+    }
 }
 
-// Leaf-node parsers working on TokenStream
 impl Ident {
-    fn try_parse(stream: &TokenStream) -> Option<Ident> {
+    fn peek(stream: &TokenStream) -> Option<Ident> {
         match stream.peek() {
             Some(Token::Ident(i)) => {
+                if Keyword::from_ident(i.repr()).is_some() {
+                    return None;
+                }
+
                 let s = i.repr();
                 if s.chars().next().map(|c| !c.is_uppercase()).unwrap_or(false) {
                     let name = i.rc_repr();
@@ -112,12 +189,39 @@ impl Ident {
             _ => None,
         }
     }
+
+    fn parse(stream: &mut TokenStream) -> ParseResult<Ident> {
+        match stream.peek() {
+            Some(Token::Ident(i)) => {
+                if Keyword::from_ident(i.repr()).is_some() {
+                    return Err(ParseError::UnexpectedToken(i.span()));
+                }
+
+
+                let s = i.repr();
+                if s.chars().next().map(|c| !c.is_uppercase()).unwrap_or(false) {
+                    stream.advance();
+                    let name = i.rc_repr();
+                    let span = i.span();
+                    Ok(Ident { name, span })
+                } else {
+                    Err(ParseError::UnexpectedToken(i.span()))
+                }
+            }
+            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+        }
+    }
 }
 
 impl Atom {
-    fn try_parse(stream: &TokenStream) -> Option<Atom> {
+    fn peek(stream: &TokenStream) -> Option<Atom> {
         match stream.peek() {
             Some(Token::Ident(i)) => {
+                if Keyword::from_ident(i.repr()).is_some() {
+                    return None;
+                }
+
                 let s = i.repr();
                 if s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                     let name = i.rc_repr();
@@ -130,10 +234,32 @@ impl Atom {
             _ => None,
         }
     }
+
+    fn parse(stream: &mut TokenStream) -> ParseResult<Atom> {
+        match stream.peek() {
+            Some(Token::Ident(i)) => {
+                if Keyword::from_ident(i.repr()).is_some() {
+                    return Err(ParseError::UnexpectedToken(i.span()));
+                }
+
+                let s = i.repr();
+                if s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    stream.advance();
+                    let name = i.rc_repr();
+                    let span = i.span();
+                    Ok(Atom { name, span })
+                } else {
+                    Err(ParseError::UnexpectedToken(i.span()))
+                }
+            }
+            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+        }
+    }
 }
 
 impl Literal {
-    fn try_parse(stream: &TokenStream) -> Option<Literal> {
+    fn peek(stream: &TokenStream) -> Option<Literal> {
         match stream.peek() {
             Some(Token::Literal(l)) => {
                 let lit = l.clone();
@@ -146,6 +272,308 @@ impl Literal {
             _ => None,
         }
     }
+
+    fn parse(stream: &mut TokenStream) -> ParseResult<Literal> {
+        match stream.peek() {
+            Some(Token::Literal(l)) => {
+                stream.advance();
+                let lit = l.clone();
+                match lit {
+                    raft_lexer::Literal::Number(n) => Ok(Literal::Number(n)),
+                    raft_lexer::Literal::Char(c) => Ok(Literal::Char(c)),
+                    raft_lexer::Literal::String(s) => Ok(Literal::String(s)),
+                }
+            }
+            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+        }
+    }
+}
+
+impl UnaryOp {
+    fn peek(stream: &TokenStream) -> Option<UnaryOp> {
+        match stream.peek() {
+            Some(Token::Punct(p)) => {
+                let ch = p.repr();
+                let kind = match ch {
+                    '!' => Some(UnaryOpKind::Not),
+                    '~' => Some(UnaryOpKind::BitNot),
+                    '+' => Some(UnaryOpKind::Pos),
+                    '-' => Some(UnaryOpKind::Neg),
+                    _ => None,
+                };
+                if let Some(k) = kind {
+                    let span = p.span();
+                    Some(UnaryOp { kind: k, span })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn parse(stream: &mut TokenStream) -> ParseResult<UnaryOp> {
+        match stream.peek() {
+            Some(Token::Punct(p)) => {
+                let ch = p.repr();
+                let kind = match ch {
+                    '!' => Some(UnaryOpKind::Not),
+                    '~' => Some(UnaryOpKind::BitNot),
+                    '+' => Some(UnaryOpKind::Pos),
+                    '-' => Some(UnaryOpKind::Neg),
+                    _ => None,
+                };
+                if let Some(k) = kind {
+                    let span = p.span();
+                    stream.advance();
+                    Ok(UnaryOp { kind: k, span })
+                } else {
+                    Err(ParseError::UnexpectedToken(p.span()))
+                }
+            }
+            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+        }
+    }
+}
+
+impl BinaryOp {
+    fn peek(stream: &TokenStream) -> Option<BinaryOp> {
+        match stream.peek() {
+            Some(Token::Punct(p1)) => match (p1.repr(), stream.peek1()) {
+                ('<', Some(Token::Punct(p2))) if p2.repr() == '<' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Shl,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('>', Some(Token::Punct(p2))) if p2.repr() == '>' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Shr,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('*', Some(Token::Punct(p2))) if p2.repr() == '*' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Pow,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('=', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Eq,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('!', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Ne,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('<', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Le,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('>', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Ge,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('&', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::BitAnd,
+                        span: p1.span(),
+                    });
+                }
+                ('|', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::BitOr,
+                        span: p1.span(),
+                    });
+                }
+                ('^', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::BitXor,
+                        span: p1.span(),
+                    });
+                }
+                ('*', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Mul,
+                        span: p1.span(),
+                    });
+                }
+                ('/', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Div,
+                        span: p1.span(),
+                    });
+                }
+                ('+', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Add,
+                        span: p1.span(),
+                    });
+                }
+                ('-', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Sub,
+                        span: p1.span(),
+                    });
+                }
+                ('<', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Lt,
+                        span: p1.span(),
+                    });
+                }
+                ('>', _) => {
+                    return Some(BinaryOp {
+                        kind: BinaryOpKind::Gt,
+                        span: p1.span(),
+                    });
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn parse(stream: &mut TokenStream) -> ParseResult<BinaryOp> {
+        match stream.peek() {
+            Some(Token::Punct(p1)) => match (p1.repr(), stream.peek1()) {
+                ('<', Some(Token::Punct(p2))) if p2.repr() == '<' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Shl,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('>', Some(Token::Punct(p2))) if p2.repr() == '>' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Shr,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('*', Some(Token::Punct(p2))) if p2.repr() == '*' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Pow,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('=', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Eq,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('!', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Ne,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('<', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Le,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('>', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                    stream.advance();
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Ge,
+                        span: p1.span().join(p2.span()),
+                    });
+                }
+                ('&', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::BitAnd,
+                        span: p1.span(),
+                    });
+                }
+                ('|', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::BitOr,
+                        span: p1.span(),
+                    });
+                }
+                ('^', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::BitXor,
+                        span: p1.span(),
+                    });
+                }
+                ('*', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Mul,
+                        span: p1.span(),
+                    });
+                }
+                ('/', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Div,
+                        span: p1.span(),
+                    });
+                }
+                ('+', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Add,
+                        span: p1.span(),
+                    });
+                }
+                ('-', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Sub,
+                        span: p1.span(),
+                    });
+                }
+                ('<', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Lt,
+                        span: p1.span(),
+                    });
+                }
+                ('>', _) => {
+                    stream.advance();
+                    return Ok(BinaryOp {
+                        kind: BinaryOpKind::Gt,
+                        span: p1.span(),
+                    });
+                }
+                (_, _) => {
+                    return Err(ParseError::UnexpectedToken(p1.span()));
+                }
+            },
+            Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.start_span())),
+        }
+    }
 }
 
 impl Expr {
@@ -156,27 +584,32 @@ impl Expr {
     fn parse_binary(stream: &mut TokenStream, min_prec: u8) -> ParseResult<Self> {
         let mut lhs = Self::parse_application(stream)?;
         loop {
-            match try_parse_binary_op(stream) {
-                Some(op) if op.precedence() > min_prec => {
-                    let rhs_min = if op.is_right_assoc() {
-                        op.precedence() - 1
-                    } else {
-                        op.precedence()
-                    };
+            match BinaryOp::peek(stream) {
+                Some(op) => {
+                    if op.kind.precedence() > min_prec {
+                        for _ in 0..op.kind.token_size() {
+                            stream.advance();
+                        }
+                        let rhs_min = if op.kind.is_right_assoc() {
+                            op.kind.precedence() - 1
+                        } else {
+                            op.kind.precedence()
+                        };
 
-                    let rhs = Self::parse_binary(stream, rhs_min)?;
-                    let span = Span {
-                        start: lhs.span.start,
-                        end: rhs.span.end,
-                    };
-                    lhs = Expr {
-                        kind: ExprKind::Binary(Box::new(lhs), op, Box::new(rhs)),
-                        span,
-                    };
+                        let rhs = Self::parse_binary(stream, rhs_min)?;
+                        let span = Span {
+                            start: lhs.span.start,
+                            end: rhs.span.end,
+                        };
+                        lhs = Expr {
+                            kind: ExprKind::Binary(Rc::new(lhs), op, Rc::new(rhs)),
+                            span,
+                        };
+                    } else {
+                        break;
+                    }
                 }
-                Some(_) => {
-                    break;
-                }
+                // Some(_) => break,
                 None => break,
             }
         }
@@ -184,39 +617,63 @@ impl Expr {
     }
 
     fn parse_application(stream: &mut TokenStream) -> ParseResult<Self> {
-        let mut expr = Self::parse_unary(stream)?;
+        let expr = Self::parse_unary(stream)?;
+        let mut args = Vec::new();
         loop {
             match stream.peek() {
-                Some(Token::Group(g))
-                    if matches!(g.delimiter(), raft_lexer::Delimiter::Parenthesis) =>
-                {
-                    stream.advance();
-
-                    // build inner token stream from group tokens
-                    let mut group_stream = TokenStream::new(g.rc_tokens());
-                    let span = expr.span.join(g.span());
-
-                    let arg = Expr::parse(&mut group_stream)?;
-                    expr = Expr {
-                        kind: ExprKind::Apply(Box::new(expr), vec![arg]),
-                        span,
-                    };
+                Some(Token::Punct(_)) => {
+                    if BinaryOp::peek(stream).is_some() {
+                        break;
+                    }
+                    if UnaryOp::peek(stream).is_none() {
+                        break;
+                    }
                 }
-                _ => break,
+                Some(Token::Ident(ident)) => {
+                    match Keyword::from_ident(ident.repr()) {
+                        Some(_) => break,
+                        None => {}
+                    }
+                }
+                Some(Token::Literal(_)) => {}
+                Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Block => break,
+                Some(Token::Group(_)) => {}
+                Some(Token::Comment(_)) => {
+                    stream.advance();
+                    continue;
+                }
+                Some(Token::Newline(_)) => break,
+                None => break,
+            };
+
+            match Self::parse_unary(stream) {
+                Ok(arg) => {
+                    args.push(arg);
+                }
+                Err(_) => break,
             }
         }
-        Ok(expr)
+
+        if args.is_empty() {
+            Ok(expr)
+        } else {
+            let span = Span {
+                start: expr.span.start,
+                end: args.last().unwrap().span.end,
+            };
+            Ok(Expr {
+                kind: ExprKind::Apply(Rc::new(expr), Rc::from(args)),
+                span,
+            })
+        }
     }
 
     fn parse_unary(stream: &mut TokenStream) -> ParseResult<Self> {
-        if let Some(op) = try_parse_unary_op(stream)? {
+        if let Ok(op) = UnaryOp::parse(stream) {
             let operand = Self::parse_unary(stream)?;
-            let span = Span {
-                start: op.span.start,
-                end: operand.span.end,
-            };
+            let span = op.span().join(operand.span());
             Ok(Expr {
-                kind: ExprKind::Unary(op, Box::new(operand)),
+                kind: ExprKind::Unary(op, Rc::new(operand)),
                 span,
             })
         } else {
@@ -229,16 +686,12 @@ impl Expr {
         loop {
             match stream.peek() {
                 Some(Token::Punct(p)) if p.repr() == '.' => {
-                    stream.advance(); // consume '.'
-                    // Ident is required after '.'
-                    let field = Ident::try_parse(stream)
-                        .ok_or(ParseError::ExpectedIdent(stream.start_span()))?;
-                    let span = Span {
-                        start: expr.span.start,
-                        end: field.span.end,
-                    };
+                    stream.advance();
+
+                    let field = Ident::parse(stream)?;
+                    let span = expr.span().join(field.span());
                     expr = Expr {
-                        kind: ExprKind::Field(Box::new(expr), field),
+                        kind: ExprKind::Field(Rc::new(expr), field),
                         span,
                     };
                 }
@@ -247,17 +700,15 @@ impl Expr {
                 {
                     stream.advance();
 
-                    // build inner token stream from group tokens
                     let mut group_stream = TokenStream::new(g.rc_tokens());
 
-                    let span = expr.span.join(g.span());
+                    let span = expr.span().join(g.span());
                     let index = Expr::parse(&mut group_stream)?;
-                    if let Some(next) = group_stream.peek() {
-                        return Err(ParseError::UnexpectedToken(next.span()));
-                    }
+                    group_stream.skip_comments_and_newlines();
+                    group_stream.expect_end()?;
 
                     expr = Expr {
-                        kind: ExprKind::Index(Box::new(expr), Box::new(index)),
+                        kind: ExprKind::Index(Rc::new(expr), Rc::new(index)),
                         span,
                     };
                 }
@@ -269,125 +720,113 @@ impl Expr {
 
     fn parse_primary(stream: &mut TokenStream) -> ParseResult<Self> {
         match stream.peek() {
-            Some(Token::Group(g)) => {
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Parenthesis => {
+                let mut group_stream = TokenStream::new(g.rc_tokens());
+                group_stream.skip_comments_and_newlines();
+
+                let mut expr = Expr::parse(&mut group_stream)?;
+                group_stream.skip_comments_and_newlines();
+                group_stream.expect_end()?;
+
+                expr.span = g.span();
                 stream.advance();
+                Ok(expr)
+            }
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {
+                let mut group_stream = TokenStream::new(g.rc_tokens());
+                group_stream.skip_comments_and_newlines();
 
-                match g.delimiter() {
-                    raft_lexer::Delimiter::Parenthesis => {
-                        let mut group_stream = TokenStream::new(g.rc_tokens());
-                        group_stream.skip_newlines();
+                let mut items = Vec::new();
+                while group_stream.peek().is_some() {
+                    let e = Expr::parse(&mut group_stream)?;
+                    group_stream.skip_comments_and_newlines();
 
-                        let mut expr = Expr::parse(&mut group_stream)?;
-                        group_stream.skip_newlines();
-
-                        if let Some(tok) = group_stream.peek() {
-                            return Err(ParseError::UnexpectedToken(tok.span()));
+                    items.push(e);
+                    match group_stream.peek() {
+                        Some(Token::Punct(p)) if p.repr() == ',' => {
+                            group_stream.advance();
+                            group_stream.skip_comments_and_newlines();
+                            continue;
                         }
-
-                        expr.span = g.span();
-                        Ok(expr)
+                        Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
+                        None => break,
                     }
-                    raft_lexer::Delimiter::Bracket => {
-                        // list literal
-                        let mut group_stream = TokenStream::new(g.rc_tokens());
-                        group_stream.skip_newlines();
+                }
 
-                        let mut items = Vec::new();
-                        while group_stream.peek().is_some() {
-                            let e = Expr::parse(&mut group_stream)?;
-                            group_stream.skip_newlines();
+                stream.advance();
+                Ok(Expr {
+                    kind: ExprKind::List(Rc::from(items)),
+                    span: g.span(),
+                })
+            }
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Brace => {
+                let mut group_stream = TokenStream::new(g.rc_tokens());
+                group_stream.skip_comments_and_newlines();
 
-                            items.push(e);
+                let mut fields = Vec::new();
+                while group_stream.peek().is_some() {
+                    let key = Ident::parse(&mut group_stream)?;
+                    group_stream.skip_comments_and_newlines();
+
+                    match group_stream.peek() {
+                        Some(Token::Punct(p)) if p.repr() == ':' => {
+                            group_stream.advance();
+                            group_stream.skip_comments_and_newlines();
+
+                            let value = Expr::parse(&mut group_stream)?;
+                            group_stream.skip_comments_and_newlines();
+
+                            let field_span = key.span.join(value.span);
+                            fields.push(ExprRecordField {
+                                key,
+                                value: Some(value),
+                                span: field_span,
+                            });
                             match group_stream.peek() {
                                 Some(Token::Punct(p)) if p.repr() == ',' => {
                                     group_stream.advance();
-                                    group_stream.skip_newlines();
-                                    continue;
-                                }
-                                Some(tok) => return Err(ParseError::ExpectedPunct(',', tok.span())),
-                                None => break,
-                            }
-                        }
-                        Ok(Expr {
-                            kind: ExprKind::List(items),
-                            span: g.span(),
-                        })
-                    }
-                    raft_lexer::Delimiter::Brace => {
-                        // record literal
-                        let mut group_stream = TokenStream::new(g.rc_tokens());
-                        group_stream.skip_newlines();
-
-                        let mut fields = Vec::new();
-                        while group_stream.peek().is_some() {
-                            // key must be ident
-                            let key = Ident::try_parse(&mut group_stream)
-                                .ok_or(ParseError::ExpectedIdent(group_stream.start_span()))?;
-                            group_stream.skip_newlines();
-
-                            // expect ':'
-                            match group_stream.peek() {
-                                Some(Token::Punct(p)) if p.repr() == ':' => {
-                                    group_stream.advance(); // consume ':'
-                                    group_stream.skip_newlines();
-
-                                    let value = Expr::parse(&mut group_stream)?;
-                                    group_stream.skip_newlines();
-
-                                    let field_span = key.span.join(value.span);
-                                    fields.push(ExprRecordField {
-                                        key,
-                                        value: Some(value),
-                                        span: field_span,
-                                    });
-                                    match group_stream.peek() {
-                                        Some(Token::Punct(p)) if p.repr() == ',' => {
-                                            group_stream.advance();
-                                            group_stream.skip_newlines();
-                                            continue;
-                                        }
-                                        Some(tok) => {
-                                            return Err(ParseError::ExpectedPunct(',', tok.span()));
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                Some(Token::Punct(p)) if p.repr() == ',' => {
-                                    group_stream.advance();
-                                    group_stream.skip_newlines();
-
-                                    let key_span = key.span;
-                                    fields.push(ExprRecordField {
-                                        key: key.clone(),
-                                        value: None,
-                                        span: key_span,
-                                    });
-
+                                    group_stream.skip_comments_and_newlines();
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::ExpectedPunct(',', tok.span()));
+                                    return Err(ParseError::UnexpectedToken(tok.span()));
                                 }
-                                None => {
-                                    let key_span = key.span;
-                                    fields.push(ExprRecordField {
-                                        key: key.clone(),
-                                        value: None,
-                                        span: key_span,
-                                    });
-                                    break;
-                                }
+                                None => break,
                             }
                         }
-                        Ok(Expr {
-                            kind: ExprKind::Record(fields),
-                            span: g.span(),
-                        })
-                    }
-                    raft_lexer::Delimiter::Block => {
-                        return Err(ParseError::UnexpectedToken(g.span()));
+                        Some(Token::Punct(p)) if p.repr() == ',' => {
+                            group_stream.advance();
+                            group_stream.skip_comments_and_newlines();
+
+                            let key_span = key.span;
+                            fields.push(ExprRecordField {
+                                key: key.clone(),
+                                value: None,
+                                span: key_span,
+                            });
+
+                            continue;
+                        }
+                        Some(tok) => {
+                            return Err(ParseError::UnexpectedToken(tok.span()));
+                        }
+                        None => {
+                            let key_span = key.span;
+                            fields.push(ExprRecordField {
+                                key: key.clone(),
+                                value: None,
+                                span: key_span,
+                            });
+                            break;
+                        }
                     }
                 }
+
+                stream.advance();
+                Ok(Expr {
+                    kind: ExprKind::Record(Rc::from(fields)),
+                    span: g.span(),
+                })
             }
             Some(Token::Literal(l)) => {
                 stream.advance();
@@ -431,153 +870,11 @@ impl Expr {
                 }
             }
             Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEof(stream.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.span())),
         }
     }
 }
 
-fn try_parse_unary_op(stream: &mut TokenStream) -> ParseResult<Option<UnaryOp>> {
-    match stream.peek() {
-        Some(Token::Punct(p)) => {
-            let ch = p.repr();
-            let kind = match ch {
-                '!' => Some(crate::UnaryOpKind::Not),
-                '-' => Some(crate::UnaryOpKind::Neg),
-                '~' => Some(crate::UnaryOpKind::BitNot),
-                _ => None,
-            };
-            if let Some(k) = kind {
-                let span = p.span();
-                stream.advance();
-                Ok(Some(UnaryOp { kind: k, span }))
-            } else {
-                Ok(None)
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-// Binary op parser on TokenStream
-fn try_parse_binary_op(stream: &mut TokenStream) -> Option<BinaryOp> {
-    match stream.peek() {
-        Some(Token::Punct(p1)) => {
-            let start = p1.span().start;
-            // lookahead for second punct
-            match (p1.repr(), stream.peek1()) {
-                ('<', Some(Token::Punct(p2))) if p2.repr() == '<' => {
-                    // consume both
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Shl,
-                        span,
-                    });
-                }
-                ('>', Some(Token::Punct(p2))) if p2.repr() == '>' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Shr,
-                        span,
-                    });
-                }
-                ('*', Some(Token::Punct(p2))) if p2.repr() == '*' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Pow,
-                        span,
-                    });
-                }
-                ('=', Some(Token::Punct(p2))) if p2.repr() == '=' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Eq,
-                        span,
-                    });
-                }
-                ('!', Some(Token::Punct(p2))) if p2.repr() == '=' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Ne,
-                        span,
-                    });
-                }
-                ('<', Some(Token::Punct(p2))) if p2.repr() == '=' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Le,
-                        span,
-                    });
-                }
-                ('>', Some(Token::Punct(p2))) if p2.repr() == '=' => {
-                    stream.advance();
-                    stream.advance();
-                    let span = Span {
-                        start,
-                        end: p2.span().end,
-                    };
-                    return Some(BinaryOp {
-                        kind: crate::BinaryOpKind::Ge,
-                        span,
-                    });
-                }
-                _ => {
-                    // single-char ops
-                    let kind = match p1.repr() {
-                        '&' => Some(crate::BinaryOpKind::BitAnd),
-                        '|' => Some(crate::BinaryOpKind::BitOr),
-                        '^' => Some(crate::BinaryOpKind::BitXor),
-                        '*' => Some(crate::BinaryOpKind::Mul),
-                        '/' => Some(crate::BinaryOpKind::Div),
-                        '+' => Some(crate::BinaryOpKind::Add),
-                        '-' => Some(crate::BinaryOpKind::Sub),
-                        '<' => Some(crate::BinaryOpKind::Lt),
-                        '>' => Some(crate::BinaryOpKind::Gt),
-                        _ => None,
-                    };
-                    if let Some(k) = kind {
-                        let span = p1.span();
-                        stream.advance();
-                        return Some(BinaryOp { kind: k, span });
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-// Keyword helper for TokenStream: consumes ident if it matches keyword
 fn peek_keyword(stream: &mut TokenStream) -> Option<(Keyword, Span)> {
     match stream.peek() {
         Some(Token::Ident(i)) => {
@@ -603,44 +900,43 @@ fn peek_keyword(stream: &mut TokenStream) -> Option<(Keyword, Span)> {
     }
 }
 
-// Convert Expr AST to Pattern if possible
-fn expr_to_pattern(expr: &Expr) -> Option<Pattern> {
+fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
     match &expr.kind {
-        ExprKind::Ident(i) => Some(Pattern {
+        ExprKind::Ident(i) => Some(Pat {
             span: i.span,
-            kind: PatternKind::Ident(i.clone()),
+            kind: PatKind::Ident(i.clone()),
         }),
-        ExprKind::Atom(a) => Some(Pattern {
+        ExprKind::Atom(a) => Some(Pat {
             span: a.span,
-            kind: PatternKind::Atom(a.clone()),
+            kind: PatKind::Atom(a.clone()),
         }),
-        ExprKind::Literal(l) => Some(Pattern {
+        ExprKind::Literal(l) => Some(Pat {
             span: l.span(),
-            kind: PatternKind::Literal(l.clone()),
+            kind: PatKind::Literal(l.clone()),
         }),
         ExprKind::List(items) => {
             let mut pats = Vec::new();
-            for it in items {
+            for it in items.iter() {
                 if let Some(p) = expr_to_pattern(it) {
                     pats.push(p);
                 } else {
                     return None;
                 }
             }
-            Some(Pattern {
+            Some(Pat {
                 span: Span {
                     start: items.first().map(|e| e.span.start).unwrap_or(0),
                     end: items.last().map(|e| e.span.end).unwrap_or(0),
                 },
-                kind: PatternKind::List(pats),
+                kind: PatKind::List(Rc::from(pats)),
             })
         }
         ExprKind::Record(fields) => {
             let mut pats = Vec::new();
-            for f in fields {
+            for f in fields.iter() {
                 if let Some(value) = &f.value {
                     if let Some(pat) = expr_to_pattern(value) {
-                        pats.push(PatternRecordField {
+                        pats.push(PatRecordField {
                             key: f.key.clone(),
                             pattern: Some(pat),
                             span: f.span,
@@ -649,75 +945,83 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pattern> {
                         return None;
                     }
                 } else {
-                    pats.push(PatternRecordField {
+                    pats.push(PatRecordField {
                         key: f.key.clone(),
                         pattern: None,
                         span: f.span,
                     });
                 }
             }
-            Some(Pattern {
+            Some(Pat {
                 span: Span {
                     start: fields.first().map(|f| f.span.start).unwrap_or(0),
                     end: fields.last().map(|f| f.span.end).unwrap_or(0),
                 },
-                kind: PatternKind::Record(pats),
+                kind: PatKind::Record(Rc::from(pats)),
             })
         }
         _ => None,
     }
 }
 
-// Pattern parsers on TokenStream
-impl Pattern {
+impl Pat {
     pub fn parse(stream: &mut TokenStream) -> ParseResult<Self> {
         match stream.peek() {
-            Some(Token::Group(g)) if matches!(g.delimiter(), raft_lexer::Delimiter::Bracket) => {
-                // list pattern
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Parenthesis => {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
-                group_stream.skip_newlines();
+                group_stream.skip_comments_and_newlines();
+
+                let mut pattern = Pat::parse(&mut group_stream)?;
+                group_stream.skip_comments_and_newlines();
+                group_stream.expect_end()?;
+
+                pattern.span = g.span();
+                stream.advance();
+                Ok(pattern)
+            }
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {
+                let mut group_stream = TokenStream::new(g.rc_tokens());
+                group_stream.skip_comments_and_newlines();
 
                 let mut items = Vec::new();
                 while group_stream.peek().is_some() {
-                    let e = Pattern::parse(&mut group_stream)?;
-                    group_stream.skip_newlines();
+                    let e = Pat::parse(&mut group_stream)?;
+                    group_stream.skip_comments_and_newlines();
 
                     items.push(e);
                     match group_stream.peek() {
                         Some(Token::Punct(p)) if p.repr() == ',' => {
                             group_stream.advance();
-                            group_stream.skip_newlines();
+                            group_stream.skip_comments_and_newlines();
                             continue;
                         }
-                        Some(tok) => return Err(ParseError::ExpectedPunct(',', tok.span())),
+                        Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
                         None => break,
                     }
                 }
-                Ok(Pattern {
-                    kind: PatternKind::List(items),
+                stream.advance();
+                Ok(Pat {
+                    kind: PatKind::List(Rc::from(items)),
                     span: g.span(),
                 })
             }
-            Some(Token::Group(g)) if matches!(g.delimiter(), raft_lexer::Delimiter::Brace) => {
-                // record pattern
+            Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Brace => {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
-                group_stream.skip_newlines();
+                group_stream.skip_comments_and_newlines();
 
                 let mut fields = Vec::new();
                 while group_stream.peek().is_some() {
-                    // key must be ident
-                    let key = Ident::try_parse(&mut group_stream)
-                        .ok_or(ParseError::ExpectedIdent(group_stream.start_span()))?;
-                    group_stream.skip_newlines();
-                    // expect ':'
+                    let key = Ident::parse(&mut group_stream)?;
+                    group_stream.skip_comments_and_newlines();
+
                     match group_stream.peek() {
                         Some(Token::Punct(p)) if p.repr() == ':' => {
-                            group_stream.advance(); // consume ':'
-                            group_stream.skip_newlines();
-                            let pattern = Pattern::parse(&mut group_stream)?;
-                            group_stream.skip_newlines();
+                            group_stream.advance();
+                            group_stream.skip_comments_and_newlines();
+                            let pattern = Pat::parse(&mut group_stream)?;
+                            group_stream.skip_comments_and_newlines();
                             let field_span = key.span.join(pattern.span);
-                            fields.push(PatternRecordField {
+                            fields.push(PatRecordField {
                                 key,
                                 pattern: Some(pattern),
                                 span: field_span,
@@ -725,21 +1029,21 @@ impl Pattern {
                             match group_stream.peek() {
                                 Some(Token::Punct(p)) if p.repr() == ',' => {
                                     group_stream.advance();
-                                    group_stream.skip_newlines();
+                                    group_stream.skip_comments_and_newlines();
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::ExpectedPunct(',', tok.span()));
+                                    return Err(ParseError::UnexpectedToken(tok.span()));
                                 }
                                 None => break,
                             }
                         }
                         Some(Token::Punct(p)) if p.repr() == ',' => {
                             group_stream.advance();
-                            group_stream.skip_newlines();
+                            group_stream.skip_comments_and_newlines();
 
                             let key_span = key.span;
-                            fields.push(PatternRecordField {
+                            fields.push(PatRecordField {
                                 key: key.clone(),
                                 pattern: None,
                                 span: key_span,
@@ -747,11 +1051,11 @@ impl Pattern {
                             continue;
                         }
                         Some(tok) => {
-                            return Err(ParseError::ExpectedPunct(',',tok.span()));
+                            return Err(ParseError::UnexpectedToken(tok.span()));
                         }
                         None => {
                             let key_span = key.span;
-                            fields.push(PatternRecordField {
+                            fields.push(PatRecordField {
                                 key: key.clone(),
                                 pattern: None,
                                 span: key_span,
@@ -760,17 +1064,18 @@ impl Pattern {
                         }
                     }
                 }
-                Ok(Pattern {
-                    kind: PatternKind::Record(fields),
+                stream.advance();
+                Ok(Pat {
+                    kind: PatKind::Record(Rc::from(fields)),
                     span: g.span(),
                 })
             }
             Some(Token::Literal(l)) => {
                 let lit = l.clone();
                 stream.advance();
-                Ok(Pattern {
+                Ok(Pat {
                     span: lit.span(),
-                    kind: PatternKind::Literal(match lit {
+                    kind: PatKind::Literal(match lit {
                         raft_lexer::Literal::Number(n) => Literal::Number(n),
                         raft_lexer::Literal::Char(c) => Literal::Char(c),
                         raft_lexer::Literal::String(s) => Literal::String(s),
@@ -787,8 +1092,8 @@ impl Pattern {
                             name: i.rc_repr(),
                             span,
                         };
-                        Ok(Pattern {
-                            kind: PatternKind::Atom(a),
+                        Ok(Pat {
+                            kind: PatKind::Atom(a),
                             span,
                         })
                     }
@@ -797,38 +1102,34 @@ impl Pattern {
                             name: i.rc_repr(),
                             span,
                         };
-                        Ok(Pattern {
-                            kind: PatternKind::Ident(id),
+                        Ok(Pat {
+                            kind: PatKind::Ident(id),
                             span,
                         })
                     }
                 }
             }
             Some(tok) => Err(ParseError::UnexpectedToken(tok.span())),
-            None => Err(ParseError::UnexpectedEof(stream.span())),
+            None => Err(ParseError::UnexpectedEnd(stream.span())),
         }
     }
 }
 
-// Statement parsing on TokenStream
 impl Stmt {
     pub fn parse_simple(stream: &mut TokenStream) -> ParseResult<Self> {
-        // parse lhs expr
         let lhs = Expr::parse(stream)?;
 
-        // assignment?
         match stream.peek() {
             Some(Token::Punct(p)) if p.repr() == '=' => {
-                stream.advance(); // consume '='
+                stream.advance();
                 let rhs = Expr::parse(stream)?;
 
-                // build assignment stmt
                 match &lhs.kind {
                     ExprKind::Field(obj, field_ident) => {
                         return Ok(Stmt {
                             span: lhs.span.join(rhs.span),
                             kind: StmtKind::AssignField {
-                                target: (*obj).clone(),
+                                target: obj.clone(),
                                 field: field_ident.clone(),
                                 value: rhs,
                             },
@@ -860,7 +1161,6 @@ impl Stmt {
                 }
             }
             _ => {
-                // expression stmt
                 return Ok(Stmt {
                     span: lhs.span,
                     kind: StmtKind::Expr(lhs),
@@ -870,15 +1170,23 @@ impl Stmt {
     }
 
     pub fn parse_line(stream: &mut TokenStream) -> ParseResult<Self> {
-        // check for return/break/continue
         if let Some((kw, kw_span)) = peek_keyword(stream) {
             match kw {
                 Keyword::Return => {
                     stream.advance();
+                    stream.skip_comments();
+
+                    if let Some(Token::Newline(_)) | None = stream.peek() {
+                        return Ok(Stmt {
+                            span: kw_span,
+                            kind: StmtKind::Return(None),
+                        });
+                    }
+
                     let expr = Expr::parse(stream)?;
                     return Ok(Stmt {
                         span: kw_span.join(expr.span),
-                        kind: StmtKind::Return(expr),
+                        kind: StmtKind::Return(Some(expr)),
                     });
                 }
                 Keyword::Break => {
@@ -895,23 +1203,30 @@ impl Stmt {
                         kind: StmtKind::Continue,
                     });
                 }
-                k => return Err(ParseError::UnexpectedKeyword(k, kw_span)),
+                _ => return Err(ParseError::UnexpectedToken(kw_span)),
             }
         }
-        // otherwise simple stmt
+
         Self::parse_simple(stream)
     }
 
     pub fn parse(stream: &mut TokenStream) -> ParseResult<Self> {
-        // keyword-first: if/while/for handled here
         if let Some((kw, kw_span)) = peek_keyword(stream) {
             match kw {
                 Keyword::Return => {
                     stream.advance();
+                    stream.skip_comments();
+                    if let Some(Token::Newline(_)) | None = stream.peek() {
+                        return Ok(Stmt {
+                            span: kw_span,
+                            kind: StmtKind::Return(None),
+                        });
+                    }
+
                     let expr = Expr::parse(stream)?;
                     return Ok(Stmt {
                         span: kw_span.join(expr.span),
-                        kind: StmtKind::Return(expr),
+                        kind: StmtKind::Return(Some(expr)),
                     });
                 }
                 Keyword::Break => {
@@ -937,49 +1252,47 @@ impl Stmt {
                 Keyword::For => {
                     return Self::parse_for(stream, kw_span);
                 }
-                k => return Err(ParseError::UnexpectedKeyword(k, kw_span)),
+                _ => return Err(ParseError::UnexpectedToken(kw_span)),
             }
         }
-        // not keyword-first: simple stmt
+
         Self::parse_simple(stream)
     }
 
-    // parse sequence of statements from a TokenStream representing a block
     fn parse_block(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
         let mut stmts = Vec::new();
+        stream.skip_comments_and_newlines();
         while !stream.is_empty() {
-            stream.skip_newlines();
-
             let stmt = Self::parse(stream)?;
             stmts.push(stmt);
+            stream.skip_comments_and_newlines();
         }
         Ok(stmts)
     }
 
     fn parse_branch(stream: &mut TokenStream) -> ParseResult<Vec<Self>> {
-        // expect ':'
         match stream.peek() {
             Some(Token::Punct(p)) if p.repr() == ':' => {
-                stream.advance(); // consume ':'
+                stream.advance();
+                stream.skip_comments();
                 if stream.skip_newlines() {
-                    // Branch in block
+                    stream.skip_comments_and_newlines();
                     match stream.peek() {
                         Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Block => {
                             stream.advance();
-                            
+
                             let mut group_stream = TokenStream::new(g.rc_tokens());
                             return Stmt::parse_block(&mut group_stream);
                         }
                         _ => return Ok(Vec::new()),
                     }
                 } else {
-                    // Branch is inline statement
                     let stmt = Stmt::parse_line(stream)?;
                     return Ok(vec![stmt]);
                 }
             }
-            Some(tok) => return Err(ParseError::ExpectedPunct(':', tok.span())),
-            None => return Err(ParseError::UnexpectedEof(stream.span())),
+            Some(tok) => return Err(ParseError::UnexpectedToken(tok.span())),
+            None => return Err(ParseError::UnexpectedEnd(stream.span())),
         }
     }
 
@@ -987,11 +1300,14 @@ impl Stmt {
         stream.advance();
         let cond = Expr::parse(stream)?;
         let then_branch = Self::parse_branch(stream)?;
-        stream.skip_newlines();
+        stream.skip_comments_and_newlines();
 
         let else_branch = Self::parse_else(stream)?;
 
-        let last_stmt = else_branch.as_ref().and_then(|b| b.last()).or(then_branch.last());
+        let last_stmt = else_branch
+            .as_ref()
+            .and_then(|b| b.last())
+            .or(then_branch.last());
         let span = if_span.join(last_stmt.map(|s| s.span).unwrap_or(cond.span));
 
         Ok(Stmt {
@@ -1008,12 +1324,12 @@ impl Stmt {
         if let Some((Keyword::Else, _else_span)) = peek_keyword(stream) {
             stream.advance();
 
-            let stmts =if let Some((Keyword::If, if_span)) = peek_keyword(stream) {
+            let stmts = if let Some((Keyword::If, if_span)) = peek_keyword(stream) {
                 vec![Self::parse_if(stream, if_span)?]
             } else {
                 Self::parse_branch(stream)?
             };
-            
+
             Ok(Some(stmts))
         } else {
             Ok(None)
@@ -1024,7 +1340,7 @@ impl Stmt {
         stream.advance();
         let cond = Expr::parse(stream)?;
         let body = Self::parse_branch(stream)?;
-        stream.skip_newlines();
+        stream.skip_comments_and_newlines();
 
         let else_branch = Self::parse_else(stream)?;
 
@@ -1043,18 +1359,24 @@ impl Stmt {
 
     fn parse_for(stream: &mut TokenStream, for_span: Span) -> ParseResult<Self> {
         stream.advance();
-        let target = Pattern::parse(stream)?;
+        let target = Pat::parse(stream)?;
 
-        if let Some((Keyword::In, _)) = peek_keyword(stream) {
-            stream.advance();
-        } else {
-            return Err(ParseError::ExpectedKeyword(Keyword::In, stream.start_span()));
+        match peek_keyword(stream) {
+            Some((Keyword::In, _)) => {
+                stream.advance();
+            }
+            Some((_, kw_span)) => {
+                return Err(ParseError::UnexpectedToken(kw_span));
+            }
+            None => {
+                return Err(ParseError::UnexpectedToken(stream.start_span()));
+            }
         }
 
         let iterable = Expr::parse(stream)?;
 
         let body = Self::parse_branch(stream)?;
-        stream.skip_newlines();
+        stream.skip_comments_and_newlines();
 
         let else_branch = Self::parse_else(stream)?;
 
@@ -1077,39 +1399,52 @@ impl Stmt {
 mod tests {
     use super::*;
 
+    fn tokens_from_str(s: &str) -> TokenStream {
+        let mut stream = raft_lexer::Stream::from_str(s);
+        TokenStream::new(raft_lexer::parse_stream(&mut stream).unwrap())
+    }
+
     #[test]
     fn idents() {
-        let i = Stream::new("foo").parse_ident().unwrap();
-        assert_eq!(i.name, "foo");
-        assert_eq!(i.span, Span { start: 0, end: 3 });
+        let i = tokens_from_str("foo").parse_ident().unwrap();
+        assert_eq!(*i.name(), *"foo");
+        assert_eq!(i.span(), Span { start: 0, end: 3 });
 
-        assert_eq!(Stream::new("_bar").parse_ident().unwrap().name, "_bar");
         assert_eq!(
-            Stream::new("foo_bar").parse_ident().unwrap().name,
+            tokens_from_str("_bar").parse_ident().unwrap().name(),
+            "_bar"
+        );
+        assert_eq!(
+            tokens_from_str("foo_bar").parse_ident().unwrap().name(),
             "foo_bar"
         );
-        assert_eq!(Stream::new("x1").parse_ident().unwrap().name, "x1");
+        assert_eq!(tokens_from_str("x1").parse_ident().unwrap().name(), "x1");
     }
 
     #[test]
     fn atoms() {
-        let a = Stream::new("Foo").parse_atom().unwrap();
-        assert_eq!(a.name, "Foo");
-        assert_eq!(a.span, Span { start: 0, end: 3 });
+        let a = tokens_from_str("Foo").parse_atom().unwrap();
+        assert_eq!(a.name(), "Foo");
+        assert_eq!(a.span(), Span { start: 0, end: 3 });
 
-        assert_eq!(Stream::new("True").parse_atom().unwrap().name, "True");
-        assert_eq!(Stream::new("MyAtom").parse_atom().unwrap().name, "MyAtom");
+        assert_eq!(tokens_from_str("True").parse_atom().unwrap().name(), "True");
+        assert_eq!(
+            tokens_from_str("MyAtom").parse_atom().unwrap().name(),
+            "MyAtom"
+        );
     }
 
     #[test]
     fn ident_not_atom() {
-        assert!(Stream::new("Foo").parse_ident().is_err());
-        assert!(Stream::new("foo").parse_atom().is_err());
+        assert!(tokens_from_str("Foo").parse_ident().is_err());
+        assert!(tokens_from_str("foo").parse_atom().is_err());
+        assert!(tokens_from_str("1x").parse_ident().is_err());
+        assert!(tokens_from_str("1x").parse_atom().is_err());
     }
 
     #[test]
     fn literal_int() {
-        let lit = Stream::new("42").parse_literal().unwrap();
+        let lit = tokens_from_str("42").parse_literal().unwrap();
         let n = lit.as_number().unwrap();
         assert_eq!(n.repr(), "42");
         assert!(!n.has_dot() && !n.has_exponent());
@@ -1119,7 +1454,7 @@ mod tests {
 
     #[test]
     fn literal_float_dot() {
-        let n = Stream::new("4.5").parse_literal().unwrap();
+        let n = tokens_from_str("4.5").parse_literal().unwrap();
         let n = n.as_number().unwrap();
         assert_eq!(n.repr(), "4.5");
         assert!(n.has_dot());
@@ -1129,7 +1464,7 @@ mod tests {
 
     #[test]
     fn literal_float_exp() {
-        let n = Stream::new("5e-2").parse_literal().unwrap();
+        let n = tokens_from_str("5e-2").parse_literal().unwrap();
         let n = n.as_number().unwrap();
         assert_eq!(n.repr(), "5e-2");
         assert!(n.has_exponent());
@@ -1139,7 +1474,7 @@ mod tests {
 
     #[test]
     fn literal_float_full() {
-        let n = Stream::new("1.0e10").parse_literal().unwrap();
+        let n = tokens_from_str("1.0e10").parse_literal().unwrap();
         let n = n.as_number().unwrap();
         assert_eq!(n.repr(), "1.0e10");
         assert!(n.has_dot() && n.has_exponent());
@@ -1149,7 +1484,7 @@ mod tests {
 
     #[test]
     fn literal_char() {
-        let lit = Stream::new("'a'").parse_literal().unwrap();
+        let lit = tokens_from_str("'a'").parse_literal().unwrap();
         let c = lit.as_char().unwrap();
         assert_eq!(c.repr(), "'a'");
         assert_eq!(c.unescape(), 'a');
@@ -1157,38 +1492,19 @@ mod tests {
 
     #[test]
     fn literal_char_escape() {
-        assert_eq!(
-            Stream::new("'\\n'")
-                .parse_literal()
-                .unwrap()
-                .as_char()
-                .unwrap()
-                .unescape(),
-            '\n'
-        );
-        assert_eq!(
-            Stream::new("'\\t'")
-                .parse_literal()
-                .unwrap()
-                .as_char()
-                .unwrap()
-                .unescape(),
-            '\t'
-        );
-        assert_eq!(
-            Stream::new("'\\\\'")
-                .parse_literal()
-                .unwrap()
-                .as_char()
-                .unwrap()
-                .unescape(),
-            '\\'
-        );
+        let lit = tokens_from_str("\'\\n\'").parse_literal().unwrap();
+        assert_eq!(lit.as_char().unwrap().unescape(), '\n');
+
+        let lit = tokens_from_str("'\\t'").parse_literal().unwrap();
+        assert_eq!(lit.as_char().unwrap().unescape(), '\t');
+
+        let lit = tokens_from_str("'\\\\'").parse_literal().unwrap();
+        assert_eq!(lit.as_char().unwrap().unescape(), '\\');
     }
 
     #[test]
     fn literal_string() {
-        let s = Stream::new(r#""hello""#).parse_literal().unwrap();
+        let s = tokens_from_str(r#""hello""#).parse_literal().unwrap();
         let s = s.as_string().unwrap();
         assert_eq!(s.repr(), r#""hello""#);
         assert_eq!(s.unescape(), "hello");
@@ -1196,322 +1512,342 @@ mod tests {
 
     #[test]
     fn literal_string_escape() {
-        let s = Stream::new(r#""foo\nbar\n""#).parse_literal().unwrap();
+        let s = tokens_from_str(r#""foo\nbar\n""#).parse_literal().unwrap();
         assert_eq!(s.as_string().unwrap().unescape(), "foo\nbar\n");
 
-        let s = Stream::new(r#""""#).parse_literal().unwrap();
+        let s = tokens_from_str(r#""""#).parse_literal().unwrap();
         assert_eq!(s.as_string().unwrap().unescape(), "");
     }
 
     #[test]
     fn literal_dot_not_accessor() {
-        let mut s = Stream::new("1.foo");
+        let mut s = tokens_from_str("1.foo");
         let lit = s.parse_literal().unwrap();
         assert_eq!(lit.as_number().unwrap().repr(), "1");
-        assert_eq!(s.pos(), 1);
+        assert_eq!(s.pos, 1);
     }
 
     #[test]
     fn unary_ops() {
-        assert_eq!(Stream::new("!").try_unary_op().unwrap().node, UnaryOp::Not);
-        assert_eq!(Stream::new("-").try_unary_op().unwrap().node, UnaryOp::Neg);
         assert_eq!(
-            Stream::new("~").try_unary_op().unwrap().node,
-            UnaryOp::BitNot
+            tokens_from_str("!").parse_unary_op().unwrap().kind(),
+            UnaryOpKind::Not
         );
-        assert!(Stream::new("+").try_unary_op().is_none());
+        assert_eq!(
+            tokens_from_str("~").parse_unary_op().unwrap().kind(),
+            UnaryOpKind::BitNot
+        );
+        assert_eq!(
+            tokens_from_str("-").parse_unary_op().unwrap().kind(),
+            UnaryOpKind::Neg
+        );
+        assert_eq!(
+            tokens_from_str("+").parse_unary_op().unwrap().kind(),
+            UnaryOpKind::Pos
+        );
+        assert!(tokens_from_str("&").parse_unary_op().is_err());
     }
 
     #[test]
     fn binary_ops() {
-        let cases: &[(&str, BinaryOp, usize)] = &[
-            ("&", BinaryOp::BitAnd, 1),
-            ("|", BinaryOp::BitOr, 1),
-            ("^", BinaryOp::BitXor, 1),
-            ("<<", BinaryOp::Shl, 2),
-            (">>", BinaryOp::Shr, 2),
-            ("**", BinaryOp::Pow, 2),
-            ("*", BinaryOp::Mul, 1),
-            ("/", BinaryOp::Div, 1),
-            ("+", BinaryOp::Add, 1),
-            ("-", BinaryOp::Sub, 1),
-            ("==", BinaryOp::Eq, 2),
-            ("!=", BinaryOp::Ne, 2),
-            ("<=", BinaryOp::Le, 2),
-            (">=", BinaryOp::Ge, 2),
-            ("<", BinaryOp::Lt, 1),
-            (">", BinaryOp::Gt, 1),
+        let cases: &[(&str, BinaryOpKind, usize)] = &[
+            ("&", BinaryOpKind::BitAnd, 1),
+            ("|", BinaryOpKind::BitOr, 1),
+            ("^", BinaryOpKind::BitXor, 1),
+            ("<<", BinaryOpKind::Shl, 2),
+            (">>", BinaryOpKind::Shr, 2),
+            ("**", BinaryOpKind::Pow, 2),
+            ("*", BinaryOpKind::Mul, 1),
+            ("/", BinaryOpKind::Div, 1),
+            ("+", BinaryOpKind::Add, 1),
+            ("-", BinaryOpKind::Sub, 1),
+            ("==", BinaryOpKind::Eq, 2),
+            ("!=", BinaryOpKind::Ne, 2),
+            ("<=", BinaryOpKind::Le, 2),
+            (">=", BinaryOpKind::Ge, 2),
+            ("<", BinaryOpKind::Lt, 1),
+            (">", BinaryOpKind::Gt, 1),
         ];
+
         for &(src, expected_op, expected_len) in cases {
-            let mut s = Stream::new(src);
-            let sp = s.try_binary_op().unwrap();
-            assert_eq!(sp.node, expected_op, "op mismatch for {src:?}");
-            assert_eq!(s.pos(), expected_len, "len mismatch for {src:?}");
+            let mut s = tokens_from_str(src);
+            let sp = s.parse_binary_op().unwrap();
+            assert_eq!(sp.kind(), expected_op);
+            assert_eq!(s.pos, expected_len);
         }
     }
 
     #[test]
     fn precedence_ordering() {
-        assert!(BinaryOp::BitAnd.precedence() > BinaryOp::Pow.precedence());
-        assert!(BinaryOp::Pow.precedence() > BinaryOp::Mul.precedence());
-        assert!(BinaryOp::Mul.precedence() > BinaryOp::Add.precedence());
-        assert!(BinaryOp::Add.precedence() > BinaryOp::Eq.precedence());
-        assert!(BinaryOp::Pow.is_right_assoc());
-        assert!(!BinaryOp::Mul.is_right_assoc());
+        assert!(BinaryOpKind::BitAnd.precedence() > BinaryOpKind::Pow.precedence());
+        assert!(BinaryOpKind::Pow.precedence() > BinaryOpKind::Mul.precedence());
+        assert!(BinaryOpKind::Mul.precedence() > BinaryOpKind::Add.precedence());
+        assert!(BinaryOpKind::Add.precedence() > BinaryOpKind::Eq.precedence());
+        assert!(BinaryOpKind::Pow.is_right_assoc());
+        assert!(!BinaryOpKind::Mul.is_right_assoc());
     }
 
     #[test]
     fn pattern_ident() {
-        let p = Stream::new("foo").parse_pattern().unwrap();
-        assert_eq!(p.span, Span { start: 0, end: 3 });
-        assert!(matches!(p.kind, PatternKind::Ident(i) if i.name == "foo"));
+        let p = tokens_from_str("foo").parse_pat().unwrap();
+        assert_eq!(p.span(), Span { start: 0, end: 3 });
+        assert!(matches!(p.kind(), PatKind::Ident(i) if i.name() == "foo"));
     }
 
     #[test]
     fn pattern_atom() {
-        let p = Stream::new("True").parse_pattern().unwrap();
-        assert!(matches!(p.kind, PatternKind::Atom(a) if a.name == "True"));
+        let p = tokens_from_str("True").parse_pat().unwrap();
+        assert!(matches!(p.kind(), PatKind::Atom(a) if a.name() == "True"));
     }
 
     #[test]
     fn pattern_list() {
-        let p = Stream::new("[]").parse_pattern().unwrap();
-        assert!(matches!(&p.kind, PatternKind::List(els) if els.is_empty()));
+        let p = tokens_from_str("[]").parse_pat().unwrap();
+        assert!(matches!(p.kind(), PatKind::List(els) if els.is_empty()));
 
-        let p = Stream::new("[a, b, c]").parse_pattern().unwrap();
-        let PatternKind::List(els) = &p.kind else {
+        let p = tokens_from_str("[a, b, c]").parse_pat().unwrap();
+        let PatKind::List(els) = p.kind() else {
             panic!()
         };
         assert_eq!(els.len(), 3);
-        assert!(matches!(&els[0].kind, PatternKind::Ident(i) if i.name == "a"));
-        assert!(matches!(&els[2].kind, PatternKind::Ident(i) if i.name == "c"));
+        assert!(matches!(els[0].kind(), PatKind::Ident(i) if i.name() == "a"));
+        assert!(matches!(els[2].kind(), PatKind::Ident(i) if i.name() == "c"));
     }
 
     #[test]
     fn pattern_record_empty() {
-        let p = Stream::new("{}").parse_pattern().unwrap();
-        assert!(matches!(&p.kind, PatternKind::Record(f) if f.is_empty()));
+        let p = tokens_from_str("{}").parse_pat().unwrap();
+        assert!(matches!(p.kind(), PatKind::Record(f) if f.is_empty()));
     }
 
     #[test]
     fn pattern_record_shorthand() {
-        let p = Stream::new("{ foo, bar }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else {
+        let p = tokens_from_str("{ foo, bar }").parse_pat().unwrap();
+        let PatKind::Record(fields) = p.kind() else {
             panic!()
         };
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].key.name, "foo");
-        assert!(matches!(&fields[0].pattern.kind, PatternKind::Ident(i) if i.name == "foo"));
-        assert_eq!(fields[1].key.name, "bar");
+        assert_eq!(fields[0].key.name(), "foo");
+        assert!(fields[0].pattern().is_none());
+        assert_eq!(fields[1].key.name(), "bar");
     }
 
     #[test]
     fn pattern_record_explicit() {
-        let p = Stream::new("{ x: foo, y: bar }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else {
+        let p = tokens_from_str("{ x: foo, y: bar }").parse_pat().unwrap();
+        let PatKind::Record(fields) = p.kind() else {
             panic!()
         };
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].key.name, "x");
-        assert!(matches!(&fields[0].pattern.kind, PatternKind::Ident(i) if i.name == "foo"));
+        assert_eq!(fields[0].key.name(), "x");
+        assert!(
+            matches!(fields[0].pattern().unwrap().kind(), PatKind::Ident(i) if i.name() == "foo")
+        );
     }
 
     #[test]
     fn pattern_record_nested() {
-        let p = Stream::new("{ x: [a, b] }").parse_pattern().unwrap();
-        let PatternKind::Record(fields) = &p.kind else {
+        let p = tokens_from_str("{ x: [a, b] }").parse_pat().unwrap();
+        let PatKind::Record(fields) = p.kind() else {
             panic!()
         };
-        assert!(matches!(&fields[0].pattern.kind, PatternKind::List(_)));
+        assert!(matches!(
+            fields[0].pattern().unwrap().kind(),
+            PatKind::List(_)
+        ));
     }
 
     #[test]
     fn expr_literal() {
-        let e = Stream::new("42").parse_expr().unwrap();
+        let e = tokens_from_str("42").parse_expr().unwrap();
         assert_eq!(e.span, Span::new(0, 2));
-        assert!(matches!(e.kind, ExprKind::Literal(_)));
+        assert!(matches!(e.kind(), ExprKind::Literal(_)));
     }
 
     #[test]
     fn expr_ident() {
-        let e = Stream::new("foo").parse_expr().unwrap();
-        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "foo"));
+        let e = tokens_from_str("foo").parse_expr().unwrap();
+        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "foo"));
     }
 
     #[test]
     fn expr_atom() {
-        let e = Stream::new("True").parse_expr().unwrap();
-        assert!(matches!(&e.kind, ExprKind::Atom(a) if a.name == "True"));
+        let e = tokens_from_str("True").parse_expr().unwrap();
+        assert!(matches!(e.kind(), ExprKind::Atom(a) if a.name() == "True"));
     }
 
     #[test]
     fn expr_unary() {
-        let e = Stream::new("!a").parse_expr().unwrap();
-        let ExprKind::Unary(op, inner) = &e.kind else {
+        let e = tokens_from_str("!a").parse_expr().unwrap();
+        let ExprKind::Unary(op, inner) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, UnaryOp::Not);
-        assert!(matches!(&inner.kind, ExprKind::Ident(i) if i.name == "a"));
-        assert_eq!(e.span, Span::new(0, 2));
+        assert_eq!(op.kind(), UnaryOpKind::Not);
+        assert!(matches!(inner.kind(), ExprKind::Ident(i) if i.name() == "a"));
+        assert_eq!(e.span(), Span::new(0, 2));
     }
 
     #[test]
     fn expr_unary_chain() {
         // !!a = !(!a)
-        let e = Stream::new("!!a").parse_expr().unwrap();
-        let ExprKind::Unary(op, inner) = &e.kind else {
+        let e = tokens_from_str("!!a").parse_expr().unwrap();
+        let ExprKind::Unary(op, inner) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, UnaryOp::Not);
-        assert!(matches!(&inner.kind, ExprKind::Unary(_, _)));
+        assert_eq!(op.kind(), UnaryOpKind::Not);
+        let ExprKind::Unary(op, inner) = inner.kind() else {
+            panic!()
+        };
+        assert_eq!(op.kind(), UnaryOpKind::Not);
+        assert!(matches!(inner.kind(), ExprKind::Ident(i) if i.name() == "a"));
     }
 
     #[test]
     fn expr_binary_simple() {
-        let e = Stream::new("1 + 2").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+        let e = tokens_from_str("1 + 2").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Add);
-        assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
-        assert!(matches!(&rhs.kind, ExprKind::Literal(_)));
-        assert_eq!(e.span, Span::new(0, 5));
+        assert_eq!(op.kind(), BinaryOpKind::Add);
+        assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
+        assert!(matches!(rhs.kind(), ExprKind::Literal(_)));
+        assert_eq!(e.span(), Span::new(0, 5));
     }
 
     #[test]
     fn expr_precedence() {
         // 1 + 2 * 3 = 1 + (2 * 3)
-        let e = Stream::new("1 + 2 * 3").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+        let e = tokens_from_str("1 + 2 * 3").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Add);
-        assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
-        let ExprKind::Binary(_, inner_op, _) = &rhs.kind else {
+        assert_eq!(op.kind(), BinaryOpKind::Add);
+        assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
+        let ExprKind::Binary(_, inner_op, _) = &rhs.kind() else {
             panic!()
         };
-        assert_eq!(inner_op.node, BinaryOp::Mul);
+        assert_eq!(inner_op.kind(), BinaryOpKind::Mul);
     }
 
     #[test]
     fn expr_left_assoc() {
         // a - b - c = (a - b) - c
-        let e = Stream::new("a - b - c").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+        let e = tokens_from_str("a - b - c").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Sub);
-        assert!(matches!(&lhs.kind, ExprKind::Binary(_, _, _)));
-        assert!(matches!(&rhs.kind, ExprKind::Ident(i) if i.name == "c"));
+        assert_eq!(op.kind(), BinaryOpKind::Sub);
+        assert!(matches!(lhs.kind(), ExprKind::Binary(_, _, _)));
+        assert!(matches!(rhs.kind(), ExprKind::Ident(i) if i.name() == "c"));
     }
 
     #[test]
     fn expr_right_assoc() {
         // 2 ** 3 ** 4 = 2 ** (3 ** 4)
-        let e = Stream::new("2 ** 3 ** 4").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+        let e = tokens_from_str("2 ** 3 ** 4").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Pow);
-        assert!(matches!(&lhs.kind, ExprKind::Literal(_)));
-        assert!(matches!(&rhs.kind, ExprKind::Binary(_, _, _)));
+        assert_eq!(op.kind(), BinaryOpKind::Pow);
+        assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
+        assert!(matches!(rhs.kind(), ExprKind::Binary(_, _, _)));
     }
 
     #[test]
     fn expr_apply() {
-        let e = Stream::new("f a b").parse_expr().unwrap();
-        let ExprKind::Apply(func, args) = &e.kind else {
+        let e = tokens_from_str("f a b").parse_expr().unwrap();
+        let ExprKind::Apply(func, args) = e.kind() else {
             panic!()
         };
-        assert!(matches!(&func.kind, ExprKind::Ident(i) if i.name == "f"));
+        assert!(matches!(func.kind(), ExprKind::Ident(i) if i.name() == "f"));
         assert_eq!(args.len(), 2);
-        assert!(matches!(&args[0].kind, ExprKind::Ident(i) if i.name == "a"));
-        assert!(matches!(&args[1].kind, ExprKind::Ident(i) if i.name == "b"));
+        assert!(matches!(args[0].kind(), ExprKind::Ident(i) if i.name() == "a"));
+        assert!(matches!(args[1].kind(), ExprKind::Ident(i) if i.name() == "b"));
     }
 
     #[test]
     fn expr_apply_unary_arg() {
         // f !a — ! is unambiguously unary, so it's an argument
-        let e = Stream::new("f !a").parse_expr().unwrap();
-        let ExprKind::Apply(_, args) = &e.kind else {
+        let e = tokens_from_str("f !a").parse_expr().unwrap();
+        let ExprKind::Apply(_, args) = e.kind() else {
             panic!()
         };
         assert_eq!(args.len(), 1);
-        assert!(matches!(&args[0].kind, ExprKind::Unary(op, _) if op.node == UnaryOp::Not));
+        assert!(matches!(args[0].kind(), ExprKind::Unary(op, _) if op.kind() == UnaryOpKind::Not));
     }
 
     #[test]
     fn expr_apply_then_binary() {
         // f a + b = (f a) + b
-        let e = Stream::new("f a + b").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, _) = &e.kind else {
+        let e = tokens_from_str("f a + b").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, _) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Add);
-        assert!(matches!(&lhs.kind, ExprKind::Apply(_, _)));
+        assert_eq!(op.kind(), BinaryOpKind::Add);
+        assert!(matches!(lhs.kind(), ExprKind::Apply(_, _)));
     }
 
     #[test]
     fn expr_minus_is_binary_not_arg() {
         // f - a = f minus a (NOT application)
-        let e = Stream::new("f - a").parse_expr().unwrap();
-        assert!(matches!(&e.kind, ExprKind::Binary(_, op, _) if op.node == BinaryOp::Sub));
+        let e = tokens_from_str("f - a").parse_expr().unwrap();
+        assert!(matches!(e.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinaryOpKind::Sub));
     }
 
     #[test]
     fn expr_field() {
-        let e = Stream::new("foo.bar").parse_expr().unwrap();
-        let ExprKind::Field(obj, field) = &e.kind else {
+        let e = tokens_from_str("foo.bar").parse_expr().unwrap();
+        let ExprKind::Field(obj, field) = e.kind() else {
             panic!()
         };
-        assert!(matches!(&obj.kind, ExprKind::Ident(i) if i.name == "foo"));
-        assert_eq!(field.name, "bar");
+        assert!(matches!(&obj.kind(), ExprKind::Ident(i) if i.name() == "foo"));
+        assert_eq!(field.name(), "bar");
         assert_eq!(e.span, Span::new(0, 7));
     }
 
     #[test]
     fn expr_index() {
-        let e = Stream::new("arr[0]").parse_expr().unwrap();
-        let ExprKind::Index(obj, _) = &e.kind else {
+        let e = tokens_from_str("arr[0]").parse_expr().unwrap();
+        let ExprKind::Index(obj, _) = e.kind() else {
             panic!()
         };
-        assert!(matches!(&obj.kind, ExprKind::Ident(i) if i.name == "arr"));
+        assert!(matches!(&obj.kind(), ExprKind::Ident(i) if i.name() == "arr"));
         assert_eq!(e.span, Span::new(0, 6));
     }
 
     #[test]
     fn expr_chained_accessor() {
         // foo.bar[0].baz = Field(Index(Field(foo, bar), 0), baz)
-        let e = Stream::new("foo.bar[0].baz").parse_expr().unwrap();
-        let ExprKind::Field(indexed, baz) = &e.kind else {
+        let e = tokens_from_str("foo.bar[0].baz").parse_expr().unwrap();
+        let ExprKind::Field(indexed, baz) = e.kind() else {
             panic!()
         };
-        assert_eq!(baz.name, "baz");
-        let ExprKind::Index(field_expr, _) = &indexed.kind else {
+        assert_eq!(baz.name(), "baz");
+        let ExprKind::Index(field_expr, _) = &indexed.kind() else {
             panic!()
         };
-        let ExprKind::Field(root, bar) = &field_expr.kind else {
+        let ExprKind::Field(root, bar) = &field_expr.kind() else {
             panic!()
         };
-        assert!(matches!(&root.kind, ExprKind::Ident(i) if i.name == "foo"));
-        assert_eq!(bar.name, "bar");
+        assert!(matches!(&root.kind(), ExprKind::Ident(i) if i.name() == "foo"));
+        assert_eq!(bar.name(), "bar");
     }
 
     #[test]
     fn expr_apply_with_field_arg() {
         // f a.b = f (a.b)
-        let e = Stream::new("f a.b").parse_expr().unwrap();
-        let ExprKind::Apply(_, args) = &e.kind else {
+        let e = tokens_from_str("f a.b").parse_expr().unwrap();
+        let ExprKind::Apply(_, args) = e.kind() else {
             panic!()
         };
         assert_eq!(args.len(), 1);
-        assert!(matches!(&args[0].kind, ExprKind::Field(_, _)));
+        assert!(matches!(&args[0].kind(), ExprKind::Field(_, _)));
     }
 
     #[test]
     fn expr_list() {
-        let e = Stream::new("[1, 2, 3]").parse_expr().unwrap();
-        let ExprKind::List(els) = &e.kind else {
+        let e = tokens_from_str("[1, 2, 3]").parse_expr().unwrap();
+        let ExprKind::List(els) = e.kind() else {
             panic!()
         };
         assert_eq!(els.len(), 3);
@@ -1520,63 +1856,71 @@ mod tests {
 
     #[test]
     fn expr_list_empty() {
-        let e = Stream::new("[]").parse_expr().unwrap();
-        assert!(matches!(&e.kind, ExprKind::List(els) if els.is_empty()));
+        let e = tokens_from_str("[]").parse_expr().unwrap();
+        assert!(matches!(e.kind(), ExprKind::List(els) if els.is_empty()));
     }
 
     #[test]
     fn expr_record() {
-        let e = Stream::new("{x: 1, y: 2}").parse_expr().unwrap();
-        let ExprKind::Record(fields) = &e.kind else {
+        let e = tokens_from_str("{x: 1, y: 2}").parse_expr().unwrap();
+        let ExprKind::Record(fields) = e.kind() else {
             panic!()
         };
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].key.name, "x");
-        assert!(matches!(&fields[0].value.kind, ExprKind::Literal(_)));
+        assert_eq!(fields[0].key.name(), "x");
+        assert!(matches!(
+            fields[0].value().unwrap().kind(),
+            ExprKind::Literal(_)
+        ));
+        assert_eq!(fields[1].key.name(), "y");
+        assert!(matches!(
+            fields[1].value().unwrap().kind(),
+            ExprKind::Literal(_)
+        ));
     }
 
     #[test]
     fn expr_paren_grouping() {
         // (1 + 2) * 3 — parens override precedence
-        let e = Stream::new("(1 + 2) * 3").parse_expr().unwrap();
-        let ExprKind::Binary(lhs, op, _) = &e.kind else {
+        let e = tokens_from_str("(1 + 2) * 3").parse_expr().unwrap();
+        let ExprKind::Binary(lhs, op, _) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Mul);
+        assert_eq!(op.kind(), BinaryOpKind::Mul);
         // lhs is the parenthesized addition; span includes parens
         assert_eq!(lhs.span, Span::new(0, 7));
-        assert!(matches!(&lhs.kind, ExprKind::Binary(_, op, _) if op.node == BinaryOp::Add));
+        assert!(matches!(lhs.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinaryOpKind::Add));
     }
 
     #[test]
     fn expr_complex() {
         // a + b * c ** d / e > f * g - h ** i / j
         // = (a + ((b * (c ** d)) / e)) > ((f * g) - ((h ** i) / j))
-        let e = Stream::new("a + b * c ** d / e > f * g - h ** i / j")
+        let e = tokens_from_str("a + b * c ** d / e > f * g - h ** i / j")
             .parse_expr()
             .unwrap();
-        let ExprKind::Binary(lhs, op, rhs) = &e.kind else {
+        let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
             panic!()
         };
-        assert_eq!(op.node, BinaryOp::Gt);
+        assert_eq!(op.kind(), BinaryOpKind::Gt);
         // lhs = a + ((b * (c**d)) / e)
-        let ExprKind::Binary(_, add_op, _) = &lhs.kind else {
+        let ExprKind::Binary(_, add_op, _) = lhs.kind() else {
             panic!()
         };
-        assert_eq!(add_op.node, BinaryOp::Add);
+        assert_eq!(add_op.kind(), BinaryOpKind::Add);
         // rhs = (f*g) - ((h**i)/j)
-        let ExprKind::Binary(_, sub_op, _) = &rhs.kind else {
+        let ExprKind::Binary(_, sub_op, _) = &rhs.kind() else {
             panic!()
         };
-        assert_eq!(sub_op.node, BinaryOp::Sub);
+        assert_eq!(sub_op.kind(), BinaryOpKind::Sub);
     }
 
     #[test]
     fn stmt_expr_statement() {
-        let stmt = Stream::new("foo").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("foo").parse_stmt().unwrap();
+        match stmt.kind() {
             StmtKind::Expr(e) => {
-                assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "foo"));
+                assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "foo"));
             }
             _ => panic!("expected expr stmt"),
         }
@@ -1585,15 +1929,23 @@ mod tests {
     #[test]
     fn ident_is_keyword() {
         // parse_ident should fail for keywords
-        assert!(Stream::new("return").parse_ident().is_err());
+        assert!(tokens_from_str("return").parse_ident().is_err());
     }
 
     #[test]
     fn stmt_return() {
-        let stmt = Stream::new("return 5").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("return").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::Return(e) => {
-                assert!(matches!(&e.kind, ExprKind::Literal(l) if l.is_number()));
+                assert!(matches!(e, None));
+            }
+            _ => panic!("expected return stmt"),
+        }
+
+        let stmt = tokens_from_str("return 5").parse_stmt().unwrap();
+        match &stmt.kind() {
+            StmtKind::Return(e) => {
+                assert!(matches!(e.as_ref().unwrap().kind(), ExprKind::Literal(l) if l.is_number()));
             }
             _ => panic!("expected return stmt"),
         }
@@ -1601,18 +1953,18 @@ mod tests {
 
     #[test]
     fn stmt_if_inline() {
-        let stmt = Stream::new("if x: y").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("if x: y").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch: None,
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(then_branch.len(), 1);
-                match &then_branch[0].kind {
+                match &then_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected inline expr as then-branch"),
                 }
@@ -1624,18 +1976,18 @@ mod tests {
     #[test]
     fn stmt_if_block() {
         let src = "if x:\n    y";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch: None,
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(then_branch.len(), 1);
-                match &then_branch[0].kind {
+                match &then_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected expr in block"),
                 }
@@ -1646,25 +1998,25 @@ mod tests {
 
     #[test]
     fn stmt_if_inline_else_same_line() {
-        let stmt = Stream::new("if x: y else: z").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("if x: y else: z").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch: Some(else_branch),
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(then_branch.len(), 1);
-                match &then_branch[0].kind {
+                match &then_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected inline expr as then-branch"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match &else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "z"))
                     }
                     _ => panic!("expected inline expr as else-branch"),
                 }
@@ -1676,24 +2028,24 @@ mod tests {
     #[test]
     fn stmt_if_inline_else_next_line() {
         let src = "if x: y\nelse: z";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch: Some(else_branch),
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
-                match &then_branch[0].kind {
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
+                match &then_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected inline expr as then-branch"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match &else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "z"))
                     }
                     _ => panic!("expected inline expr as else-branch"),
                 }
@@ -1705,25 +2057,25 @@ mod tests {
     #[test]
     fn stmt_if_block_else_block() {
         let src = "if x:\n    y\nelse:\n    z";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch: Some(else_branch),
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(then_branch.len(), 1);
-                match &then_branch[0].kind {
+                match &then_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected expr in block"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match &else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "z"))
                     }
                     _ => panic!("expected expr in else block"),
                 }
@@ -1734,11 +2086,11 @@ mod tests {
 
     #[test]
     fn stmt_assign_pattern_ident() {
-        let stmt = Stream::new("x = 1\n").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("x = 1").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::AssignPattern { target, value } => {
-                assert!(matches!(target.kind, PatternKind::Ident(ref id) if id.name == "x"));
-                assert!(matches!(&value.kind, ExprKind::Literal(l) if l.is_number()));
+                assert!(matches!(target.kind(), PatKind::Ident(id) if id.name() == "x"));
+                assert!(matches!(value.kind(), ExprKind::Literal(l) if l.is_number()));
             }
             _ => panic!("expected assign pattern"),
         }
@@ -1746,17 +2098,17 @@ mod tests {
 
     #[test]
     fn stmt_assign_pattern_list() {
-        let stmt = Stream::new("[a, b] = [1, 2]\n").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("[a, b] = [1, 2]").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::AssignPattern { target, value } => {
-                if let PatternKind::List(items) = &target.kind {
+                if let PatKind::List(items) = &target.kind() {
                     assert_eq!(items.len(), 2);
-                    assert!(matches!(&items[0].kind, PatternKind::Ident(i) if i.name == "a"));
-                    assert!(matches!(&items[1].kind, PatternKind::Ident(i) if i.name == "b"));
+                    assert!(matches!(&items[0].kind(), PatKind::Ident(i) if i.name() == "a"));
+                    assert!(matches!(&items[1].kind(), PatKind::Ident(i) if i.name() == "b"));
                 } else {
                     panic!("expected list pattern")
                 }
-                if let ExprKind::List(vals) = &value.kind {
+                if let ExprKind::List(vals) = &value.kind() {
                     assert_eq!(vals.len(), 2);
                 } else {
                     panic!("expected list rhs")
@@ -1768,16 +2120,16 @@ mod tests {
 
     #[test]
     fn stmt_assign_field() {
-        let stmt = Stream::new("obj.x = 5\n").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("obj.x = 5").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::AssignField {
                 target,
                 field,
                 value,
             } => {
-                assert_eq!(field.name, "x");
-                assert!(matches!(&target.kind, ExprKind::Ident(i) if i.name == "obj"));
-                assert!(matches!(&value.kind, ExprKind::Literal(l) if l.is_number()));
+                assert_eq!(field.name(), "x");
+                assert!(matches!(target.kind(), ExprKind::Ident(i) if i.name() == "obj"));
+                assert!(matches!(value.kind(), ExprKind::Literal(l) if l.is_number()));
             }
             _ => panic!("expected assign field"),
         }
@@ -1785,16 +2137,16 @@ mod tests {
 
     #[test]
     fn stmt_assign_index() {
-        let stmt = Stream::new("arr[0] = 7\n").parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str("arr[0] = 7").parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::AssignIndex {
                 target,
                 index,
                 value,
             } => {
-                assert!(matches!(&target.kind, ExprKind::Ident(i) if i.name == "arr"));
-                assert!(matches!(&index.kind, ExprKind::Literal(l) if l.is_number()));
-                assert!(matches!(&value.kind, ExprKind::Literal(l) if l.is_number()));
+                assert!(matches!(target.kind(), ExprKind::Ident(i) if i.name() == "arr"));
+                assert!(matches!(index.kind(), ExprKind::Literal(l) if l.is_number()));
+                assert!(matches!(value.kind(), ExprKind::Literal(l) if l.is_number()));
             }
             _ => panic!("expected assign index"),
         }
@@ -1803,25 +2155,25 @@ mod tests {
     #[test]
     fn stmt_while_block_else_block() {
         let src = "while x:\n    y\nelse:\n    z";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::While {
                 cond,
                 body: loop_branch,
                 else_branch: Some(else_branch),
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(loop_branch.len(), 1);
-                match &loop_branch[0].kind {
+                match loop_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected expr in loop branch"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "z"))
                     }
                     _ => panic!("expected expr in else branch"),
                 }
@@ -1833,25 +2185,25 @@ mod tests {
     #[test]
     fn stmt_while_inline_else_next_line() {
         let src = "while x: y\nelse: z";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match &stmt.kind() {
             StmtKind::While {
                 cond,
                 body: loop_branch,
                 else_branch: Some(else_branch),
             } => {
-                assert!(matches!(&cond.kind, ExprKind::Ident(i) if i.name == "x"));
+                assert!(matches!(&cond.kind(), ExprKind::Ident(i) if i.name() == "x"));
                 assert_eq!(loop_branch.len(), 1);
-                match &loop_branch[0].kind {
+                match &loop_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "y"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "y"))
                     }
                     _ => panic!("expected inline expr as loop body"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "z"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "z"))
                     }
                     _ => panic!("expected inline expr as else branch"),
                 }
@@ -1863,31 +2215,31 @@ mod tests {
     #[test]
     fn stmt_for_block_else_block() {
         let src = "for a in arr:\n    b\nelse:\n    c";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match stmt.kind() {
             StmtKind::For {
                 target,
-                iter,
+                iterable,
                 body: loop_branch,
                 else_branch: Some(else_branch),
             } => {
                 // target should be identifier pattern 'a'
-                match &target.kind {
-                    PatternKind::Ident(id) => assert_eq!(id.name, "a"),
+                match &target.kind() {
+                    PatKind::Ident(id) => assert_eq!(id.name(), "a"),
                     _ => panic!("expected ident pattern as for target"),
                 }
-                assert!(matches!(&iter.kind, ExprKind::Ident(i) if i.name == "arr"));
+                assert!(matches!(iterable.kind(), ExprKind::Ident(i) if i.name() == "arr"));
                 assert_eq!(loop_branch.len(), 1);
-                match &loop_branch[0].kind {
+                match &loop_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "b"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "b"))
                     }
                     _ => panic!("expected expr in loop branch"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match &else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "c"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "c"))
                     }
                     _ => panic!("expected expr in else branch"),
                 }
@@ -1899,30 +2251,30 @@ mod tests {
     #[test]
     fn stmt_for_inline_else_next_line() {
         let src = "for a in arr: b\nelse: c";
-        let stmt = Stream::new(src).parse_stmt(0).unwrap();
-        match &stmt.kind {
+        let stmt = tokens_from_str(src).parse_stmt().unwrap();
+        match stmt.kind() {
             StmtKind::For {
                 target,
-                iter,
+                iterable,
                 body: loop_branch,
                 else_branch: Some(else_branch),
             } => {
-                match &target.kind {
-                    PatternKind::Ident(id) => assert_eq!(id.name, "a"),
+                match &target.kind() {
+                    PatKind::Ident(id) => assert_eq!(id.name(), "a"),
                     _ => panic!("expected ident pattern as for target"),
                 }
-                assert!(matches!(&iter.kind, ExprKind::Ident(i) if i.name == "arr"));
+                assert!(matches!(iterable.kind(), ExprKind::Ident(i) if i.name() == "arr"));
                 assert_eq!(loop_branch.len(), 1);
-                match &loop_branch[0].kind {
+                match &loop_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "b"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "b"))
                     }
                     _ => panic!("expected inline expr as loop body"),
                 }
                 assert_eq!(else_branch.len(), 1);
-                match &else_branch[0].kind {
+                match &else_branch[0].kind() {
                     StmtKind::Expr(e) => {
-                        assert!(matches!(&e.kind, ExprKind::Ident(i) if i.name == "c"))
+                        assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "c"))
                     }
                     _ => panic!("expected inline expr as else branch"),
                 }

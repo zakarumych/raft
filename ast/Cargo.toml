@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 std = []
-default = ["std"]
+default = ["std", "raft-lexer/std"]
 
 [dependencies]
-raft-lexer = { path = "../lexer" }
+raft-lexer = { path = "../lexer", default-features = false }

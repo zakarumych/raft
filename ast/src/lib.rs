@@ -10,14 +10,42 @@ pub mod parse;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Ident {
-    pub span: Span,
-    pub name: Rc<str>,
+    span: Span,
+    name: Rc<str>,
+}
+
+impl Ident {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn rc_name(&self) -> Rc<str> {
+        self.name.clone()
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Atom {
-    pub span: Span,
-    pub name: Rc<str>,
+    span: Span,
+    name: Rc<str>,
+}
+
+impl Atom {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn rc_name(&self) -> Rc<str> {
+        self.name.clone()
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -35,19 +63,71 @@ impl Literal {
             Literal::String(s) => s.span(),
         }
     }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, Literal::Number(_))
+    }
+
+    pub fn is_char(&self) -> bool {
+        matches!(self, Literal::Char(_))
+    }
+
+    pub fn is_string(&self) -> bool {
+        matches!(self, Literal::String(_))
+    }
+
+    pub fn as_number(&self) -> Option<&LiteralNumber> {
+        match self {
+            Literal::Number(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub fn as_char(&self) -> Option<&LiteralChar> {
+        match self {
+            Literal::Char(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&LiteralString> {
+        match self {
+            Literal::String(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOpKind {
     Not,    // !
-    Neg,    // -
     BitNot, // ~
+    Pos,    // +
+    Neg,    // -
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UnaryOp {
-    pub span: Span,
-    pub kind: UnaryOpKind,
+    span: Span,
+    kind: UnaryOpKind,
+}
+
+impl UnaryOp {
+    pub fn new(kind: UnaryOpKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn kind(&self) -> UnaryOpKind {
+        self.kind
+    }
+
+    pub fn is_(&self, kind: UnaryOpKind) -> bool {
+        self.kind == kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,17 +155,11 @@ pub enum BinaryOpKind {
     Ge, // >=
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BinaryOp {
-    pub kind: BinaryOpKind,
-    pub span: Span,
-}
-
-impl BinaryOp {
+impl BinaryOpKind {
     pub fn precedence(&self) -> u8 {
         use BinaryOpKind::*;
 
-        match self.kind {
+        match self {
             BitAnd | BitOr | BitXor | Shl | Shr => 5,
             Pow => 4,
             Mul | Div => 3,
@@ -97,17 +171,69 @@ impl BinaryOp {
     pub fn is_right_assoc(&self) -> bool {
         use BinaryOpKind::*;
 
-        match self.kind {
+        match self {
             Pow => true,
             _ => false,
         }
     }
+
+    pub fn token_size(&self) -> usize {
+        use BinaryOpKind::*;
+
+        match self {
+            BitAnd | BitOr | BitXor | Mul | Div | Add | Sub | Lt | Gt => 1,
+            Shl | Shr | Pow | Eq | Ne | Le | Ge => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BinaryOp {
+    kind: BinaryOpKind,
+    span: Span,
+}
+
+impl BinaryOp {
+    pub fn new(kind: BinaryOpKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn kind(&self) -> BinaryOpKind {
+        self.kind
+    }
+
+    pub fn is_(&self, kind: BinaryOpKind) -> bool {
+        self.kind == kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Expr {
-    pub span: Span,
-    pub kind: ExprKind,
+pub struct ExprRecordField {
+    span: Span,
+    key: Ident,
+    value: Option<Expr>,
+}
+
+impl ExprRecordField {
+    pub fn new(key: Ident, value: Option<Expr>, span: Span) -> Self {
+        Self { key, value, span }
+    }
+
+    pub fn key(&self) -> &Ident {
+        &self.key
+    }
+
+    pub fn value(&self) -> Option<&Expr> {
+        self.value.as_ref()
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -115,61 +241,121 @@ pub enum ExprKind {
     Literal(Literal),
     Ident(Ident),
     Atom(Atom),
-    List(Vec<Expr>),
-    Record(Vec<ExprRecordField>),
-    Unary(UnaryOp, Box<Expr>),
-    Binary(Box<Expr>, BinaryOp, Box<Expr>),
-    Apply(Box<Expr>, Vec<Expr>),
-    Field(Box<Expr>, Ident),
-    Index(Box<Expr>, Box<Expr>),
+    List(Rc<[Expr]>),
+    Record(Rc<[ExprRecordField]>),
+    Unary(UnaryOp, Rc<Expr>),
+    Binary(Rc<Expr>, BinaryOp, Rc<Expr>),
+    Apply(Rc<Expr>, Rc<[Expr]>),
+    Field(Rc<Expr>, Ident),
+    Index(Rc<Expr>, Rc<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ExprRecordField {
-    pub span: Span,
-    pub key: Ident,
-    pub value: Option<Expr>,
+pub struct Expr {
+    span: Span,
+    kind: ExprKind,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn kind(&self) -> &ExprKind {
+        &self.kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Pattern {
-    pub span: Span,
-    pub kind: PatternKind,
+pub struct PatRecordField {
+    span: Span,
+    key: Ident,
+    pattern: Option<Pat>,
+}
+
+impl PatRecordField {
+    pub fn new(key: Ident, pattern: Option<Pat>, span: Span) -> Self {
+        Self { key, pattern, span }
+    }
+
+    pub fn key(&self) -> &Ident {
+        &self.key
+    }
+
+    pub fn pattern(&self) -> Option<&Pat> {
+        self.pattern.as_ref()
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PatternKind {
+pub enum PatKind {
     Ident(Ident),
     Atom(Atom),
     Literal(Literal),
-    List(Vec<Pattern>),
-    Record(Vec<PatternRecordField>),
+    List(Rc<[Pat]>),
+    Record(Rc<[PatRecordField]>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PatternRecordField {
-    pub span: Span,
-    pub key: Ident,
-    pub pattern: Option<Pattern>,
+pub struct Pat {
+    span: Span,
+    kind: PatKind,
 }
 
-// Statements and blocks
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Stmt {
-    pub span: Span,
-    pub kind: StmtKind,
+impl Pat {
+    pub fn new(kind: PatKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn kind(&self) -> &PatKind {
+        &self.kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StmtKind {
     Expr(Expr),
-    AssignPattern { target: Pattern, value: Expr },
-    AssignField { target: Box<Expr>, field: Ident, value: Expr },
-    AssignIndex { target: Box<Expr>, index: Box<Expr>, value: Expr },
+    AssignPattern { target: Pat, value: Expr },
+    AssignField { target: Rc<Expr>, field: Ident, value: Expr },
+    AssignIndex { target: Rc<Expr>, index: Rc<Expr>, value: Expr },
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    For { target: Pattern, iterable: Expr, body: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    Return(Expr),
+    For { target: Pat, iterable: Expr, body: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
+    Return(Option<Expr>),
     Break,
     Continue,
+}
+
+
+// Statements and blocks
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Stmt {
+    span: Span,
+    kind: StmtKind,
+}
+
+impl Stmt {
+    pub fn new(kind: StmtKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn kind(&self) -> &StmtKind {
+        &self.kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }

@@ -199,7 +199,6 @@ impl Punct {
                 | '@'
                 | '\\'
                 | '^'
-                | '_'
                 | '`'
                 | '|'
                 | '~'
@@ -258,7 +257,7 @@ impl Ident {
 
     pub fn is_ident(stream: &Stream) -> bool {
         match stream.peek_char() {
-            Some(c) => unicode_ident::is_xid_start(c),
+            Some(c) => unicode_ident::is_xid_start(c) || c == '_',
             None => false,
         }
     }
@@ -266,7 +265,7 @@ impl Ident {
     pub fn parse(stream: &mut Stream) -> Result<Self, LexError> {
         match stream.peek_char() {
             Some(c) => {
-                if !unicode_ident::is_xid_start(c) {
+                if !unicode_ident::is_xid_start(c) && c != '_' {
                     return Err(LexError {
                         span: Span::new(stream.pos(), stream.pos() + c.len_utf8()),
                         kind: LexErrorKind::UnexpectedCharacter(c),
@@ -281,11 +280,13 @@ impl Ident {
             }
         };
 
-        // It is already checked that first character is xid_start
+        // It is already checked that first character is xid_start or '_'
         // xid_continue is superset of xid_start, so it will pass this predicate too.
         let ident_string = stream
-            .str_until(|c| !unicode_ident::is_xid_continue(c))
+            .str_until(|c| !unicode_ident::is_xid_continue(c) && c != '_')
             .to_owned();
+
+        debug_assert!(!ident_string.is_empty());
 
         let start = stream.pos();
         stream.consume(ident_string.len());
@@ -1041,20 +1042,17 @@ impl Group {
         self.span
     }
 
-    fn parse_open(stream: &mut Stream) -> Option<Delimiter> {
+    fn peek_open(stream: &mut Stream) -> Option<Delimiter> {
         match stream.peek_char() {
             Some('(') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Parenthesis)
             }
             Some('{') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Brace)
             }
             Some('[') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Bracket)
             }
@@ -1063,20 +1061,17 @@ impl Group {
     }
 
     /// Parse next closing delimiter from the input stream.
-    fn parse_close(stream: &mut Stream) -> Option<Delimiter> {
+    fn peek_close(stream: &mut Stream) -> Option<Delimiter> {
         match stream.peek_char() {
             Some(')') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Parenthesis)
             }
             Some('}') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Brace)
             }
             Some(']') => {
-                stream.consume(1);
                 stream.skip_whitespace();
                 Some(Delimiter::Bracket)
             }
@@ -1095,11 +1090,14 @@ impl Group {
         loop {
             if let Some(token) = Newline::try_parse(stream) {
                 tokens.push(Token::Newline(token));
-                debug_assert!(Newline::try_parse(stream).is_none(), "Newline::try_parse should consume all consecutive newlines");
+                debug_assert!(
+                    Newline::try_parse(stream).is_none(),
+                    "Newline::try_parse should consume all consecutive newlines"
+                );
             }
 
             if stream.is_empty() {
-                break;
+                return Ok(Group::new(open_delim, tokens, Span::new(start_pos, stream.pos())));
             }
 
             if stream.is_linestart() {
@@ -1117,7 +1115,7 @@ impl Group {
                 if line_indent < indent {
                     // Indentation decreased, so this is the end of the block.
                     if open_delim == Delimiter::Block {
-                        break;
+                        return Ok(Group::new(open_delim, tokens, Span::new(start_pos, stream.pos())));
                     } else {
                         return Err(LexError {
                             span: Span::new(start_pos, stream.pos()),
@@ -1131,24 +1129,29 @@ impl Group {
             stream.skip_whitespace();
 
             // Check for group start symbols.
-            if let Some(open_delim) = Self::parse_open(stream) {
+            if let Some(open_delim) = Self::peek_open(stream) {
+                let start_pos = stream.pos();
+                stream.consume(1);
                 stream.skip_whitespace();
 
-                let group =
-                    Group::parse_body(open_delim, stream.pos(), stream, indent)?;
+                let group = Group::parse_body(open_delim, start_pos, stream, indent)?;
 
                 tokens.push(Token::Group(group));
                 continue;
             }
-            
-            if let Some(close_delim) = Self::parse_close(stream) {
-                stream.skip_whitespace();
+
+            if let Some(close_delim) = Self::peek_close(stream) {
+                let end_pos = stream.pos();
+                stream.consume(1);
 
                 if close_delim == open_delim {
-                    break;
+                    let group = Group::new(open_delim, tokens, Span::new(start_pos, stream.pos()));
+                    stream.skip_whitespace();
+
+                    return Ok(group);
                 } else {
                     return Err(LexError {
-                        span: Span::new(start_pos, stream.pos()),
+                        span: Span::new(start_pos, end_pos),
                         kind: LexErrorKind::UnclosedDelimiter,
                     });
                 }
@@ -1157,12 +1160,6 @@ impl Group {
             let token = next_token(stream)?;
             tokens.push(token);
         }
-
-        Ok(Group::new(
-            open_delim,
-            tokens,
-            Span::new(start_pos, stream.pos()),
-        ))
     }
 
     pub fn tokens(&self) -> &[Token] {
@@ -1396,10 +1393,10 @@ fn parse_escape(
         Some((_, '\\')) => Ok('\\'),
         Some((_, '\'')) => Ok('\''),
         Some((_, '\"')) => Ok('\"'),
-        Some((_, '\n')) => Ok('\n'),
-        Some((_, '\r')) => Ok('\r'),
-        Some((_, '\t')) => Ok('\t'),
-        Some((_, '\0')) => Ok('\0'),
+        Some((_, 'n')) => Ok('\n'),
+        Some((_, 'r')) => Ok('\r'),
+        Some((_, 't')) => Ok('\t'),
+        Some((_, '0')) => Ok('\0'),
         Some((_, 'x')) => {
             // Hex escape sequence, skip \xNN
             let mut value = 0u8;
