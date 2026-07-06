@@ -21,8 +21,11 @@ name = "raft-repl"
 version = "0.1.0"
 
 [[package]]
-name = "runtime"
+name = "raft-runtime"
 version = "0.1.0"
+dependencies = [
+ "raft-ast",
+]
 
 [[package]]
 name = "unicode-ident"

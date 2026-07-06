@@ -4,9 +4,12 @@ extern crate alloc;
 
 use alloc::rc::Rc;
 
-pub use raft_lexer::{Span, LiteralNumber, LiteralChar, LiteralString, Token};
+pub use raft_lexer::{Span, LiteralNumber, LiteralChar, LiteralString};
 
 pub mod parse;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Ident {
@@ -274,20 +277,20 @@ impl Expr {
 pub struct PatRecordField {
     span: Span,
     key: Ident,
-    pattern: Option<Pat>,
+    pat: Option<Pat>,
 }
 
 impl PatRecordField {
-    pub fn new(key: Ident, pattern: Option<Pat>, span: Span) -> Self {
-        Self { key, pattern, span }
+    pub fn new(key: Ident, pat: Option<Pat>, span: Span) -> Self {
+        Self { key, pat, span }
     }
 
     pub fn key(&self) -> &Ident {
         &self.key
     }
 
-    pub fn pattern(&self) -> Option<&Pat> {
-        self.pattern.as_ref()
+    pub fn pat(&self) -> Option<&Pat> {
+        self.pat.as_ref()
     }
 
     pub fn span(&self) -> Span {

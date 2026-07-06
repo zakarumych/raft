@@ -1,6 +1,11 @@
 [package]
-name = "runtime"
+name = "raft-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+std = ["raft-ast/std"]
+default = ["std"]
+
 [dependencies]
+raft-ast = { path = "../ast", default-features = false }
