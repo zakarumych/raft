@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 use core::{cell::RefCell, cmp::Ordering, fmt};
+use std::rc::Weak;
 
 use raft_ast::{BinaryOp, Expr, ExprKind, Literal, Pat, PatKind, Stmt, StmtKind, UnaryOp};
 
@@ -229,7 +230,7 @@ pub enum Any {
     String(Rc<str>),
     Atom(Rc<str>),                 // atoms like True/False or symbols
     Object(Rc<RefCell<Object>>),   // lists and records live here
-    Fn(Rc<ExternalFn>),            // host-provided function
+    Fn(Rc<FnTrait>),               // host-provided function
     Opaque(Rc<dyn std::any::Any>), // opaque value, uninterpretable by raft code
 }
 
@@ -564,52 +565,79 @@ impl Any {
         }
     }
 
-    fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>) -> Result<Any, RuntimeError> {
-        let f = move |rt: &mut Runtime, args: &[Any]| -> Any {
-            if args.len() != params.len() {
-                rt.set_error(RuntimeError::TypeError(format!(
-                    "expected {} arguments, got {}",
-                    params.len(),
-                    args.len()
-                )));
-                return Any::nil();
+    fn maybe_partial(
+        rt: &mut Runtime,
+        f: Rc<FnTrait>,
+        args: Rc<[Any]>,
+        arity: usize,
+    ) -> (Any, usize) {
+        if args.len() < arity {
+            if args.is_empty() {
+                return (Any::Fn(f.clone()), 0);
             }
 
-            for (param, arg) in params.iter().zip(args.iter()) {
-                if let Err(e) = rt.bind_pattern(param, arg) {
-                    rt.set_error(e);
-                    return Any::nil();
+            let preapplied: Rc<[Any]> = args.clone();
+
+            (
+                Any::Fn(Rc::new(move |rt: &mut Runtime, args: &[Any]| {
+                    let combined_args: Rc<[Any]> =
+                        Rc::from_iter(preapplied.iter().chain(args.iter()).cloned());
+                    let (ret, consumed) = Self::maybe_partial(rt, f.clone(), combined_args, arity);
+                    (ret, consumed - preapplied.len())
+                })),
+                args.len(),
+            )
+        } else {
+            f(rt, &args[..])
+        }
+    }
+
+    fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>) -> Any {
+        let arity = params.len();
+
+        let f = Rc::new_cyclic(|me| {
+            let me = { me.clone() as Weak<FnTrait> };
+            move |rt: &mut Runtime, args: &[Any]| -> (Any, usize) {
+                if args.len() < params.len() {
+                    return Self::maybe_partial(rt, me.upgrade().unwrap(), Rc::from(args), arity);
+                }
+
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    if let Err(e) = rt.bind_pattern(param, arg) {
+                        rt.set_error(e);
+                        return (Any::nil(), params.len());
+                    }
+                }
+
+                match rt.exec_block(&body) {
+                    Ok(Exec::Value(v)) => (v, params.len()),
+                    Ok(Exec::Return(v)) => (v, params.len()),
+                    Ok(Exec::Break) => {
+                        rt.set_error(RuntimeError::Other(
+                            "break statement outside of loop".to_owned(),
+                        ));
+                        (Any::nil(), params.len())
+                    }
+                    Ok(Exec::Continue) => {
+                        rt.set_error(RuntimeError::Other(
+                            "continue statement outside of loop".to_owned(),
+                        ));
+                        (Any::nil(), params.len())
+                    }
+                    Err(e) => {
+                        rt.set_error(e);
+                        (Any::nil(), params.len())
+                    }
                 }
             }
+        });
 
-            match rt.exec_block(&body) {
-                Ok(Exec::Value(v)) => v,
-                Ok(Exec::Return(v)) => v,
-                Ok(Exec::Break) => {
-                    rt.set_error(RuntimeError::Other(
-                        "break statement outside of loop".to_owned(),
-                    ));
-                    Any::nil()
-                }
-                Ok(Exec::Continue) => {
-                    rt.set_error(RuntimeError::Other(
-                        "continue statement outside of loop".to_owned(),
-                    ));
-                    Any::nil()
-                }
-                Err(e) => {
-                    rt.set_error(e);
-                    Any::nil()
-                }
-            }
-        };
-
-        Ok(Any::Fn(Rc::new(f)))
+        Any::Fn(f)
     }
 }
 
 /// External function type. Receives runtime and evaluated args, returns Any or error string.
-pub type ExternalFn = dyn Fn(&mut Runtime, &[Any]) -> Any;
+pub type FnTrait = dyn Fn(&mut Runtime, &[Any]) -> (Any, usize);
 
 // Runtime with two scopes: global and optional local
 pub struct Runtime {
@@ -668,7 +696,7 @@ impl Runtime {
 
     pub fn register_external<F>(&mut self, name: &str, f: F)
     where
-        F: Fn(&mut Runtime, &[Any]) -> Any + 'static,
+        F: Fn(&mut Runtime, &[Any]) -> (Any, usize) + 'static,
     {
         self.global.insert(name.to_owned(), Any::Fn(Rc::new(f)));
     }
@@ -754,8 +782,9 @@ impl Runtime {
                     && call_fn
                 {
                     // call inside function-local scope
-                    let ret = self.call_with_local(|rt| f(rt, &[]));
+                    let (ret, args_consumed) = self.call_with_local(|rt| f(rt, &[]));
                     self.status.clone()?;
+                    debug_assert_eq!(args_consumed, 0);
                     Ok(ret)
                 } else {
                     Ok(val)
@@ -794,36 +823,46 @@ impl Runtime {
                 eval_binary(op, &a, &b)
             }
             ExprKind::Apply(func, args) => {
-                let fval = self.eval(func)?;
+                let mut fval = self.eval(func)?;
                 let mut evaled_args = Vec::with_capacity(args.len());
                 for a in args.iter() {
                     evaled_args.push(self.eval(a)?);
                 }
-                match fval {
-                    Any::Fn(f) => {
-                        // call inside function-local scope
-                        let ret = self.call_with_local(|rt| f(rt, &evaled_args));
-                        self.status.clone()?;
-                        Ok(ret)
-                    }
-                    Any::Object(h) => {
-                        // allow calling a object only if it holds an External under a special key "__call" (record)
-                        let borrowed = h.borrow();
-                        match &borrowed.kind {
-                            ObjectKind::Record(map) => {
-                                if let Some(Any::Fn(ext)) = map.get("__call") {
-                                    let ret = self.call_with_local(|rt| ext(rt, &evaled_args));
-                                    self.status.clone()?;
-                                    Ok(ret)
-                                } else {
-                                    Err(RuntimeError::NotAFunction("object not callable".into()))
-                                }
-                            }
-                            _ => Err(RuntimeError::NotAFunction("list not callable".into())),
+
+                while !evaled_args.is_empty() {
+                    match fval {
+                        Any::Fn(f) => {
+                            // call inside function-local scope
+                            let (ret, consumed) = self.call_with_local(|rt| f(rt, &evaled_args));
+                            self.status.clone()?;
+                            
+                            fval = ret;
+                            evaled_args.drain(0..consumed);
                         }
+                        Any::Object(h) => {
+                            // allow calling a object only if it holds an External under a special key "__call" (record)
+                            let borrowed = h.borrow();
+                            match &borrowed.kind {
+                                ObjectKind::Record(map) => {
+                                    if let Some(Any::Fn(ext)) = map.get("__call") {
+                                        let (ret, consumed) = self.call_with_local(|rt| ext(rt, &evaled_args));
+                                        self.status.clone()?;
+                                        fval = ret;
+                                        evaled_args.drain(0..consumed);
+                                    } else {
+                                        return Err(RuntimeError::NotAFunction(
+                                            "object not callable".into(),
+                                        ));
+                                    }
+                                }
+                                _ => return Err(RuntimeError::NotAFunction("list not callable".into())),
+                            }
+                        }
+                        _ => return Err(RuntimeError::NotAFunction("value is not callable".into())),
                     }
-                    _ => Err(RuntimeError::NotAFunction("value is not callable".into())),
                 }
+
+                Ok(fval)
             }
             ExprKind::Field(obj, field_ident) => {
                 let v = self.eval(obj)?;
@@ -864,9 +903,7 @@ impl Runtime {
                     _ => Err(RuntimeError::TypeError("indexing non-heap value".into())),
                 }
             }
-            ExprKind::Parenthesized(expr) => {
-                self.eval_impl(expr, true)
-            }
+            ExprKind::Parenthesized(expr) => self.eval_impl(expr, true),
         }
     }
 
@@ -1020,7 +1057,7 @@ impl Runtime {
             StmtKind::Break => Ok(Exec::Break),
             StmtKind::Continue => Ok(Exec::Continue),
             StmtKind::Fn { name, params, body } => {
-                let fval = Any::fn_from_ast(params.clone(), body.clone())?;
+                let fval = Any::fn_from_ast(params.clone(), body.clone());
                 self.set_var(name.name(), fval);
                 Ok(Exec::Value(Any::nil()))
             }
@@ -1029,15 +1066,16 @@ impl Runtime {
 
     /// Execute block of statements. Stops and returns Some(value) if a return happens.
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Exec, RuntimeError> {
+        let mut last_val = Any::nil();
         for s in stmts {
             match self.exec_stmt(s)? {
-                Exec::Value(_) => continue,
-                Exec::Return(v) => return Ok(Exec::Return(v)),
+                Exec::Value(val) => last_val = val,
+                Exec::Return(val) => return Ok(Exec::Return(val)),
                 Exec::Continue => continue,
                 Exec::Break => return Ok(Exec::Break),
             }
         }
-        Ok(Exec::Value(Any::nil()))
+        Ok(Exec::Value(last_val))
     }
 
     fn bind_pattern(&mut self, pat: &Pat, val: &Any) -> Result<(), RuntimeError> {

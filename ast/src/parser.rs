@@ -818,9 +818,13 @@ impl Expr {
                 group_stream.expect_end()?;
 
                 stream.advance();
-                Ok(Expr {
-                    kind: ExprKind::Parenthesized(Rc::new(expr)),
-                    span: g.span(),
+
+                Ok(match expr.kind {
+                    ExprKind::Parenthesized(kind) => Expr {
+                        kind: ExprKind::Parenthesized(kind),
+                        span: g.span(),
+                    },
+                    _ => Expr { span: g.span(), kind: ExprKind::Parenthesized(Rc::new(expr)) }
                 })
             }
             Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {

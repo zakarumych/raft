@@ -15,14 +15,13 @@ fn main() {
         for arg in args {
             println!("{}", arg);
         }
-
-        Any::nil()
+        (Any::nil(), args.len())
     })));
 
     let quit_flag_clone = quit_flag.clone();
     rt.set_var("quit", Any::Fn(Rc::new(move |_rt, _args| {
         quit_flag_clone.set(true);
-        Any::nil()
+        (Any::nil(), 0)
     })));
 
     let mut lines = String::new();
