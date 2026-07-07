@@ -253,6 +253,7 @@ pub enum ExprKind {
     Apply(Rc<Expr>, Rc<[Expr]>),
     Field(Rc<Expr>, Ident),
     Index(Rc<Expr>, Rc<Expr>),
+    Parenthesized(Rc<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -335,12 +336,13 @@ pub enum StmtKind {
     AssignPattern { target: Pat, value: Expr },
     AssignField { target: Rc<Expr>, field: Ident, value: Expr },
     AssignIndex { target: Rc<Expr>, index: Rc<Expr>, value: Expr },
-    If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    For { target: Pat, iterable: Expr, body: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
+    If { cond: Expr, then_branch: Rc<[Stmt]>, else_branch: Option<Rc<[Stmt]>> },
+    While { cond: Expr, body: Rc<[Stmt]>, else_branch: Option<Rc<[Stmt]>> },
+    For { target: Pat, iterable: Expr, body: Rc<[Stmt]>, else_branch: Option<Rc<[Stmt]>> },
     Return(Option<Expr>),
     Break,
     Continue,
+    Fn { name: Ident, params: Rc<[Pat]>, body: Rc<[Stmt]> },
 }
 
 

@@ -1,12 +1,12 @@
-use core::fmt;
 use alloc::rc::Rc;
+use core::fmt;
 
 use crate::{
     Atom, BinaryOp, BinaryOpKind, Expr, ExprKind, ExprRecordField, Ident, Literal, Pat, PatKind,
     PatRecordField, Span, Stmt, StmtKind, UnaryOp, UnaryOpKind,
 };
 
-use raft_lexer::{SpannedSource, Token};
+use raft_lexer::{Spacing, SpannedSource, Token};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParseErrorKind {
@@ -52,7 +52,6 @@ impl ParseError {
     }
 }
 
-
 pub struct PrintParseError<'a> {
     kind: ParseErrorKind,
     spanned_source: SpannedSource<'a>,
@@ -64,7 +63,6 @@ impl fmt::Display for PrintParseError<'_> {
         write!(f, "{}", self.spanned_source)
     }
 }
-
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
@@ -78,6 +76,7 @@ pub enum Keyword {
     While,
     For,
     In,
+    Fn,
 }
 
 impl Keyword {
@@ -91,16 +90,14 @@ impl Keyword {
             "while" => Some(Keyword::While),
             "for" => Some(Keyword::For),
             "in" => Some(Keyword::In),
+            "fn" => Some(Keyword::Fn),
             _ => None,
         }
     }
 
-    
     pub fn peek(stream: &mut TokenStream) -> Option<(Self, Span)> {
         match stream.peek() {
-            Some(Token::Ident(i)) => {
-                Some((Self::from_ident(i.repr())?, i.span()))
-            }
+            Some(Token::Ident(i)) => Some((Self::from_ident(i.repr())?, i.span())),
             _ => None,
         }
     }
@@ -244,7 +241,7 @@ impl Ident {
     //             }
 
     //             let s = i.repr();
-    //             if s.chars().next().map(|c| !c.is_uppercase()).unwrap_or(false) {
+    //             if s.chars().next().map_or(false, |c| !c.is_uppercase()) {
     //                 let name = i.rc_repr();
     //                 let span = i.span();
     //                 Some(Ident { name, span })
@@ -263,9 +260,8 @@ impl Ident {
                     return Err(ParseError::new(ParseErrorKind::UnexpectedToken, i.span()));
                 }
 
-
                 let s = i.repr();
-                if s.chars().next().map(|c| !c.is_uppercase()).unwrap_or(false) {
+                if s.chars().next().map_or(false, |c| !c.is_uppercase()) {
                     stream.advance();
                     let name = i.rc_repr();
                     let span = i.span();
@@ -275,7 +271,10 @@ impl Ident {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -289,7 +288,7 @@ impl Atom {
     //             }
 
     //             let s = i.repr();
-    //             if s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    //             if s.chars().next().map_or(false, |c| c.is_uppercase()) {
     //                 let name = i.rc_repr();
     //                 let span = i.span();
     //                 Some(Atom { name, span })
@@ -309,7 +308,7 @@ impl Atom {
                 }
 
                 let s = i.repr();
-                if s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                if s.chars().next().map_or(false, |c| c.is_uppercase()) {
                     stream.advance();
                     let name = i.rc_repr();
                     let span = i.span();
@@ -319,7 +318,10 @@ impl Atom {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -351,7 +353,10 @@ impl Literal {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -399,7 +404,10 @@ impl UnaryOp {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -408,43 +416,57 @@ impl BinaryOp {
     fn peek(stream: &TokenStream) -> Option<BinaryOp> {
         match stream.peek() {
             Some(Token::Punct(p1)) => match (p1.repr(), stream.peek1()) {
-                ('<', Some(Token::Punct(p2))) if p2.repr() == '<' => {
+                ('<', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '<' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Shl,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('>', Some(Token::Punct(p2))) if p2.repr() == '>' => {
+                ('>', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '>' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Shr,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('*', Some(Token::Punct(p2))) if p2.repr() == '*' => {
+                ('*', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '*' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Pow,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('=', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                ('=', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Eq,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('!', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                ('!', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Ne,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('<', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                ('<', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Le,
                         span: p1.span().join(p2.span()),
                     });
                 }
-                ('>', Some(Token::Punct(p2))) if p2.repr() == '=' => {
+                ('>', Some(Token::Punct(p2)))
+                    if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
+                {
                     return Some(BinaryOp {
                         kind: BinaryOpKind::Ge,
                         span: p1.span().join(p2.span()),
@@ -637,7 +659,10 @@ impl BinaryOp {
                 }
             },
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -695,12 +720,10 @@ impl Expr {
                         break;
                     }
                 }
-                Some(Token::Ident(ident)) => {
-                    match Keyword::from_ident(ident.repr()) {
-                        Some(_) => break,
-                        None => {}
-                    }
-                }
+                Some(Token::Ident(ident)) => match Keyword::from_ident(ident.repr()) {
+                    Some(_) => break,
+                    None => {}
+                },
                 Some(Token::Literal(_)) => {}
                 Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Block => break,
                 Some(Token::Group(_)) => {}
@@ -790,13 +813,15 @@ impl Expr {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
                 group_stream.skip_comments_and_newlines();
 
-                let mut expr = Expr::parse(&mut group_stream)?;
+                let expr = Expr::parse(&mut group_stream)?;
                 group_stream.skip_comments_and_newlines();
                 group_stream.expect_end()?;
 
-                expr.span = g.span();
                 stream.advance();
-                Ok(expr)
+                Ok(Expr {
+                    kind: ExprKind::Parenthesized(Rc::new(expr)),
+                    span: g.span(),
+                })
             }
             Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
@@ -814,7 +839,12 @@ impl Expr {
                             group_stream.skip_comments_and_newlines();
                             continue;
                         }
-                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+                        Some(tok) => {
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedToken,
+                                tok.span(),
+                            ));
+                        }
                         None => break,
                     }
                 }
@@ -855,7 +885,10 @@ impl Expr {
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
+                                    return Err(ParseError::new(
+                                        ParseErrorKind::UnexpectedToken,
+                                        tok.span(),
+                                    ));
                                 }
                                 None => break,
                             }
@@ -874,7 +907,10 @@ impl Expr {
                             continue;
                         }
                         Some(tok) => {
-                            return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedToken,
+                                tok.span(),
+                            ));
                         }
                         None => {
                             let key_span = key.span;
@@ -936,7 +972,10 @@ impl Expr {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -944,15 +983,15 @@ impl Expr {
 fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
     match &expr.kind {
         ExprKind::Ident(i) => Some(Pat {
-            span: i.span,
+            span: expr.span(),
             kind: PatKind::Ident(i.clone()),
         }),
         ExprKind::Atom(a) => Some(Pat {
-            span: a.span,
+            span: expr.span(),
             kind: PatKind::Atom(a.clone()),
         }),
         ExprKind::Literal(l) => Some(Pat {
-            span: l.span(),
+            span: expr.span(),
             kind: PatKind::Literal(l.clone()),
         }),
         ExprKind::List(items) => {
@@ -965,10 +1004,7 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
                 }
             }
             Some(Pat {
-                span: Span {
-                    start: items.first().map(|e| e.span.start).unwrap_or(0),
-                    end: items.last().map(|e| e.span.end).unwrap_or(0),
-                },
+                span: expr.span(),
                 kind: PatKind::List(Rc::from(pats)),
             })
         }
@@ -994,14 +1030,16 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
                 }
             }
             Some(Pat {
-                span: Span {
-                    start: fields.first().map(|f| f.span.start).unwrap_or(0),
-                    end: fields.last().map(|f| f.span.end).unwrap_or(0),
-                },
+                span: expr.span(),
                 kind: PatKind::Record(Rc::from(pats)),
             })
         }
-        _ => None,
+        ExprKind::Parenthesized(expr) => expr_to_pattern(expr),
+        ExprKind::Apply(..) => None,
+        ExprKind::Unary(..) => None,
+        ExprKind::Binary(..) => None,
+        ExprKind::Field(..) => None,
+        ExprKind::Index(..) => None,
     }
 }
 
@@ -1036,7 +1074,12 @@ impl Pat {
                             group_stream.skip_comments_and_newlines();
                             continue;
                         }
-                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+                        Some(tok) => {
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedToken,
+                                tok.span(),
+                            ));
+                        }
                         None => break,
                     }
                 }
@@ -1074,7 +1117,10 @@ impl Pat {
                                     continue;
                                 }
                                 Some(tok) => {
-                                    return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
+                                    return Err(ParseError::new(
+                                        ParseErrorKind::UnexpectedToken,
+                                        tok.span(),
+                                    ));
                                 }
                                 None => break,
                             }
@@ -1092,7 +1138,10 @@ impl Pat {
                             continue;
                         }
                         Some(tok) => {
-                            return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span()));
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedToken,
+                                tok.span(),
+                            ));
                         }
                         None => {
                             let key_span = key.span;
@@ -1151,7 +1200,10 @@ impl Pat {
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => Err(ParseError::new(
+                ParseErrorKind::UnexpectedEndOfInput,
+                stream.end_span(),
+            )),
         }
     }
 }
@@ -1196,7 +1248,10 @@ impl Stmt {
                                 },
                             });
                         } else {
-                            return Err(ParseError::new(ParseErrorKind::InvalidAssignmentTarget, lhs.span));
+                            return Err(ParseError::new(
+                                ParseErrorKind::InvalidAssignmentTarget,
+                                lhs.span,
+                            ));
                         }
                     }
                 }
@@ -1285,13 +1340,20 @@ impl Stmt {
                     });
                 }
                 Keyword::If => {
+                    stream.advance();
                     return Self::parse_if(stream, kw_span);
                 }
                 Keyword::While => {
+                    stream.advance();
                     return Self::parse_while(stream, kw_span);
                 }
                 Keyword::For => {
+                    stream.advance();
                     return Self::parse_for(stream, kw_span);
+                }
+                Keyword::Fn => {
+                    stream.advance();
+                    return Self::parse_fn(stream, kw_span);
                 }
                 _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }
@@ -1330,8 +1392,18 @@ impl Stmt {
                             // It is only possible in REPL, as non-repl lexer will skip blank lines.
                             return Ok(Vec::new());
                         }
-                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-                        None => return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+                        Some(tok) => {
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedToken,
+                                tok.span(),
+                            ));
+                        }
+                        None => {
+                            return Err(ParseError::new(
+                                ParseErrorKind::UnexpectedEndOfInput,
+                                stream.end_span(),
+                            ));
+                        }
                     }
                 } else {
                     let stmt = Stmt::parse_line(stream)?;
@@ -1339,12 +1411,16 @@ impl Stmt {
                 }
             }
             Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
-            None => return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
+            None => {
+                return Err(ParseError::new(
+                    ParseErrorKind::UnexpectedEndOfInput,
+                    stream.end_span(),
+                ));
+            }
         }
     }
 
     pub fn parse_if(stream: &mut TokenStream, if_span: Span) -> ParseResult<Self> {
-        stream.advance();
         let cond = Expr::parse(stream)?;
         let then_branch = Self::parse_branch(stream)?;
         stream.skip_comments_and_newlines();
@@ -1355,14 +1431,14 @@ impl Stmt {
             .as_ref()
             .and_then(|b| b.last())
             .or(then_branch.last());
-        let span = if_span.join(last_stmt.map(|s| s.span).unwrap_or(cond.span));
+        let span = if_span.join(last_stmt.map_or(cond.span, |s| s.span));
 
         Ok(Stmt {
             span,
             kind: StmtKind::If {
                 cond,
-                then_branch,
-                else_branch,
+                then_branch: then_branch.into(),
+                else_branch: else_branch.map(|b| b.into()),
             },
         })
     }
@@ -1372,6 +1448,7 @@ impl Stmt {
             stream.advance();
 
             let stmts = if let Some((Keyword::If, if_span)) = Keyword::peek(stream) {
+                stream.advance();
                 vec![Self::parse_if(stream, if_span)?]
             } else {
                 Self::parse_branch(stream)?
@@ -1384,7 +1461,6 @@ impl Stmt {
     }
 
     pub fn parse_while(stream: &mut TokenStream, while_span: Span) -> ParseResult<Self> {
-        stream.advance();
         let cond = Expr::parse(stream)?;
         let body = Self::parse_branch(stream)?;
         stream.skip_comments_and_newlines();
@@ -1392,14 +1468,14 @@ impl Stmt {
         let else_branch = Self::parse_else(stream)?;
 
         let last_stmt = else_branch.as_ref().and_then(|b| b.last()).or(body.last());
-        let span = while_span.join(last_stmt.map(|s| s.span).unwrap_or(cond.span));
+        let span = while_span.join(last_stmt.map_or(cond.span, |s| s.span));
 
         Ok(Stmt {
             span,
             kind: StmtKind::While {
                 cond,
-                body,
-                else_branch,
+                body: body.into(),
+                else_branch: else_branch.map(|b| b.into()),
             },
         })
     }
@@ -1416,7 +1492,10 @@ impl Stmt {
                 return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));
             }
             None => {
-                return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span()));
+                return Err(ParseError::new(
+                    ParseErrorKind::UnexpectedEndOfInput,
+                    stream.end_span(),
+                ));
             }
         }
 
@@ -1428,15 +1507,51 @@ impl Stmt {
         let else_branch = Self::parse_else(stream)?;
 
         let last_stmt = else_branch.as_ref().and_then(|b| b.last()).or(body.last());
-        let span = for_span.join(last_stmt.map(|s| s.span).unwrap_or(iterable.span));
+        let span = for_span.join(last_stmt.map_or(iterable.span, |s| s.span));
 
         Ok(Stmt {
             span,
             kind: StmtKind::For {
                 target,
                 iterable,
-                body,
-                else_branch,
+                body: body.into(),
+                else_branch: else_branch.map(|b| b.into()),
+            },
+        })
+    }
+
+    pub fn parse_fn(stream: &mut TokenStream, fn_span: Span) -> ParseResult<Self> {
+        let name = Ident::parse(stream)?;
+        let mut params = Vec::new();
+
+        loop {
+            match stream.peek() {
+                None => {
+                    return Err(ParseError::new(
+                        ParseErrorKind::UnexpectedEndOfInput,
+                        stream.end_span(),
+                    ));
+                }
+                Some(Token::Punct(p)) if p.repr() == ':' => {
+                    break;
+                }
+                _ => {
+                    let pat = Pat::parse(stream)?;
+                    params.push(pat);
+                }
+            }
+        }
+
+        let body = Self::parse_branch(stream)?;
+
+        let span = fn_span.join(body.last().map_or(name.span, |s| s.span));
+
+        Ok(Stmt {
+            span,
+            kind: StmtKind::Fn {
+                name,
+                params: params.into(),
+                body: body.into(),
             },
         })
     }

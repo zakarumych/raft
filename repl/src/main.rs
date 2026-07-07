@@ -11,7 +11,7 @@ fn main() {
 
     let quit_flag = Rc::new(std::cell::Cell::new(false));
 
-    rt.set_var("print", Any::External(Rc::new(|_rt, args| {
+    rt.set_var("print", Any::Fn(Rc::new(|_rt, args| {
         for arg in args {
             println!("{}", arg);
         }
@@ -20,7 +20,7 @@ fn main() {
     })));
 
     let quit_flag_clone = quit_flag.clone();
-    rt.set_var("quit", Any::External(Rc::new(move |_rt, _args| {
+    rt.set_var("quit", Any::Fn(Rc::new(move |_rt, _args| {
         quit_flag_clone.set(true);
         Any::nil()
     })));

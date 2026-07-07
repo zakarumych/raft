@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 use core::{cell::RefCell, cmp::Ordering, fmt};
 
-use raft_ast::{Expr, ExprKind, Literal, Pat, PatKind, Stmt, StmtKind, UnaryOp, BinaryOp};
+use raft_ast::{BinaryOp, Expr, ExprKind, Literal, Pat, PatKind, Stmt, StmtKind, UnaryOp};
 
 struct KnownAtoms {
     false_: Rc<str>,
@@ -229,7 +229,7 @@ pub enum Any {
     String(Rc<str>),
     Atom(Rc<str>),                 // atoms like True/False or symbols
     Object(Rc<RefCell<Object>>),   // lists and records live here
-    External(Rc<ExternalFn>),      // host-provided function
+    Fn(Rc<ExternalFn>),            // host-provided function
     Opaque(Rc<dyn std::any::Any>), // opaque value, uninterpretable by raft code
 }
 
@@ -247,7 +247,7 @@ impl fmt::Debug for Any {
             Any::String(s) => write!(f, "String({})", s),
             Any::Atom(a) => write!(f, "Atom({})", a),
             Any::Object(o) => write!(f, "Object({:?})", o.borrow()),
-            Any::External(_) => write!(f, "External(<fn>)"),
+            Any::Fn(_) => write!(f, "<fn>)"),
             Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
         }
     }
@@ -261,7 +261,7 @@ impl fmt::Display for Any {
             Any::String(s) => write!(f, "{}", s),
             Any::Atom(a) => write!(f, "{}", a),
             Any::Object(o) => write!(f, "{}", o.borrow()),
-            Any::External(_) => write!(f, "External(<fn>)"),
+            Any::Fn(_) => write!(f, "<fn>"),
             Any::Opaque(val) => write!(f, "{:p}", &**val),
         }
     }
@@ -298,9 +298,7 @@ impl Any {
     fn pos(&self) -> Result<Any, RuntimeError> {
         match self {
             Any::Number(n) => Ok(Any::Number(*n)),
-            _ => Err(RuntimeError::TypeError(
-                "pos on non-numeric value".into(),
-            )),
+            _ => Err(RuntimeError::TypeError("pos on non-numeric value".into())),
         }
     }
 
@@ -408,7 +406,7 @@ impl Any {
             (Any::String(s1), Any::String(s2)) => Some(s1.cmp(s2)),
             (Any::Char(c1), Any::Char(c2)) => Some(c1.cmp(c2)),
             (Any::Object(o1), Any::Object(o2)) => o1.borrow().cmp(&o2.borrow()),
-            (Any::External(e1), Any::External(e2)) => {
+            (Any::Fn(e1), Any::Fn(e2)) => {
                 std::ptr::eq(Rc::as_ptr(e1), Rc::as_ptr(e2)).then(|| Ordering::Equal)
             }
             (Any::Opaque(o1), Any::Opaque(o2)) => {
@@ -565,6 +563,49 @@ impl Any {
             )),
         }
     }
+
+    fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>) -> Result<Any, RuntimeError> {
+        let f = move |rt: &mut Runtime, args: &[Any]| -> Any {
+            if args.len() != params.len() {
+                rt.set_error(RuntimeError::TypeError(format!(
+                    "expected {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                )));
+                return Any::nil();
+            }
+
+            for (param, arg) in params.iter().zip(args.iter()) {
+                if let Err(e) = rt.bind_pattern(param, arg) {
+                    rt.set_error(e);
+                    return Any::nil();
+                }
+            }
+
+            match rt.exec_block(&body) {
+                Ok(Exec::Value(v)) => v,
+                Ok(Exec::Return(v)) => v,
+                Ok(Exec::Break) => {
+                    rt.set_error(RuntimeError::Other(
+                        "break statement outside of loop".to_owned(),
+                    ));
+                    Any::nil()
+                }
+                Ok(Exec::Continue) => {
+                    rt.set_error(RuntimeError::Other(
+                        "continue statement outside of loop".to_owned(),
+                    ));
+                    Any::nil()
+                }
+                Err(e) => {
+                    rt.set_error(e);
+                    Any::nil()
+                }
+            }
+        };
+
+        Ok(Any::Fn(Rc::new(f)))
+    }
 }
 
 /// External function type. Receives runtime and evaluated args, returns Any or error string.
@@ -629,8 +670,7 @@ impl Runtime {
     where
         F: Fn(&mut Runtime, &[Any]) -> Any + 'static,
     {
-        self.global
-            .insert(name.to_owned(), Any::External(Rc::new(f)));
+        self.global.insert(name.to_owned(), Any::Fn(Rc::new(f)));
     }
 
     /// Set variable according to scope rules. If local scope exists, set there; otherwise global.
@@ -667,6 +707,10 @@ impl Runtime {
     }
 
     pub fn eval(&mut self, expr: &Expr) -> Result<Any, RuntimeError> {
+        self.eval_impl(expr, false)
+    }
+
+    fn eval_impl(&mut self, expr: &Expr, call_fn: bool) -> Result<Any, RuntimeError> {
         match expr.kind() {
             ExprKind::Literal(lit) => match lit {
                 Literal::Number(n) => {
@@ -702,22 +746,19 @@ impl Runtime {
             ExprKind::Atom(a) => Ok(Any::Atom(a.rc_name())),
             ExprKind::Ident(i) => {
                 let name = i.name();
-                let val = self.get_var(name)
+                let val = self
+                    .get_var(name)
                     .ok_or(RuntimeError::UnboundIdentifier(name.to_owned()))?;
 
-                match val {
-                    Any::External(f) => {
-                        // call inside function-local scope
-                        let ret = self.call_with_local(|rt| f(rt, &[]));
-                        self.status.clone()?;
-                        Ok(ret)
-                    },
-                    Any::Object(_) => Ok(val),
-                    Any::Number(_) => Ok(val),
-                    Any::Char(_) => Ok(val),
-                    Any::String(_) => Ok(val),
-                    Any::Atom(_) => Ok(val),
-                    Any::Opaque(_) => Ok(val),
+                if let Any::Fn(f) = &val
+                    && call_fn
+                {
+                    // call inside function-local scope
+                    let ret = self.call_with_local(|rt| f(rt, &[]));
+                    self.status.clone()?;
+                    Ok(ret)
+                } else {
+                    Ok(val)
                 }
             }
             ExprKind::List(elements) => {
@@ -759,25 +800,23 @@ impl Runtime {
                     evaled_args.push(self.eval(a)?);
                 }
                 match fval {
-                    Any::External(f) => {
+                    Any::Fn(f) => {
                         // call inside function-local scope
                         let ret = self.call_with_local(|rt| f(rt, &evaled_args));
                         self.status.clone()?;
                         Ok(ret)
                     }
                     Any::Object(h) => {
-                        // allow calling a heap object only if it holds an External under a special key "__call" (record)
+                        // allow calling a object only if it holds an External under a special key "__call" (record)
                         let borrowed = h.borrow();
                         match &borrowed.kind {
                             ObjectKind::Record(map) => {
-                                if let Some(Any::External(ext)) = map.get("__call") {
+                                if let Some(Any::Fn(ext)) = map.get("__call") {
                                     let ret = self.call_with_local(|rt| ext(rt, &evaled_args));
                                     self.status.clone()?;
                                     Ok(ret)
                                 } else {
-                                    Err(RuntimeError::NotAFunction(
-                                        "heap object not callable".into(),
-                                    ))
+                                    Err(RuntimeError::NotAFunction("object not callable".into()))
                                 }
                             }
                             _ => Err(RuntimeError::NotAFunction("list not callable".into())),
@@ -825,13 +864,16 @@ impl Runtime {
                     _ => Err(RuntimeError::TypeError("indexing non-heap value".into())),
                 }
             }
+            ExprKind::Parenthesized(expr) => {
+                self.eval_impl(expr, true)
+            }
         }
     }
 
     pub fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Exec, RuntimeError> {
         match stmt.kind() {
             StmtKind::Expr(e) => {
-                let val = self.eval(e)?;
+                let val = self.eval_impl(e, true)?;
                 Ok(Exec::Value(val))
             }
             StmtKind::AssignPattern { target, value } => {
@@ -905,7 +947,7 @@ impl Runtime {
                         }
                     }
                     _ => Err(RuntimeError::TypeError(
-                        "index must be integer and target must be heap object".into(),
+                        "index must be integer and target must be object".into(),
                     )),
                 }
             }
@@ -977,6 +1019,11 @@ impl Runtime {
             }
             StmtKind::Break => Ok(Exec::Break),
             StmtKind::Continue => Ok(Exec::Continue),
+            StmtKind::Fn { name, params, body } => {
+                let fval = Any::fn_from_ast(params.clone(), body.clone())?;
+                self.set_var(name.name(), fval);
+                Ok(Exec::Value(Any::nil()))
+            }
         }
     }
 
