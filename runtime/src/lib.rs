@@ -233,6 +233,12 @@ pub enum Any {
     Opaque(Rc<dyn std::any::Any>), // opaque value, uninterpretable by raft code
 }
 
+impl core::cmp::PartialEq for Any {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Some(Ordering::Equal)
+    }
+}
+
 impl fmt::Debug for Any {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -594,9 +600,15 @@ impl fmt::Display for RuntimeError {
     }
 }
 
-pub enum ExecControl {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Exec {
+    /// Statement executed successfully, no control flow change.
+    Value(Any),
+    /// Return statement encountered.
     Return(Any),
+    /// Continue statement encountered.
     Continue,
+    /// Break statement encountered.
     Break,
 }
 
@@ -690,8 +702,23 @@ impl Runtime {
             ExprKind::Atom(a) => Ok(Any::Atom(a.rc_name())),
             ExprKind::Ident(i) => {
                 let name = i.name();
-                self.get_var(name)
-                    .ok_or(RuntimeError::UnboundIdentifier(name.to_owned()))
+                let val = self.get_var(name)
+                    .ok_or(RuntimeError::UnboundIdentifier(name.to_owned()))?;
+
+                match val {
+                    Any::External(f) => {
+                        // call inside function-local scope
+                        let ret = self.call_with_local(|rt| f(rt, &[]));
+                        self.status.clone()?;
+                        Ok(ret)
+                    },
+                    Any::Object(_) => Ok(val),
+                    Any::Number(_) => Ok(val),
+                    Any::Char(_) => Ok(val),
+                    Any::String(_) => Ok(val),
+                    Any::Atom(_) => Ok(val),
+                    Any::Opaque(_) => Ok(val),
+                }
             }
             ExprKind::List(elements) => {
                 let mut vec = Vec::with_capacity(elements.len());
@@ -801,16 +828,16 @@ impl Runtime {
         }
     }
 
-    pub fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Option<ExecControl>, RuntimeError> {
+    pub fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Exec, RuntimeError> {
         match stmt.kind() {
             StmtKind::Expr(e) => {
-                let _ = self.eval(e)?;
-                Ok(None)
+                let val = self.eval(e)?;
+                Ok(Exec::Value(val))
             }
             StmtKind::AssignPattern { target, value } => {
                 let val = self.eval(value)?;
                 self.bind_pattern(target, &val)?;
-                Ok(None)
+                Ok(Exec::Value(Any::nil()))
             }
             StmtKind::AssignField {
                 target,
@@ -830,7 +857,7 @@ impl Runtime {
                         match &mut borrowed.kind {
                             ObjectKind::Record(map) => {
                                 map.insert(field.rc_name(), val);
-                                Ok(None)
+                                Ok(Exec::Value(Any::nil()))
                             }
                             _ => Err(RuntimeError::FieldError(field.name().to_owned())),
                         }
@@ -872,7 +899,7 @@ impl Runtime {
                                     )));
                                 }
                                 vec[ui] = val;
-                                Ok(None)
+                                Ok(Exec::Value(Any::nil()))
                             }
                             _ => Err(RuntimeError::IndexError("indexing non-list object".into())),
                         }
@@ -894,7 +921,7 @@ impl Runtime {
                     if let Some(eb) = else_branch {
                         self.exec_block(eb)
                     } else {
-                        Ok(None)
+                        Ok(Exec::Value(Any::nil()))
                     }
                 }
             }
@@ -908,12 +935,13 @@ impl Runtime {
                     if let Some(eb) = else_branch {
                         break self.exec_block(eb);
                     }
-                    break Ok(None);
+                    break Ok(Exec::Value(Any::nil()));
                 }
                 match self.exec_block(body)? {
-                    Some(ExecControl::Return(v)) => break Ok(Some(ExecControl::Return(v))),
-                    Some(ExecControl::Break) => break Ok(None),
-                    None | Some(ExecControl::Continue) => continue,
+                    Exec::Value(_) => continue,
+                    Exec::Return(v) => break Ok(Exec::Return(v)),
+                    Exec::Continue => continue,
+                    Exec::Break => break Ok(Exec::Value(Any::nil())),
                 }
             },
             StmtKind::For {
@@ -929,39 +957,40 @@ impl Runtime {
                     self.bind_pattern(target, &value)?;
 
                     match self.exec_block(body)? {
-                        Some(ExecControl::Return(v)) => return Ok(Some(ExecControl::Return(v))),
-                        Some(ExecControl::Break) => return Ok(None),
-                        None | Some(ExecControl::Continue) => continue,
+                        Exec::Return(v) => return Ok(Exec::Return(v)),
+                        Exec::Break => return Ok(Exec::Value(Any::nil())),
+                        Exec::Continue => continue,
+                        Exec::Value(_) => continue,
                     }
                 }
 
                 if let Some(else_branch) = else_branch {
                     self.exec_block(else_branch)
                 } else {
-                    Ok(None)
+                    Ok(Exec::Value(Any::nil()))
                 }
             }
-            StmtKind::Return(None) => Ok(Some(ExecControl::Return(Any::nil()))),
+            StmtKind::Return(None) => Ok(Exec::Return(Any::nil())),
             StmtKind::Return(Some(expr)) => {
                 let v = self.eval(expr)?;
-                Ok(Some(ExecControl::Return(v)))
+                Ok(Exec::Return(v))
             }
-            StmtKind::Break => Ok(Some(ExecControl::Break)),
-            StmtKind::Continue => Ok(Some(ExecControl::Continue)),
+            StmtKind::Break => Ok(Exec::Break),
+            StmtKind::Continue => Ok(Exec::Continue),
         }
     }
 
     /// Execute block of statements. Stops and returns Some(value) if a return happens.
-    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Option<ExecControl>, RuntimeError> {
+    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Exec, RuntimeError> {
         for s in stmts {
             match self.exec_stmt(s)? {
-                Some(ExecControl::Return(v)) => return Ok(Some(ExecControl::Return(v))),
-                Some(ExecControl::Continue) => continue,
-                Some(ExecControl::Break) => return Ok(Some(ExecControl::Break)),
-                None => continue,
+                Exec::Value(_) => continue,
+                Exec::Return(v) => return Ok(Exec::Return(v)),
+                Exec::Continue => continue,
+                Exec::Break => return Ok(Exec::Break),
             }
         }
-        Ok(None)
+        Ok(Exec::Value(Any::nil()))
     }
 
     fn bind_pattern(&mut self, pat: &Pat, val: &Any) -> Result<(), RuntimeError> {
@@ -1121,7 +1150,7 @@ mod tests {
         let src = "x = 1";
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&stmts).unwrap(), Exec::Value(Any::nil()));
         let v = rt.get_var("x").expect("x bound");
         match v {
             Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
@@ -1134,7 +1163,7 @@ mod tests {
         let src = "[a, b] = [1, 2]";
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&stmts).unwrap(), Exec::Value(Any::nil()));
         let va = rt.get_var("a").expect("a bound");
         let vb = rt.get_var("b").expect("b bound");
         match va {
@@ -1152,7 +1181,7 @@ mod tests {
         let ok_src = "'a' = 'a'";
         let ok_stmts = ast_from_str(ok_src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&ok_stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&ok_stmts).unwrap(), Exec::Value(Any::nil()));
 
         let bad_src = "'a' = 'b'";
         let bad_stmts = ast_from_str(bad_src);
@@ -1165,7 +1194,7 @@ mod tests {
         let src = "obj = { x: 1 }\nobj.x = 5\narr = [0, 1]\narr[0] = 7";
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&stmts).unwrap(), Exec::Value(Any::nil()));
 
         // check obj.x
         let objv = rt.get_var("obj").expect("obj bound");
@@ -1210,7 +1239,7 @@ mod tests {
         let mut rt = Runtime::new();
         let res = rt.exec_block(&stmts).unwrap();
         match res {
-            Some(ExecControl::Return(Any::Number(Number::Integer(i)))) => assert_eq!(i, 5),
+            Exec::Return(Any::Number(Number::Integer(i))) => assert_eq!(i, 5),
             _ => panic!("expected return value"),
         }
         assert!(rt.get_var("x").is_none());
@@ -1221,7 +1250,7 @@ mod tests {
         let src = "if True:\n    x = 1";
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&stmts).unwrap(), Exec::Value(Any::nil()));
         match rt.get_var("x").expect("x bound") {
             Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
             _ => panic!("expected integer"),
@@ -1230,7 +1259,7 @@ mod tests {
         let src2 = "if False:\n    x = 1\nelse:\n    x = 2";
         let stmts2 = ast_from_str(src2);
         let mut rt2 = Runtime::new();
-        assert!(rt2.exec_block(&stmts2).unwrap().is_none());
+        assert_eq!(rt2.exec_block(&stmts2).unwrap(), Exec::Value(Any::nil()));
         match rt2.get_var("x").expect("x bound") {
             Any::Number(Number::Integer(i)) => assert_eq!(i, 2),
             _ => panic!("expected integer"),
@@ -1242,7 +1271,7 @@ mod tests {
         let src = "r = { x: 1 }";
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
-        assert!(rt.exec_block(&stmts).unwrap().is_none());
+        assert_eq!(rt.exec_block(&stmts).unwrap(), Exec::Value(Any::nil()));
         // freeze object
         let rv = rt.get_var("r").expect("r bound");
         match rv {
@@ -1265,7 +1294,7 @@ mod tests {
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
         let res = rt.exec_block(&stmts).unwrap();
-        assert!(res.is_none());
+        assert_eq!(res, Exec::Value(Any::nil()));
         match rt.get_var("i").expect("i bound") {
             Any::Number(Number::Integer(i)) => assert_eq!(i, 3),
             _ => panic!("expected integer"),

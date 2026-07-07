@@ -1,13 +1,15 @@
 use std::{io::Write, rc::Rc};
 
 use raft_ast::{lexer::LexErrorKind, parser::ParseErrorKind};
-use raft_runtime::{Any, ExecControl};
+use raft_runtime::{Any, Exec};
 
 fn main() {
     std::io::stdout().write_all(b"Raft REPL\n").unwrap();
     std::io::stdout().flush().unwrap();
 
     let mut rt = raft_runtime::Runtime::new();
+
+    let quit_flag = Rc::new(std::cell::Cell::new(false));
 
     rt.set_var("print", Any::External(Rc::new(|_rt, args| {
         for arg in args {
@@ -17,10 +19,21 @@ fn main() {
         Any::nil()
     })));
 
+    let quit_flag_clone = quit_flag.clone();
+    rt.set_var("quit", Any::External(Rc::new(move |_rt, _args| {
+        quit_flag_clone.set(true);
+        Any::nil()
+    })));
+
     let mut lines = String::new();
 
-    loop {
-        std::io::stdout().write_all(b"> ").unwrap();
+    while quit_flag.get() == false {
+        if lines.is_empty() {
+            std::io::stdout().write_all(b"> ").unwrap();
+        } else {
+            std::io::stdout().write_all(b". ").unwrap();
+        }
+
         std::io::stdout().flush().unwrap();
 
         if 0 == std::io::stdin().read_line(&mut lines).unwrap() {
@@ -36,16 +49,20 @@ fn main() {
 
                         for stmt in &stmts {
                             match rt.exec_stmt(&stmt) {
-                                Ok(None) => {}
-                                Ok(Some(ExecControl::Break)) => {
+                                Ok(Exec::Value(value)) => {
+                                    if value != Any::nil() {
+                                        println!("{}", value);
+                                    }
+                                }
+                                Ok(Exec::Break) => {
                                     eprintln!("Unexpected break");
                                     break;
                                 }
-                                Ok(Some(ExecControl::Continue)) => {
+                                Ok(Exec::Continue) => {
                                     eprintln!("Unexpected continue");
                                     break;
                                 }
-                                Ok(Some(ExecControl::Return(_))) => {
+                                Ok(Exec::Return(_)) => {
                                     eprintln!("Unexpected return");
                                     break;
                                 }

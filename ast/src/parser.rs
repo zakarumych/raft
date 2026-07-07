@@ -1317,13 +1317,18 @@ impl Stmt {
                 stream.advance();
                 stream.skip_comments();
                 if stream.skip_newline() {
-                    stream.skip_comments_and_newlines();
+                    stream.skip_comments();
                     match stream.peek() {
                         Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Block => {
                             stream.advance();
 
                             let mut group_stream = TokenStream::new(g.rc_tokens());
                             return Stmt::parse_many(&mut group_stream);
+                        }
+                        Some(Token::Newline(_)) => {
+                            // 2nd newline means empty branch
+                            // It is only possible in REPL, as non-repl lexer will skip blank lines.
+                            return Ok(Vec::new());
                         }
                         Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
                         None => return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
