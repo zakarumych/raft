@@ -2,7 +2,10 @@ use core::{char, fmt, ops::Range};
 
 use alloc::{borrow::ToOwned, rc::Rc, string::String, vec::Vec};
 
-use crate::{stream::Stream, span::{Span, SpannedSource}};
+use crate::{
+    span::{Span, SpannedSource},
+    stream::Stream,
+};
 
 /// Options for the lexer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,7 +40,7 @@ impl Options {
             ignore_blank_lines: true,
         }
     }
-    
+
     /// Returns REPL whitespace-sensitive options,
     /// which emit newlines and group blocks.
     pub const fn wss_repl() -> Self {
@@ -45,8 +48,8 @@ impl Options {
             emit_comments: true,
             emit_newlines: true,
             group_blocks: true,
-            block_end_on_eof: false,    // in REPL we don't want to treat EOF as block end, because we want to allow the user to continue typing in the next line.
-            ignore_blank_lines: false,  // in REPL we don't want to ignore blank lines, because we want user to use blank lines to separate blocks.
+            block_end_on_eof: false, // in REPL we don't want to treat EOF as block end, because we want to allow the user to continue typing in the next line.
+            ignore_blank_lines: false, // in REPL we don't want to ignore blank lines, because we want user to use blank lines to separate blocks.
         }
     }
 
@@ -1101,7 +1104,7 @@ impl Group {
         let mut tokens = Vec::new();
 
         loop {
-            while let Ok(token) = Newline::parse(stream) {
+            if let Ok(token) = Newline::parse(stream) {
                 if options.ignore_blank_lines {
                     stream.skip_blank_lines();
                 }
@@ -1113,6 +1116,21 @@ impl Group {
 
             if options.ignore_blank_lines {
                 stream.skip_blank_lines();
+            }
+
+            if stream.is_empty() {
+                if open_delim == Delimiter::Block && options.block_end_on_eof {
+                    return Ok(Group::new(
+                        open_delim,
+                        tokens,
+                        Span::new(start_pos, stream.pos()),
+                    ));
+                } else {
+                    return Err(LexError {
+                        span: Span::new(start_pos, stream.pos()),
+                        kind: LexErrorKind::UnexpectedEndOfInput,
+                    });
+                }
             }
 
             if options.group_blocks && stream.is_linestart() {
@@ -1161,7 +1179,7 @@ impl Group {
                 } else {
                     return Err(LexError {
                         span: Span::new(start_pos, stream.pos()),
-                        kind: LexErrorKind::UnclosedDelimiter,
+                        kind: LexErrorKind::UnexpectedEndOfInput,
                     });
                 }
             }

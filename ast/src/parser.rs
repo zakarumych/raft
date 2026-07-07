@@ -1325,7 +1325,8 @@ impl Stmt {
                             let mut group_stream = TokenStream::new(g.rc_tokens());
                             return Stmt::parse_many(&mut group_stream);
                         }
-                        _ => return Ok(Vec::new()),
+                        Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
+                        None => return Err(ParseError::new(ParseErrorKind::UnexpectedEndOfInput, stream.end_span())),
                     }
                 } else {
                     let stmt = Stmt::parse_line(stream)?;
