@@ -62,7 +62,7 @@ where
 
 fn bench_python(c: &mut Criterion, group: &str, defs: &str, call: &str) {
     use pyo3::{prelude::*, types::*};
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
 
     let mut g = c.benchmark_group(group);
 
@@ -97,7 +97,7 @@ fn bench_python(c: &mut Criterion, group: &str, defs: &str, call: &str) {
 }
 
 const FIB: &str =
-    "fn fib n:\n    if n < 2:\n        return n\n    return (fib (n - 1)) + (fib (n - 2))\n";
+    "fn fib n:\n  if n < 2: return n\n  fib (n - 1) + fib (n - 2)\n";
 
 const FIB_PY: &str =
     "def fib(n):\n    if n < 2:\n        return n\n    return (fib (n - 1)) + (fib (n - 2))\n";

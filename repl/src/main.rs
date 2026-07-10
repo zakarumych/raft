@@ -23,6 +23,14 @@ fn main() {
         Any::nil()
     }));
 
+    // print takes any number of arguments, quit takes exactly none
+    rt.set_var("debugfmt", Any::host_function(0, None, |rt, args| {
+        for arg in rt.vm.drain_off_stack(args).rev() {
+            println!("{:#?}", arg);
+        }
+        Any::nil()
+    }));
+
     let quit_flag_clone = quit_flag.clone();
     rt.set_var("quit", Any::host_function(0, Some(0), move |_rt, _args| {
         quit_flag_clone.set(true);

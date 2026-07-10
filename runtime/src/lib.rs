@@ -5,7 +5,10 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 use core::{cell::RefCell, cmp::Ordering, fmt};
 use smallvec::SmallVec;
-use std::{collections::HashMap, hash::{Hash, Hasher}};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
 
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
 
@@ -281,7 +284,7 @@ pub enum Any {
     Number(Number),
     Char(char),
     String(Rc<str>),
-    Atom(Atom),                 // atoms like True/False or symbols
+    Atom(Atom),                    // atoms like True/False or symbols
     Object(Rc<RefCell<Object>>),   // lists and records live here
     Fn(FnValue),                   // function value: fn-defined (AST or bytecode), partial, or host
     Opaque(Rc<dyn std::any::Any>), // opaque value, uninterpretable by raft code
@@ -299,15 +302,28 @@ impl core::cmp::PartialEq for Any {
 
 impl fmt::Debug for Any {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Any::Number(n) => write!(f, "Number({:?})", n),
-            Any::Char(c) => write!(f, "Char({:?})", c),
-            Any::String(s) => write!(f, "String({:?})", s),
-            Any::Atom(a) => write!(f, "Atom({:?})", a),
-            Any::Object(o) => write!(f, "Object({:?})", o.borrow()),
-            Any::Fn(_) => write!(f, "<fn>"),
-            Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
-            Any::Uninit => write!(f, "<uninit>"),
+        if f.alternate() {
+            match self {
+                Any::Number(n) => write!(f, "Number({:#?})", n),
+                Any::Char(c) => write!(f, "Char({:#?})", c),
+                Any::String(s) => write!(f, "String({:#?})", s),
+                Any::Atom(a) => write!(f, "Atom({:#?})", a),
+                Any::Object(o) => write!(f, "Object({:#?})", o.borrow()),
+                Any::Fn(fun) => write!(f, "{:#?}", fun),
+                Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
+                Any::Uninit => write!(f, "<uninit>"),
+            }
+        } else {
+            match self {
+                Any::Number(n) => write!(f, "Number({:?})", n),
+                Any::Char(c) => write!(f, "Char({:?})", c),
+                Any::String(s) => write!(f, "String({:?})", s),
+                Any::Atom(a) => write!(f, "Atom({:?})", a),
+                Any::Object(o) => write!(f, "Object({:?})", o.borrow()),
+                Any::Fn(fun) => write!(f, "{:?}", fun),
+                Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
+                Any::Uninit => write!(f, "<uninit>"),
+            }
         }
     }
 }
@@ -349,12 +365,6 @@ impl Any {
     #[inline]
     pub fn nil() -> Any {
         Any::Atom(Atom::Nil)
-    }
-
-    #[cold]
-    #[inline]
-    fn cold_nil() -> Any {
-        Any::nil()
     }
 
     pub fn new_atom(s: Rc<str>) -> Any {
@@ -704,7 +714,7 @@ pub trait Function: Sized + 'static {
     }
 
     /// Call through a shared reference.
-    fn call(&self, rt: &mut Runtime, args: usize) -> Any;
+    fn call(&self, rt: &mut Runtime, args: usize);
 
     /// Consuming flavor of [`call`](Function::call). The runtime dispatches
     /// here when the value being called holds the last reference to this
@@ -712,17 +722,20 @@ pub trait Function: Sized + 'static {
     /// captured state instead of cloning it — see `PartialFn`). Defaults to
     /// delegating to `call`.
     #[inline]
-    fn call_once(self, rt: &mut Runtime, args: usize) -> Any {
+    fn call_once(self, rt: &mut Runtime, args: usize) {
         self.call(rt, args)
     }
 
-    /// Whether the runtime must push a fresh name-keyed local scope around
-    /// calls. Functions that manage their own locals (compiled functions
-    /// use stack-frame slots) return `false` and skip that work; they must
-    /// then never touch `Runtime::local`.
     #[inline]
-    fn wants_local_scope(&self) -> bool {
-        true
+    fn call_rc(self: Rc<Self>, rt: &mut Runtime, args: usize) {
+        match Rc::try_unwrap(self) {
+            Ok(f) => f.call_once(rt, args),
+            Err(f) => f.call(rt, args),
+        }
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<fn>")
     }
 }
 
@@ -733,59 +746,68 @@ pub trait Function: Sized + 'static {
 /// falls back to the borrowing `call`. That unwrap attempt doubles as the
 /// "is this the last reference?" dispatch.
 trait DynFunction: 'static {
-    fn dyn_call_once(self: Rc<Self>, rt: &mut Runtime, args: usize) -> (Any, usize);
+    /// Minimum number of arguments this function consumes in a call.
+    /// If less than that many are supplied, the runtime will return a partially-applied
+    /// function value instead of calling.
+    fn min_args(&self) -> usize;
+
+    fn max_args(&self) -> Option<usize>;
+
+    fn dyn_call(self: Rc<Self>, rt: &mut Runtime, args: usize) -> usize;
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 }
 
-impl<F: Function> DynFunction for F {
-    fn dyn_call_once(self: Rc<Self>, rt: &mut Runtime, args: usize) -> (Any, usize) {
-        let min_args = self.min_args();
-        if args < min_args {
-            if args == 0 {
-                return (Any::Fn(FnValue(self)), 0);
-            }
-            return (Any::Fn(FnValue::partial(self, rt, args)), args);
+fn dyn_call_impl<F: Function>(f: Rc<F>, rt: &mut Runtime, args: usize) -> usize {
+    let min_args = f.min_args();
+    if args < min_args {
+        core::hint::cold_path();
+
+        if args == 0 {
+            rt.vm.push_stack(Any::Fn(FnValue(f)));
+            return 0;
         }
 
-        let scoped = self.wants_local_scope();
-        let invoke = move |rt: &mut Runtime| {
-            let max_args = self.max_args();
+        let partial = FnValue::partial(f, rt, args);
+        rt.vm.push_stack(Any::Fn(partial));
+        return args;
+    }
 
-            match max_args {
-                Some(max_args) if max_args < args => match Rc::try_unwrap(self) {
-                    Ok(f) => (f.call_once(rt, max_args), max_args),
-                    Err(shared) => (shared.call(rt, max_args), max_args),
-                },
-                _ => match Rc::try_unwrap(self) {
-                    Ok(f) => (f.call_once(rt, args), args),
-                    Err(shared) => (shared.call(rt, args), args),
-                },
-            }
-        };
+    let max_args = f.max_args();
 
-        if scoped {
-            rt.call_with_local(invoke)
-        } else {
-            invoke(rt)
+    match max_args {
+        Some(max_args) if max_args < args => {
+            f.call_rc(rt, max_args);
+            max_args
+        }
+        _ => {
+            f.call_rc(rt, args);
+            args
         }
     }
 }
 
-// impl<F: Function> Function for Rc<F> {
-//     fn min_args(&self) -> usize {
-//         (**self).min_args()
-//     }
+impl<F: Function> DynFunction for F {
+    #[inline]
+    fn min_args(&self) -> usize {
+        Function::min_args(self)
+    }
 
-//     fn call(&self, rt: &mut Runtime, args: usize) -> Any {
-//         (**self).call(rt, args)
-//     }
+    #[inline]
+    fn max_args(&self) -> Option<usize> {
+        Function::max_args(self)
+    }
 
-//     fn call_once(self, rt: &mut Runtime, args: usize) -> Any {
-//         match Rc::try_unwrap(self) {
-//             Ok(f) => f.call_once(rt, args),
-//             Err(shared) => shared.call(rt, args),
-//         }
-//     }
-// }
+    #[inline]
+    fn dyn_call(self: Rc<Self>, rt: &mut Runtime, args: usize) -> usize {
+        dyn_call_impl(self, rt, args)
+    }
+
+    #[inline]
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Function::debug_fmt(self, f)
+    }
+}
 
 /// Adapter implementing [`Function`] for plain host closures. (A blanket
 /// impl on `F: Fn(..)` would conflict with the concrete `Function` impls
@@ -811,11 +833,25 @@ where
     }
 
     #[inline]
-    fn call(&self, rt: &mut Runtime, args: usize) -> Any {
+    fn call(&self, rt: &mut Runtime, args: usize) {
         debug_assert!(args >= self.min_args);
-        match self.max_args {
+        let ret = match self.max_args {
             Some(max_args) if args > max_args => (self.fun)(rt, max_args),
             _ => (self.fun)(rt, args),
+        };
+        rt.vm.push_stack(ret);
+    }
+
+    #[inline]
+    fn call_rc(self: Rc<Self>, rt: &mut Runtime, args: usize) {
+        self.call(rt, args)
+    }
+
+    #[inline]
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.max_args {
+            Some(max_args) => write!(f, "<fn {}..={}>", self.min_args, max_args),
+            None => write!(f, "<fn {}..>", self.min_args),
         }
     }
 }
@@ -829,7 +865,13 @@ where
 pub struct FnValue(Rc<dyn DynFunction>);
 
 impl FnValue {
+    #[inline]
     pub fn new(func: impl Function + 'static) -> Self {
+        FnValue(Rc::new(func))
+    }
+
+    #[inline]
+    fn new_dyn(func: impl DynFunction + 'static) -> Self {
         FnValue(Rc::new(func))
     }
 
@@ -837,19 +879,33 @@ impl FnValue {
     /// the last reference to the function, [`Function::call`] otherwise
     /// (the bridge's unwrap attempt makes that decision — cloning the
     /// `FnValue` first therefore naturally selects the shared flavor).
-    fn invoke(self, rt: &mut Runtime, args: &mut usize) -> Any {
-        let (val, consumed) = self.0.dyn_call_once(rt, *args);
+    #[inline]
+    fn invoke(self, rt: &mut Runtime, args: &mut usize) {
+        let consumed = self.0.dyn_call(rt, *args);
         *args -= consumed;
-        val
     }
 
     /// Capture `args` (fewer than `min_args` of them) and return a function
     /// value awaiting the rest.
+    #[inline]
     pub fn partial<F: Function>(fun: Rc<F>, runtime: &mut Runtime, args: usize) -> Self {
+        FnValue::partial_dyn(fun, runtime, args)
+    }
+
+    /// Capture `args` (fewer than `min_args` of them) and return a function
+    /// value awaiting the rest.
+    #[inline]
+    fn partial_dyn<F: DynFunction>(fun: Rc<F>, runtime: &mut Runtime, args: usize) -> Self {
         FnValue(Rc::new(PartialFn {
             fun,
             preapplied: runtime.vm.drain_off_stack(args).collect(),
         }))
+    }
+}
+
+impl fmt::Debug for FnValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.debug_fmt(f)
     }
 }
 
@@ -861,8 +917,20 @@ struct PartialFn<F> {
 
 impl<F: Function> PartialFn<F> {}
 
-impl<F: Function> DynFunction for PartialFn<F> {
-    fn dyn_call_once(mut self: Rc<Self>, rt: &mut Runtime, args: usize) -> (Any, usize) {
+impl<F: DynFunction> DynFunction for PartialFn<F> {
+    #[inline]
+    fn min_args(&self) -> usize {
+        self.fun.min_args().saturating_sub(self.preapplied.len())
+    }
+
+    #[inline]
+    fn max_args(&self) -> Option<usize> {
+        self.fun
+            .max_args()
+            .map(|max| max.saturating_sub(self.preapplied.len()))
+    }
+
+    fn dyn_call(mut self: Rc<Self>, rt: &mut Runtime, args: usize) -> usize {
         if self.preapplied.len() + args < self.fun.min_args() {
             // still not enough: capture the new arguments too. `preapplied`
             // is kept in stack order — first argument LAST — so the newly
@@ -883,50 +951,50 @@ impl<F: Function> DynFunction for PartialFn<F> {
                     },
                 }))),
             };
-            (f, args)
-        } else {
-            let scoped = self.fun.wants_local_scope();
-            let invoke = move |rt: &mut Runtime| {
-                let pre_args = self.preapplied.len();
-                let total_args = pre_args + args;
-                match self.fun.max_args() {
-                    Some(max_args) if max_args < total_args => match Rc::try_unwrap(self) {
-                        Ok(me) => {
-                            rt.vm.extend_stack(me.preapplied);
-                            let val = match Rc::try_unwrap(me.fun) {
-                                Ok(f) => f.call_once(rt, max_args),
-                                Err(shared) => shared.call(rt, max_args),
-                            };
-                            (val, max_args - pre_args)
-                        }
-                        Err(me) => {
-                            rt.vm.extend_stack(me.preapplied.iter().cloned());
-                            (me.fun.call(rt, max_args), max_args - pre_args)
-                        }
-                    },
-                    _ => match Rc::try_unwrap(self) {
-                        Ok(me) => {
-                            rt.vm.extend_stack(me.preapplied);
-                            let val = match Rc::try_unwrap(me.fun) {
-                                Ok(f) => f.call_once(rt, total_args),
-                                Err(shared) => shared.call(rt, total_args),
-                            };
-                            (val, args)
-                        }
-                        Err(me) => {
-                            rt.vm.extend_stack(me.preapplied.iter().cloned());
-                            (me.fun.call(rt, total_args), args)
-                        }
-                    },
-                }
-            };
 
-            if scoped {
-                rt.call_with_local(invoke)
-            } else {
-                invoke(rt)
+            rt.vm.push_stack(f);
+            args
+        } else {
+            core::hint::cold_path();
+
+            let pre_args = self.preapplied.len();
+            let total_args = pre_args + args;
+            match self.fun.max_args() {
+                Some(max_args) if max_args < total_args => match Rc::try_unwrap(self) {
+                    Ok(me) => {
+                        rt.vm.extend_stack(me.preapplied);
+                        let consumed = me.fun.dyn_call(rt, max_args);
+                        consumed - pre_args
+                    }
+                    Err(me) => {
+                        rt.vm.extend_stack(me.preapplied.iter().cloned());
+                        let consumed = me.fun.clone().dyn_call(rt, max_args);
+                        consumed - pre_args
+                    }
+                },
+                _ => match Rc::try_unwrap(self) {
+                    Ok(me) => {
+                        rt.vm.extend_stack(me.preapplied);
+                        let consumed = me.fun.dyn_call(rt, total_args);
+                        consumed - pre_args
+                    }
+                    Err(me) => {
+                        rt.vm.extend_stack(me.preapplied.iter().cloned());
+                        let consumed = me.fun.clone().dyn_call(rt, total_args);
+                        consumed - pre_args
+                    }
+                },
             }
         }
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<partial ")?;
+        for arg in self.preapplied.iter() {
+            write!(f, "{:?} ", arg)?;
+        }
+        self.fun.debug_fmt(f)?;
+        write!(f, ">")
     }
 }
 
@@ -947,39 +1015,47 @@ impl Function for AstFn {
         Some(self.params.len())
     }
 
-    fn call(&self, rt: &mut Runtime, args: usize) -> Any {
+    fn call(&self, rt: &mut Runtime, args: usize) {
         debug_assert!(rt.vm.stack_len() >= args);
         debug_assert_eq!(args, self.params.len());
 
-        // first argument is on top of the stack
-        for param in self.params.iter() {
-            let arg = rt.vm.pop_stack();
-            if let Err(e) = rt.bind_pattern(param, &arg) {
-                rt.set_error(e);
-                return Any::nil();
+        let ret = rt.call_with_local(move |rt| {
+            // first argument is on top of the stack
+            for param in self.params.iter() {
+                let arg = rt.vm.pop_stack();
+                if let Err(e) = rt.bind_pattern(param, &arg) {
+                    rt.set_error(e);
+                    return Any::nil();
+                }
             }
-        }
 
-        match rt.exec_block(&self.body) {
-            Ok(Exec::Value(v)) => v,
-            Ok(Exec::Return(v)) => v,
-            Ok(Exec::Break) => {
-                rt.set_error(RuntimeError::Other(
-                    "break statement outside of loop".to_owned(),
-                ));
-                Any::nil()
+            match rt.exec_block(&self.body) {
+                Ok(Exec::Value(v)) => v,
+                Ok(Exec::Return(v)) => v,
+                Ok(Exec::Break) => {
+                    rt.set_error(RuntimeError::Other(
+                        "break statement outside of loop".to_owned(),
+                    ));
+                    Any::nil()
+                }
+                Ok(Exec::Continue) => {
+                    rt.set_error(RuntimeError::Other(
+                        "continue statement outside of loop".to_owned(),
+                    ));
+                    Any::nil()
+                }
+                Err(e) => {
+                    rt.set_error(e);
+                    Any::nil()
+                }
             }
-            Ok(Exec::Continue) => {
-                rt.set_error(RuntimeError::Other(
-                    "continue statement outside of loop".to_owned(),
-                ));
-                Any::nil()
-            }
-            Err(e) => {
-                rt.set_error(e);
-                Any::nil()
-            }
-        }
+        });
+
+        rt.vm.push_stack(ret);
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<fn {:?} {{ ... }}>", self.params)
     }
 }
 
@@ -1058,6 +1134,7 @@ impl Runtime {
         self.compile_fns
     }
 
+    #[cold]
     pub fn set_error(&mut self, err: RuntimeError) {
         self.status = Err(err);
     }
@@ -1134,7 +1211,7 @@ impl Runtime {
                     .ok_or(RuntimeError::UnboundIdentifier(name.to_owned()))?;
 
                 if call_fn {
-                    self.call_bare(val)
+                    self.call_bare_ast(val)
                 } else {
                     Ok(val)
                 }
@@ -1188,8 +1265,9 @@ impl Runtime {
                 // calling convention: first argument on top of the stack,
                 // same as the reversal Instr::Call performs
                 self.vm.reverse_stack(args.len());
-
-                self.apply_value(fval, args.len())
+                self.vm.push_stack(fval);
+                self.apply_value(args.len())?;
+                Ok(self.vm.pop_stack())
             }
             ExprKind::Field(obj, field_ident) => {
                 let v = self.eval(obj)?;
@@ -1209,12 +1287,9 @@ impl Runtime {
     /// (possibly returning a partially-applied function), and leftover
     /// arguments are re-applied to whatever it returned. Shared by the AST
     /// walker (`ExprKind::Apply`) and the bytecode VM (`vm::Instr::Call`).
-    pub(crate) fn apply_value(
-        &mut self,
-        mut fval: Any,
-        mut args: usize,
-    ) -> Result<Any, RuntimeError> {
+    pub(crate) fn apply_value(&mut self, mut args: usize) -> Result<(), RuntimeError> {
         while args > 0 {
+            let fval = self.vm.pop_stack();
             let callee = match fval {
                 Any::Fn(f) => Ok(f),
                 Any::Object(h) => {
@@ -1240,35 +1315,53 @@ impl Runtime {
             };
 
             // the callee establishes its own function-local scope (see
-            // DynFunction::dyn_call_once)
-            let ret = callee.invoke(self, &mut args);
+            // DynFunction::dyn_call)
+            callee.invoke(self, &mut args);
             if self.status.is_err() {
                 drop(self.vm.drain_off_stack(args));
                 self.status.clone()?;
             }
-
-            fval = ret;
         }
 
-        Ok(fval)
+        Ok(())
     }
 
     /// A value referenced in call position with no arguments: zero-argument
     /// functions are invoked, everything else passes through unchanged.
-    /// Shared by the AST walker (bare/parenthesized idents) and the bytecode
-    /// VM (`vm::Instr::CallBare`).
-    pub(crate) fn call_bare(&mut self, val: Any) -> Result<Any, RuntimeError> {
+    /// Used by AST walker.
+    pub(crate) fn call_bare_ast(&mut self, val: Any) -> Result<Any, RuntimeError> {
         match val {
             // only a function that may take zero arguments is invoked; one
             // that needs more would just evaluate to itself anyway, so the
             // arity hint lets us skip the call entirely
             Any::Fn(f) => {
                 // call inside function-local scope
-                let ret = f.invoke(self, &mut 0);
+                f.invoke(self, &mut 0);
                 self.status.clone()?;
-                Ok(ret)
+                Ok(self.vm.pop_stack())
             }
             val => Ok(val),
+        }
+    }
+
+    /// A value referenced in call position with no arguments: zero-argument
+    /// functions are invoked, everything else passes through unchanged.
+    /// Used by the bytecode VM (`vm::Instr::CallBare`).
+    pub(crate) fn call_bare(&mut self, val: Any) -> Result<(), RuntimeError> {
+        match val {
+            // only a function that may take zero arguments is invoked; one
+            // that needs more would just evaluate to itself anyway, so the
+            // arity hint lets us skip the call entirely
+            Any::Fn(f) => {
+                // call inside function-local scope
+                f.invoke(self, &mut 0);
+                self.status.clone()?;
+                Ok(())
+            }
+            val => {
+                self.vm.push_stack(val);
+                Ok(())
+            }
         }
     }
 
@@ -1899,7 +1992,7 @@ mod tests {
         };
 
         // host registrations: default hint is "takes anything"
-        rt.register_function("anything", 0, None,|_rt, _args| Any::nil());
+        rt.register_function("anything", 0, None, |_rt, _args| Any::nil());
         let Some(Any::Fn(_host)) = rt.get_var("anything") else {
             panic!("anything not a function");
         };
@@ -1921,29 +2014,27 @@ mod tests {
                 Some(1)
             }
 
-            fn call(&self, _rt: &mut Runtime, args: usize) -> Any {
+            fn call(&self, rt: &mut Runtime, args: usize) {
                 debug_assert_eq!(args, 1);
                 self.shared_calls.set(self.shared_calls.get() + 1);
-                Any::nil()
+                rt.vm.push_stack(Any::nil());
             }
 
             // `self` by value: the hidden bridge already proved uniqueness
-            fn call_once(self, _rt: &mut Runtime, args: usize) -> Any {
+            fn call_once(self, rt: &mut Runtime, args: usize) {
                 debug_assert_eq!(args, 1);
                 self.once_calls.set(self.once_calls.get() + 1);
-                Any::nil()
+                rt.vm.push_stack(Any::nil());
             }
         }
 
         let shared_calls = Rc::new(core::cell::Cell::new(0));
         let once_calls = Rc::new(core::cell::Cell::new(0));
         let probe = || {
-            Any::Fn(FnValue::new(
-                Probe {
-                    shared_calls: shared_calls.clone(),
-                    once_calls: once_calls.clone(),
-                },
-            ))
+            Any::Fn(FnValue::new(Probe {
+                shared_calls: shared_calls.clone(),
+                once_calls: once_calls.clone(),
+            }))
         };
 
         let mut rt = Runtime::new();
@@ -1960,7 +2051,8 @@ mod tests {
         // a temporary function value: the argument list holds the last
         // reference, so the consuming flavor runs
         rt.vm.push_stack(Any::nil());
-        rt.apply_value(probe(), 1).unwrap();
+        rt.vm.push_stack(probe());
+        rt.apply_value(1).unwrap();
         assert_eq!((shared_calls.get(), once_calls.get()), (1, 1));
     }
 

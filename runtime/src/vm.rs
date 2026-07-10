@@ -42,13 +42,15 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
 
 use crate::{
-    Any, Atom, FnValue, Function, Number, ObjectKind, Runtime, RuntimeError, assign_field,
-    assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
+    Any, Atom, DynFunction, FnValue, Number, ObjectKind, Runtime, RuntimeError,
+    assign_field, assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey,
+    literal_value,
 };
 
 /// One virtual-machine instruction.
@@ -86,7 +88,10 @@ pub enum Instr {
     /// unassigned, fall back to reading global `names[name]` (a body-local
     /// name may be read before its first assignment, which reaches the
     /// global of the same name).
-    LoadLocal { slot: u32, name: u32 },
+    LoadLocal {
+        slot: u32,
+        name: u32,
+    },
     /// `→ v` — push global variable `names[i]`; error if unbound. Used for
     /// names never assigned in the function — they can only be globals.
     LoadGlobal(u32),
@@ -113,8 +118,14 @@ pub enum Instr {
     /// `→` — add/subtract 1 to frame slot `slot` in place (no stack
     /// traffic). Falls back to the global `names[name]` when the slot is
     /// still unassigned, exactly like `LoadLocal`.
-    IncSlot { slot: u32, name: u32 },
-    DecSlot { slot: u32, name: u32 },
+    IncSlot {
+        slot: u32,
+        name: u32,
+    },
+    DecSlot {
+        slot: u32,
+        name: u32,
+    },
     /// `obj → obj.names[i]` — read a record field.
     GetField(u32),
     /// `obj idx → obj[idx]` — read a list element.
@@ -448,7 +459,6 @@ fn read_u32(code: &[u8], pc: &mut usize) -> Result<u32, RuntimeError> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-
 fn truncated() -> RuntimeError {
     RuntimeError::Other("vm: truncated bytecode".to_string())
 }
@@ -528,9 +538,7 @@ fn instr_len(i: &Instr) -> usize {
         | Instr::Bind(v)
         | Instr::GetField(v)
         | Instr::SetField(v) => width_len(width_idx(*v)),
-        Instr::LoadLocal { slot, name } => {
-            operand_len(*slot) + width_len(width_idx(*name))
-        }
+        Instr::LoadLocal { slot, name } => operand_len(*slot) + width_len(width_idx(*name)),
         Instr::Unary(_) | Instr::Binary(_) | Instr::BinaryInt(..) => 0,
         Instr::IncSlot { slot, .. } | Instr::DecSlot { slot, .. } => operand_len(*slot) + 2,
         Instr::Jump(_) | Instr::JumpIfFalse(_) | Instr::IterNext(_) => 4,
@@ -784,9 +792,7 @@ impl Code {
             opcode::NIL => Instr::Nil,
             opcode::TRUE => Instr::True,
             opcode::FALSE => Instr::False,
-            opcode::INT..=opcode::INT_END => {
-                Instr::Int(SMALL_INTS[(op - opcode::INT) as usize])
-            }
+            opcode::INT..=opcode::INT_END => Instr::Int(SMALL_INTS[(op - opcode::INT) as usize]),
             opcode::INT_8 => Instr::Int(read_u8(code, &mut pc)? as i8 as i64),
             opcode::INT_16 => Instr::Int(read_u16(code, &mut pc)? as i16 as i64),
             opcode::UINT_8 => Instr::Int(read_u8(code, &mut pc)? as i64),
@@ -1081,7 +1087,9 @@ fn collect_stmt_names(stmts: &[Stmt], table: &mut SlotTable, is_uniform: bool) {
                 }
             }
             StmtKind::While {
-                cond, body, else_branch,
+                cond,
+                body,
+                else_branch,
             } => {
                 collect_expr_names(cond, table);
                 collect_stmt_names(body, table, false);
@@ -1113,7 +1121,11 @@ fn collect_stmt_names(stmts: &[Stmt], table: &mut SlotTable, is_uniform: bool) {
                 collect_expr_names(target, table);
                 collect_expr_names(value, table);
             }
-            StmtKind::AssignIndex { target, index, value } => {
+            StmtKind::AssignIndex {
+                target,
+                index,
+                value,
+            } => {
                 collect_expr_names(target, table);
                 collect_expr_names(index, table);
                 collect_expr_names(value, table);
@@ -1340,6 +1352,14 @@ impl VmContext {
     }
 
     #[inline]
+    pub fn peek_stack(&self) -> &Any {
+        match self.stack.last() {
+            Some(v) => v,
+            None => unreachable!("Attempted to peek from an empty VM stack"),
+        }
+    }
+
+    #[inline]
     pub fn extend_stack(&mut self, values: impl IntoIterator<Item = Any>) {
         self.stack.extend(values);
     }
@@ -1398,11 +1418,11 @@ impl CompiledFn {
     /// and currying are handled by the runtime through the arity hint.
     #[inline]
     pub fn into_function(self) -> Any {
-        Any::Fn(FnValue::new(self))
+        Any::Fn(FnValue::new_dyn(self))
     }
 }
 
-impl Function for CompiledFn {
+impl DynFunction for CompiledFn {
     #[inline]
     fn min_args(&self) -> usize {
         self.arity()
@@ -1413,26 +1433,43 @@ impl Function for CompiledFn {
         Some(self.arity())
     }
 
-    /// Compiled functions keep their locals in frame slots and never touch
-    /// the runtime's name-keyed local scope.
-    #[inline]
-    fn wants_local_scope(&self) -> bool {
-        false
-    }
+    fn dyn_call(self: Rc<Self>, rt: &mut Runtime, args: usize) -> usize {
+        let arity = self.arity();
+        if args < arity {
+            if args == 0 {
+                rt.vm.push_stack(Any::Fn(FnValue(self.clone())));
+                return 0;
+            }
+            let partial = FnValue::partial_dyn(self.clone(), rt, args);
+            rt.vm.push_stack(Any::Fn(partial));
+            return args;
+        }
 
-    #[inline]
-    fn call(&self, rt: &mut Runtime, args: usize) -> Any {
-        debug_assert_eq!(args, self.arity());
-
-        // the arguments stay on the stack: they are the frame's first
-        // slots (destructuring parameters are unpacked by the compiled
-        // prologue)
-        match run(rt, self) {
+        match run(rt, &self) {
             Ok(v) => v,
             Err(e) => {
                 rt.set_error(e);
-                Any::nil()
+                rt.vm.push_stack(Any::nil());
             }
+        };
+
+        arity
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            writeln!(f, "<fn {}>{{", self.arity())?;
+
+            for r in self.code.disassemble() {
+                match r {
+                    Ok((at, instr)) => writeln!(f, "  {at:4}: {instr:?}")?,
+                    Err(e) => return writeln!(f, "  <decode error: {e}>"),
+                }
+            }
+
+            write!(f, "}}")
+        } else {
+            write!(f, "<fn {}>", self.arity())
         }
     }
 }
@@ -1539,9 +1576,7 @@ fn int_literal_of(expr: &Expr) -> Option<i64> {
         _ => return None,
     };
     match literal_value(lit) {
-        Ok(Any::Number(Number::Integer(n))) => {
-            Some(if negated { n.wrapping_neg() } else { n })
-        }
+        Ok(Any::Number(Number::Integer(n))) => Some(if negated { n.wrapping_neg() } else { n }),
         _ => None,
     }
 }
@@ -1717,14 +1752,13 @@ impl Compiler<'_> {
     fn compile_stmt(&mut self, statement: &Stmt, tail: bool) -> Result<(), CompileError> {
         match statement.kind() {
             StmtKind::Expr(e) => {
-                self.compile_expr_callfn(e)?;
-                if !tail {
-                    self.emit(Instr::Pop);
-                }
+                // Use expression value only in tail position.
+                // Otherwise compile only side effects.
+                self.compile_expr_callfn(e,tail)?;
             }
             StmtKind::AssignPat { target, value } => {
                 if !self.try_inc_dec(target, value) {
-                    self.compile_expr(value)?;
+                    self.compile_expr(value, true)?;
                     self.compile_bind(target);
                 }
                 if tail {
@@ -1736,8 +1770,8 @@ impl Compiler<'_> {
                 field,
                 value,
             } => {
-                self.compile_expr(target)?;
-                self.compile_expr(value)?;
+                self.compile_expr(target, true)?;
+                self.compile_expr(value, true)?;
                 let i = self.ctx.name(field.rc_name());
                 self.emit(Instr::SetField(i));
                 if tail {
@@ -1749,9 +1783,9 @@ impl Compiler<'_> {
                 index,
                 value,
             } => {
-                self.compile_expr(target)?;
-                self.compile_expr(index)?;
-                self.compile_expr(value)?;
+                self.compile_expr(target, true)?;
+                self.compile_expr(index, true)?;
+                self.compile_expr(value, true)?;
                 self.emit(Instr::SetIndex);
                 if tail {
                     self.emit(Instr::Nil);
@@ -1762,7 +1796,7 @@ impl Compiler<'_> {
                 then_branch,
                 else_branch,
             } => {
-                self.compile_expr(cond)?;
+                self.compile_expr(cond, true)?;
                 match else_branch {
                     Some(eb) => {
                         let to_else = self.emit(Instr::JumpIfFalse(0));
@@ -1805,7 +1839,7 @@ impl Compiler<'_> {
                 else_branch,
             } => {
                 let head = self.here();
-                self.compile_expr(cond)?;
+                self.compile_expr(cond, true)?;
                 let to_exit = self.emit(Instr::JumpIfFalse(0));
 
                 self.loops.push(LoopCtx {
@@ -1842,7 +1876,7 @@ impl Compiler<'_> {
                 body,
                 else_branch,
             } => {
-                self.compile_expr(iterable)?;
+                self.compile_expr(iterable, true)?;
                 self.emit(Instr::IterInit);
 
                 let head = self.here();
@@ -1876,7 +1910,7 @@ impl Compiler<'_> {
             }
             StmtKind::Return(value) => {
                 match value {
-                    Some(e) => self.compile_expr(e)?,
+                    Some(e) => self.compile_expr(e, true)?,
                     None => {
                         self.emit(Instr::Nil);
                     }
@@ -1932,24 +1966,34 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+    // if `used` is false, the expression's value is discarded
+    // thus only expressions that produce side effects need to be compiled.
+    fn compile_expr(&mut self, expr: &Expr, used: bool) -> Result<(), CompileError> {
         match expr.kind() {
             ExprKind::Literal(lit) => {
-                let v = literal_value(lit)
-                    .map_err(|e| CompileError::new(expr.span(), e.to_string()))?;
-                self.emit_const_value(v);
+                if used {
+                    let v = literal_value(lit)
+                        .map_err(|e| CompileError::new(expr.span(), e.to_string()))?;
+                    self.emit_const_value(v);
+                }
             }
             ExprKind::Ident(id) => {
-                self.emit_load_name(id.rc_name());
+                if used {
+                    self.emit_load_name(id.rc_name());
+                }
             }
             ExprKind::Atom(a) => {
-                self.emit_const_value(Any::new_atom(a.rc_name()));
+                if used {
+                    self.emit_const_value(Any::new_atom(a.rc_name()));
+                }
             }
             ExprKind::List(elements) => {
                 for e in elements.iter() {
-                    self.compile_expr(e)?;
+                    self.compile_expr(e, used)?;
                 }
-                self.emit(Instr::MakeList(elements.len() as u32));
+                if used {
+                    self.emit(Instr::MakeList(elements.len() as u32));
+                }
             }
             ExprKind::Record(fields) => {
                 for f in fields.iter() {
@@ -1957,12 +2001,18 @@ impl Compiler<'_> {
                     let ki = self.ctx.const_(Any::String(key.clone()));
                     self.emit(Instr::Const(ki));
                     match f.value() {
-                        Some(v) => self.compile_expr(v)?,
+                        Some(v) => self.compile_expr(v, used)?,
                         // shorthand field reads the same-named variable
-                        None => self.emit_load_name(key),
+                        None => {
+                            if used {
+                                self.emit_load_name(key);
+                            }
+                        }
                     }
                 }
-                self.emit(Instr::MakeRecord(fields.len() as u32));
+                if used {
+                    self.emit(Instr::MakeRecord(fields.len() as u32));
+                }
             }
             ExprKind::Unary(op, operand) => {
                 // fold `-<number literal>` at compile time, mirroring what
@@ -1979,17 +2029,17 @@ impl Compiler<'_> {
                         return Ok(());
                     }
                 }
-                self.compile_expr(operand)?;
-                self.emit(Instr::Unary(op.kind()));
+                self.compile_expr(operand, used)?;
+                if used {
+                    self.emit(Instr::Unary(op.kind()));
+                }
             }
             ExprKind::Binary(lhs, op, rhs) => {
                 // fuse `<expr> op n` with an integer-literal right operand
                 // into a single instruction, when n is in the op's table
                 let table: Option<&[i64]> = match op.kind() {
                     BinOpKind::Add | BinOpKind::Sub => Some(&SMALL_INTS),
-                    BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor => {
-                        Some(&TINY_MASKS)
-                    }
+                    BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor => Some(&TINY_MASKS),
                     BinOpKind::Eq
                     | BinOpKind::Ne
                     | BinOpKind::Lt
@@ -2000,34 +2050,42 @@ impl Compiler<'_> {
                 };
                 if let (Some(table), Some(n)) = (table, int_literal_of(rhs)) {
                     if table.contains(&n) {
-                        self.compile_expr(lhs)?;
+                        self.compile_expr(lhs, used)?;
                         self.emit(Instr::BinaryInt(op.kind(), n as i16));
                         return Ok(());
                     }
                 }
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
-                self.emit(Instr::Binary(op.kind()));
+                self.compile_expr(lhs, used)?;
+                self.compile_expr(rhs, used)?;
+
+                if used {
+                    self.emit(Instr::Binary(op.kind()));
+                }
             }
             ExprKind::Apply(func, args) => {
-                self.compile_expr(func)?;
+                // function calls are always used.
+                self.compile_expr(func, true)?;
                 for a in args.iter() {
-                    self.compile_expr(a)?;
+                    self.compile_expr(a, true)?;
                 }
                 self.emit(Instr::Call(args.len() as u32));
             }
             ExprKind::Field(obj, field) => {
-                self.compile_expr(obj)?;
+                self.compile_expr(obj, used)?;
                 let i = self.ctx.name(field.rc_name());
-                self.emit(Instr::GetField(i));
+                if used {
+                    self.emit(Instr::GetField(i));
+                }
             }
             ExprKind::Index(obj, index) => {
-                self.compile_expr(obj)?;
-                self.compile_expr(index)?;
-                self.emit(Instr::GetIndex);
+                self.compile_expr(obj, used)?;
+                self.compile_expr(index, used)?;
+                if used {
+                    self.emit(Instr::GetIndex);
+                }
             }
             // parentheses put the inner expression in call position
-            ExprKind::Parenthesized(inner) => self.compile_expr_callfn(inner)?,
+            ExprKind::Parenthesized(inner) => self.compile_expr_callfn(inner, used)?,
         }
         Ok(())
     }
@@ -2035,14 +2093,17 @@ impl Compiler<'_> {
     /// Compile an expression in call position (statement expressions and
     /// parenthesized expressions): a bare identifier holding a zero-argument
     /// function gets called instead of yielding the function value.
-    fn compile_expr_callfn(&mut self, expr: &Expr) -> Result<(), CompileError> {
+    fn compile_expr_callfn(&mut self, expr: &Expr, used: bool) -> Result<(), CompileError> {
         match expr.kind() {
-            ExprKind::Ident(_) => {
-                self.compile_expr(expr)?;
+            ExprKind::Ident(id) => {
+                self.emit_load_name(id.rc_name());
                 self.emit(Instr::CallBare);
+                if !used {
+                    self.emit(Instr::Pop);
+                }
             }
-            ExprKind::Parenthesized(inner) => self.compile_expr_callfn(inner)?,
-            _ => self.compile_expr(expr)?,
+            ExprKind::Parenthesized(inner) => self.compile_expr_callfn(inner, used)?,
+            _ => self.compile_expr(expr, used)?,
         }
         Ok(())
     }
@@ -2057,23 +2118,47 @@ impl Compiler<'_> {
 /// restores it on the way out, whether it returns a value or an error, so
 /// nested and recursive frames (including mixed-mode reentry through host
 /// or AST functions) compose without per-call stack allocations.
-pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<Any, RuntimeError> {
+pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     // the caller's arguments are already on the stack and become the
     // frame's first slots; reserve the rest for body-introduced locals
     debug_assert!(rt.vm.stack.len() >= f.arity());
     let base = rt.vm.stack.len() - f.arity();
     rt.vm.extend_uninit((f.slots - f.arity) as usize);
 
-    let result = run_frame(rt, f, base);
+    let result = run_frame(rt, &f.code.bytes, base, f);
     debug_assert!(rt.vm.stack.len() >= base);
-    rt.vm.stack.truncate(base);
     result
 }
 
-fn run_frame(rt: &mut Runtime, f: &CompiledFn, base: usize) -> Result<Any, RuntimeError> {
-    let mut iters = Vec::new();
+/// Execute a compiled function's code. Parameters are expected to already be
+/// bound in the current (local) scope — [`CompiledFn::into_function`] does
+/// that — so `run` itself is just the instruction loop.
+///
+/// The frame executes on the runtime's shared operand stack
+/// (`rt.vm.stack`): it treats the stack height at entry as its floor and
+/// restores it on the way out, whether it returns a value or an error, so
+/// nested and recursive frames (including mixed-mode reentry through host
+/// or AST functions) compose without per-call stack allocations.
+pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<(), RuntimeError> {
+    // the caller's arguments are already on the stack and become the
+    // frame's first slots; reserve the rest for body-introduced locals
+    debug_assert!(rt.vm.stack.len() >= f.arity());
+    let base = rt.vm.stack.len() - f.arity();
+    rt.vm.extend_uninit((f.slots - f.arity) as usize);
+
+    let result = run_frame(rt, code, base, f);
+    debug_assert!(rt.vm.stack.len() >= base);
+    result
+}
+
+fn run_frame(
+    rt: &mut Runtime,
+    code: &[u8],
+    base: usize,
+    f: &CompiledFn,
+) -> Result<(), RuntimeError> {
+    let mut iters = SmallVec::<[_; 4]>::new();
     let mut pc: usize = 0;
-    let code = &f.code.bytes[..];
 
     loop {
         // `pc` is a byte offset; each opcode decodes its own operands
@@ -2348,13 +2433,11 @@ fn run_frame(rt: &mut Runtime, f: &CompiledFn, base: usize) -> Result<Any, Runti
                 };
                 let kind = if inc { BinOpKind::Add } else { BinOpKind::Sub };
                 let v = match cur {
-                    Any::Number(Number::Integer(x)) => {
-                        Any::Number(Number::Integer(if inc {
-                            x.wrapping_add(1)
-                        } else {
-                            x.wrapping_sub(1)
-                        }))
-                    }
+                    Any::Number(Number::Integer(x)) => Any::Number(Number::Integer(if inc {
+                        x.wrapping_add(1)
+                    } else {
+                        x.wrapping_sub(1)
+                    })),
                     cur => eval_binary(kind, &cur, &Any::Number(Number::Integer(1)))?,
                 };
                 rt.vm.set_slot(base, slot, v);
@@ -2386,14 +2469,21 @@ fn run_frame(rt: &mut Runtime, f: &CompiledFn, base: usize) -> Result<Any, Runti
             opcode::CALL..=opcode::CALL_END => {
                 let n = decode_operand(op - opcode::CALL, code, &mut pc)?;
                 rt.vm.reverse_stack(n as usize + 1);
-                let fval = rt.vm.pop_stack();
-                let ret = rt.apply_value(fval, n as usize)?;
-                rt.vm.stack.push(ret);
+                let fval = rt.vm.peek_stack();
+
+                match fval {
+                    Any::Fn(fval) if core::ptr::eq(&*fval.0, f) && f.arity == n => {
+                        // Calls self.
+                        run_recursive(rt, code, f)?;
+                    }
+                    _ => {
+                        rt.apply_value(n as usize)?;
+                    }
+                }
             }
             opcode::CALL_BARE => {
                 let v = rt.vm.pop_stack();
-                let ret = rt.call_bare(v)?;
-                rt.vm.stack.push(ret);
+                rt.call_bare(v)?;
             }
             opcode::JUMP => {
                 pc = read_u32(code, &mut pc)? as usize;
@@ -2425,7 +2515,14 @@ fn run_frame(rt: &mut Runtime, f: &CompiledFn, base: usize) -> Result<Any, Runti
             opcode::ITER_POP => {
                 iters.pop();
             }
-            opcode::RETURN => return Ok(rt.vm.pop_stack()),
+            opcode::RETURN => {
+                if rt.vm.stack.len() != base + 1 {
+                    let ret = rt.vm.pop_stack();
+                    rt.vm.stack.truncate(base);
+                    rt.vm.push_stack(ret);
+                }
+                return Ok(());
+            }
             _ => return Err(RuntimeError::Other("vm: unknown opcode".to_string())),
         }
     }
@@ -2492,11 +2589,7 @@ mod tests {
         };
         let mut ctx = VmContext::new();
         let compiled = compile_fn(&mut ctx, params.clone(), body).unwrap();
-        let instrs: Vec<Instr> = compiled
-            .code
-            .disassemble()
-            .map(|r| r.unwrap().1)
-            .collect();
+        let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
         assert!(matches!(instrs.last(), Some(Instr::Return)));
         assert_eq!(compiled.arity(), 2);
     }
@@ -2560,7 +2653,7 @@ mod tests {
             Instr::SetIndex,
             Instr::Call(2),
             Instr::CallBare,
-            Instr::Jump(0),      // → byte offset of instruction 0
+            Instr::Jump(0), // → byte offset of instruction 0
             Instr::JumpIfFalse(5),
             Instr::IterInit,
             Instr::IterNext(24), // → one past the last instruction
@@ -2570,8 +2663,7 @@ mod tests {
         // jump operands hold instruction indices going in and byte offsets
         // coming out; map the expectation through the encoded layout
         let code = encode(&instrs);
-        let decoded: Vec<(usize, Instr)> =
-            code.disassemble().map(|r| r.unwrap()).collect();
+        let decoded: Vec<(usize, Instr)> = code.disassemble().map(|r| r.unwrap()).collect();
         assert_eq!(decoded.len(), instrs.len());
 
         let offsets: Vec<u32> = decoded.iter().map(|(at, _)| *at as u32).collect();
