@@ -1,6 +1,6 @@
 use raft_lexer::Span;
 
-use crate::{BinaryOpKind, ExprKind, PatKind, StmtKind, UnaryOpKind, parser::TokenStream};
+use crate::{BinOpKind, ExprKind, PatKind, StmtKind, UnOpKind, parser::TokenStream};
 
 fn tokens_from_str(s: &str) -> TokenStream {
     let tokens = raft_lexer::parse_str(s, &raft_lexer::Options::wss()).unwrap();
@@ -134,42 +134,42 @@ fn literal_dot_not_accessor() {
 fn unary_ops() {
     assert_eq!(
         tokens_from_str("!").parse_unary_op().unwrap().kind(),
-        UnaryOpKind::Not
+        UnOpKind::Not
     );
     assert_eq!(
         tokens_from_str("~").parse_unary_op().unwrap().kind(),
-        UnaryOpKind::BitNot
+        UnOpKind::BitNot
     );
     assert_eq!(
         tokens_from_str("-").parse_unary_op().unwrap().kind(),
-        UnaryOpKind::Neg
+        UnOpKind::Neg
     );
     assert_eq!(
         tokens_from_str("+").parse_unary_op().unwrap().kind(),
-        UnaryOpKind::Pos
+        UnOpKind::Pos
     );
     assert!(tokens_from_str("&").parse_unary_op().is_err());
 }
 
 #[test]
 fn binary_ops() {
-    let cases: &[(&str, BinaryOpKind, usize)] = &[
-        ("&", BinaryOpKind::BitAnd, 1),
-        ("|", BinaryOpKind::BitOr, 1),
-        ("^", BinaryOpKind::BitXor, 1),
-        ("<<", BinaryOpKind::Shl, 2),
-        (">>", BinaryOpKind::Shr, 2),
-        ("**", BinaryOpKind::Pow, 2),
-        ("*", BinaryOpKind::Mul, 1),
-        ("/", BinaryOpKind::Div, 1),
-        ("+", BinaryOpKind::Add, 1),
-        ("-", BinaryOpKind::Sub, 1),
-        ("==", BinaryOpKind::Eq, 2),
-        ("!=", BinaryOpKind::Ne, 2),
-        ("<=", BinaryOpKind::Le, 2),
-        (">=", BinaryOpKind::Ge, 2),
-        ("<", BinaryOpKind::Lt, 1),
-        (">", BinaryOpKind::Gt, 1),
+    let cases: &[(&str, BinOpKind, usize)] = &[
+        ("&", BinOpKind::BitAnd, 1),
+        ("|", BinOpKind::BitOr, 1),
+        ("^", BinOpKind::BitXor, 1),
+        ("<<", BinOpKind::Shl, 2),
+        (">>", BinOpKind::Shr, 2),
+        ("**", BinOpKind::Pow, 2),
+        ("*", BinOpKind::Mul, 1),
+        ("/", BinOpKind::Div, 1),
+        ("+", BinOpKind::Add, 1),
+        ("-", BinOpKind::Sub, 1),
+        ("==", BinOpKind::Eq, 2),
+        ("!=", BinOpKind::Ne, 2),
+        ("<=", BinOpKind::Le, 2),
+        (">=", BinOpKind::Ge, 2),
+        ("<", BinOpKind::Lt, 1),
+        (">", BinOpKind::Gt, 1),
     ];
 
     for &(src, expected_op, expected_len) in cases {
@@ -182,12 +182,12 @@ fn binary_ops() {
 
 #[test]
 fn precedence_ordering() {
-    assert!(BinaryOpKind::BitAnd.precedence() > BinaryOpKind::Pow.precedence());
-    assert!(BinaryOpKind::Pow.precedence() > BinaryOpKind::Mul.precedence());
-    assert!(BinaryOpKind::Mul.precedence() > BinaryOpKind::Add.precedence());
-    assert!(BinaryOpKind::Add.precedence() > BinaryOpKind::Eq.precedence());
-    assert!(BinaryOpKind::Pow.is_right_assoc());
-    assert!(!BinaryOpKind::Mul.is_right_assoc());
+    assert!(BinOpKind::BitAnd.precedence() > BinOpKind::Pow.precedence());
+    assert!(BinOpKind::Pow.precedence() > BinOpKind::Mul.precedence());
+    assert!(BinOpKind::Mul.precedence() > BinOpKind::Add.precedence());
+    assert!(BinOpKind::Add.precedence() > BinOpKind::Eq.precedence());
+    assert!(BinOpKind::Pow.is_right_assoc());
+    assert!(!BinOpKind::Mul.is_right_assoc());
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn pattern_record_shorthand() {
     };
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].key.name(), "foo");
-    assert!(fields[0].pat().is_none());
+    assert!(fields[0].pattern().is_none());
     assert_eq!(fields[1].key.name(), "bar");
 }
 
@@ -244,7 +244,7 @@ fn pattern_record_explicit() {
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].key.name(), "x");
     assert!(
-        matches!(fields[0].pat().unwrap().kind(), PatKind::Ident(i) if i.name() == "foo")
+        matches!(fields[0].pattern().unwrap().kind(), PatKind::Ident(i) if i.name() == "foo")
     );
 }
 
@@ -255,7 +255,7 @@ fn pattern_record_nested() {
         panic!()
     };
     assert!(matches!(
-        fields[0].pat().unwrap().kind(),
+        fields[0].pattern().unwrap().kind(),
         PatKind::List(_)
     ));
 }
@@ -285,7 +285,7 @@ fn expr_unary() {
     let ExprKind::Unary(op, inner) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), UnaryOpKind::Not);
+    assert_eq!(op.kind(), UnOpKind::Not);
     assert!(matches!(inner.kind(), ExprKind::Ident(i) if i.name() == "a"));
     assert_eq!(e.span(), Span::new(0, 2));
 }
@@ -297,11 +297,11 @@ fn expr_unary_chain() {
     let ExprKind::Unary(op, inner) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), UnaryOpKind::Not);
+    assert_eq!(op.kind(), UnOpKind::Not);
     let ExprKind::Unary(op, inner) = inner.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), UnaryOpKind::Not);
+    assert_eq!(op.kind(), UnOpKind::Not);
     assert!(matches!(inner.kind(), ExprKind::Ident(i) if i.name() == "a"));
 }
 
@@ -311,7 +311,7 @@ fn expr_binary_simple() {
     let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Add);
+    assert_eq!(op.kind(), BinOpKind::Add);
     assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
     assert!(matches!(rhs.kind(), ExprKind::Literal(_)));
     assert_eq!(e.span(), Span::new(0, 5));
@@ -324,12 +324,12 @@ fn expr_precedence() {
     let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Add);
+    assert_eq!(op.kind(), BinOpKind::Add);
     assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
     let ExprKind::Binary(_, inner_op, _) = &rhs.kind() else {
         panic!()
     };
-    assert_eq!(inner_op.kind(), BinaryOpKind::Mul);
+    assert_eq!(inner_op.kind(), BinOpKind::Mul);
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn expr_left_assoc() {
     let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Sub);
+    assert_eq!(op.kind(), BinOpKind::Sub);
     assert!(matches!(lhs.kind(), ExprKind::Binary(_, _, _)));
     assert!(matches!(rhs.kind(), ExprKind::Ident(i) if i.name() == "c"));
 }
@@ -351,7 +351,7 @@ fn expr_right_assoc() {
     let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Pow);
+    assert_eq!(op.kind(), BinOpKind::Pow);
     assert!(matches!(lhs.kind(), ExprKind::Literal(_)));
     assert!(matches!(rhs.kind(), ExprKind::Binary(_, _, _)));
 }
@@ -376,7 +376,7 @@ fn expr_apply_unary_arg() {
         panic!()
     };
     assert_eq!(args.len(), 1);
-    assert!(matches!(args[0].kind(), ExprKind::Unary(op, _) if op.kind() == UnaryOpKind::Not));
+    assert!(matches!(args[0].kind(), ExprKind::Unary(op, _) if op.kind() == UnOpKind::Not));
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn expr_apply_then_binary() {
     let ExprKind::Binary(lhs, op, _) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Add);
+    assert_eq!(op.kind(), BinOpKind::Add);
     assert!(matches!(lhs.kind(), ExprKind::Apply(_, _)));
 }
 
@@ -394,7 +394,7 @@ fn expr_apply_then_binary() {
 fn expr_minus_is_binary_not_arg() {
     // f - a = f minus a (NOT application)
     let e = tokens_from_str("f - a").parse_expr().unwrap();
-    assert!(matches!(e.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinaryOpKind::Sub));
+    assert!(matches!(e.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinOpKind::Sub));
 }
 
 #[test]
@@ -483,16 +483,56 @@ fn expr_record() {
 }
 
 #[test]
+fn number_suffix_validated_at_parse_time() {
+    use crate::parser::ParseErrorKind;
+
+    // `i` and `f` are the only valid number suffixes
+    assert!(tokens_from_str("1i").parse_expr().is_ok());
+    assert!(tokens_from_str("1f").parse_expr().is_ok());
+    assert!(tokens_from_str("1.5f").parse_expr().is_ok());
+
+    let err = tokens_from_str("1z").parse_expr().unwrap_err();
+    assert_eq!(err.kind(), ParseErrorKind::InvalidLiteral);
+
+    // in patterns too
+    let err = tokens_from_str("2q").parse_pat().unwrap_err();
+    assert_eq!(err.kind(), ParseErrorKind::InvalidLiteral);
+}
+
+#[test]
+fn underscore_rejected_as_record_key() {
+    // `_` is the wildcard binder, not a field name — in expressions...
+    assert!(tokens_from_str("{ _: 1 }").parse_expr().is_err());
+    assert!(tokens_from_str("{ _ }").parse_expr().is_err());
+    // ...and in patterns
+    assert!(tokens_from_str("{ _: x }").parse_pat().is_err());
+    assert!(tokens_from_str("{ _ }").parse_pat().is_err());
+
+    // nor as a field in dot access — reading or assigning
+    assert!(tokens_from_str("p._").parse_expr().is_err());
+    assert!(tokens_from_str("p._ = 1").parse_stmt().is_err());
+    assert!(tokens_from_str("p._.q").parse_expr().is_err());
+
+    // but `_` is fine as a field *pattern* and as an ordinary ident
+    assert!(tokens_from_str("{ kind: _ }").parse_pat().is_ok());
+    assert!(tokens_from_str("_").parse_pat().is_ok());
+    assert!(tokens_from_str("p.x").parse_expr().is_ok());
+}
+
+#[test]
 fn expr_paren_grouping() {
     // (1 + 2) * 3 — parens override precedence
     let e = tokens_from_str("(1 + 2) * 3").parse_expr().unwrap();
     let ExprKind::Binary(lhs, op, _) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Mul);
+    assert_eq!(op.kind(), BinOpKind::Mul);
     // lhs is the parenthesized addition; span includes parens
     assert_eq!(lhs.span, Span::new(0, 7));
-    assert!(matches!(lhs.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinaryOpKind::Add));
+    let ExprKind::Parenthesized(inner) = lhs.kind() else {
+        panic!()
+    };
+    assert!(matches!(inner.kind(), ExprKind::Binary(_, op, _) if op.kind() == BinOpKind::Add));
 }
 
 #[test]
@@ -505,27 +545,27 @@ fn expr_complex() {
     let ExprKind::Binary(lhs, op, rhs) = e.kind() else {
         panic!()
     };
-    assert_eq!(op.kind(), BinaryOpKind::Gt);
+    assert_eq!(op.kind(), BinOpKind::Gt);
     // lhs = a + ((b * (c**d)) / e)
     let ExprKind::Binary(_, add_op, _) = lhs.kind() else {
         panic!()
     };
-    assert_eq!(add_op.kind(), BinaryOpKind::Add);
+    assert_eq!(add_op.kind(), BinOpKind::Add);
     // rhs = (f*g) - ((h**i)/j)
     let ExprKind::Binary(_, sub_op, _) = &rhs.kind() else {
         panic!()
     };
-    assert_eq!(sub_op.kind(), BinaryOpKind::Sub);
+    assert_eq!(sub_op.kind(), BinOpKind::Sub);
 }
 
 #[test]
 fn stmt_expr_statement() {
-    let stmt = tokens_from_str("foo").parse_stmt().unwrap();
-    match stmt.kind() {
+    let statement = tokens_from_str("foo").parse_stmt().unwrap();
+    match statement.kind() {
         StmtKind::Expr(e) => {
             assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "foo"));
         }
-        _ => panic!("expected expr stmt"),
+        _ => panic!("expected expr statement"),
     }
 }
 
@@ -537,27 +577,27 @@ fn ident_is_keyword() {
 
 #[test]
 fn stmt_return() {
-    let stmt = tokens_from_str("return").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("return").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::Return(e) => {
             assert!(matches!(e, None));
         }
-        _ => panic!("expected return stmt"),
+        _ => panic!("expected return statement"),
     }
 
-    let stmt = tokens_from_str("return 5").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("return 5").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::Return(e) => {
             assert!(matches!(e.as_ref().unwrap().kind(), ExprKind::Literal(l) if l.is_number()));
         }
-        _ => panic!("expected return stmt"),
+        _ => panic!("expected return statement"),
     }
 }
 
 #[test]
 fn stmt_if_inline() {
-    let stmt = tokens_from_str("if x: y").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("if x: y").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::If {
             cond,
             then_branch,
@@ -572,15 +612,15 @@ fn stmt_if_inline() {
                 _ => panic!("expected inline expr as then-branch"),
             }
         }
-        _ => panic!("expected if stmt"),
+        _ => panic!("expected if statement"),
     }
 }
 
 #[test]
 fn stmt_if_block() {
     let src = "if x:\n    y";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::If {
             cond,
             then_branch,
@@ -595,14 +635,14 @@ fn stmt_if_block() {
                 _ => panic!("expected expr in block"),
             }
         }
-        _ => panic!("expected if stmt"),
+        _ => panic!("expected if statement"),
     }
 }
 
 #[test]
 fn stmt_if_inline_else_same_line() {
-    let stmt = tokens_from_str("if x: y else: z").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("if x: y else: z").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::If {
             cond,
             then_branch,
@@ -624,15 +664,15 @@ fn stmt_if_inline_else_same_line() {
                 _ => panic!("expected inline expr as else-branch"),
             }
         }
-        _ => panic!("expected if-else stmt"),
+        _ => panic!("expected if-else statement"),
     }
 }
 
 #[test]
 fn stmt_if_inline_else_next_line() {
     let src = "if x: y\nelse: z";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::If {
             cond,
             then_branch,
@@ -653,15 +693,15 @@ fn stmt_if_inline_else_next_line() {
                 _ => panic!("expected inline expr as else-branch"),
             }
         }
-        _ => panic!("expected if-else stmt"),
+        _ => panic!("expected if-else statement"),
     }
 }
 
 #[test]
 fn stmt_if_block_else_block() {
     let src = "if x:\n    y\nelse:\n    z";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::If {
             cond,
             then_branch,
@@ -683,15 +723,15 @@ fn stmt_if_block_else_block() {
                 _ => panic!("expected expr in else block"),
             }
         }
-        _ => panic!("expected if-else stmt"),
+        _ => panic!("expected if-else statement"),
     }
 }
 
 #[test]
 fn stmt_assign_pattern_ident() {
-    let stmt = tokens_from_str("x = 1").parse_stmt().unwrap();
-    match &stmt.kind() {
-        StmtKind::AssignPattern { target, value } => {
+    let statement = tokens_from_str("x = 1").parse_stmt().unwrap();
+    match &statement.kind() {
+        StmtKind::AssignPat { target, value } => {
             assert!(matches!(target.kind(), PatKind::Ident(id) if id.name() == "x"));
             assert!(matches!(value.kind(), ExprKind::Literal(l) if l.is_number()));
         }
@@ -701,9 +741,9 @@ fn stmt_assign_pattern_ident() {
 
 #[test]
 fn stmt_assign_pattern_list() {
-    let stmt = tokens_from_str("[a, b] = [1, 2]").parse_stmt().unwrap();
-    match &stmt.kind() {
-        StmtKind::AssignPattern { target, value } => {
+    let statement = tokens_from_str("[a, b] = [1, 2]").parse_stmt().unwrap();
+    match &statement.kind() {
+        StmtKind::AssignPat { target, value } => {
             if let PatKind::List(items) = &target.kind() {
                 assert_eq!(items.len(), 2);
                 assert!(matches!(&items[0].kind(), PatKind::Ident(i) if i.name() == "a"));
@@ -723,8 +763,8 @@ fn stmt_assign_pattern_list() {
 
 #[test]
 fn stmt_assign_field() {
-    let stmt = tokens_from_str("obj.x = 5").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("obj.x = 5").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::AssignField {
             target,
             field,
@@ -740,8 +780,8 @@ fn stmt_assign_field() {
 
 #[test]
 fn stmt_assign_index() {
-    let stmt = tokens_from_str("arr[0] = 7").parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str("arr[0] = 7").parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::AssignIndex {
             target,
             index,
@@ -758,8 +798,8 @@ fn stmt_assign_index() {
 #[test]
 fn stmt_while_block_else_block() {
     let src = "while x:\n    y\nelse:\n    z";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::While {
             cond,
             body: loop_branch,
@@ -781,15 +821,15 @@ fn stmt_while_block_else_block() {
                 _ => panic!("expected expr in else branch"),
             }
         }
-        _ => panic!("expected while stmt with else"),
+        _ => panic!("expected while statement with else"),
     }
 }
 
 #[test]
 fn stmt_while_inline_else_next_line() {
     let src = "while x: y\nelse: z";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match &stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match &statement.kind() {
         StmtKind::While {
             cond,
             body: loop_branch,
@@ -811,15 +851,15 @@ fn stmt_while_inline_else_next_line() {
                 _ => panic!("expected inline expr as else branch"),
             }
         }
-        _ => panic!("expected while stmt with else"),
+        _ => panic!("expected while statement with else"),
     }
 }
 
 #[test]
 fn stmt_for_block_else_block() {
     let src = "for a in arr:\n    b\nelse:\n    c";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match statement.kind() {
         StmtKind::For {
             target,
             iterable,
@@ -847,15 +887,15 @@ fn stmt_for_block_else_block() {
                 _ => panic!("expected expr in else branch"),
             }
         }
-        _ => panic!("expected for stmt with else"),
+        _ => panic!("expected for statement with else"),
     }
 }
 
 #[test]
 fn stmt_for_inline_else_next_line() {
     let src = "for a in arr: b\nelse: c";
-    let stmt = tokens_from_str(src).parse_stmt().unwrap();
-    match stmt.kind() {
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    match statement.kind() {
         StmtKind::For {
             target,
             iterable,
@@ -882,6 +922,6 @@ fn stmt_for_inline_else_next_line() {
                 _ => panic!("expected inline expr as else branch"),
             }
         }
-        _ => panic!("expected for stmt with else"),
+        _ => panic!("expected for statement with else"),
     }
 }

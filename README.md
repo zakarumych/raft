@@ -19,7 +19,7 @@ This is a Cargo workspace made up of four crates:
 | ------------------- | ----------- | ---------------------------------------------------------------------------- |
 | `raft-lexer`        | `lexer/`    | `no_std`-friendly tokenizer: idents, atoms, numbers, chars, strings, comments, punctuation and delimiter groups (including indentation-based blocks). |
 | `raft-ast`          | `ast/`      | AST types plus a recursive-descent parser built on top of the token stream. |
-| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST.                          |
+| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. |
 | `raft-repl`         | `repl/`     | Line-by-line REPL wiring the lexer, parser and runtime together.           |
 
 `raft-lexer`, `raft-ast` and `raft-runtime` support an optional `std`
@@ -219,7 +219,7 @@ close over the caller's local variables (see [Roadmap](#roadmap)) — only
 globals are visible inside. See [Function application](#function-application)
 for how currying and partial application work when calling.
 
-### Pattern matching & destructuring
+### Pat matching & destructuring
 
 Assignment targets can be simple identifiers, or patterns that destructure
 lists and records:
@@ -231,6 +231,30 @@ lists and records:
 
 Patterns can also match literal values and atoms, which is used to
 accept/reject values during pattern-matching assignment.
+
+The identifier `_` is a wildcard: it matches anything and binds nothing —
+in parameters, destructuring positions, `for` targets, and as a plain
+assignment target to discard a value. (It is not a valid record key, in
+either expressions or patterns.)
+
+```raft
+fn snd _ b:
+    return b
+
+[_, m, _] = xs      // keep only the middle element
+_ = do_something    // evaluate and discard
+```
+
+Number literals match **exactly** (no tolerance; NaN matches NaN and only
+NaN, `-0.0` matches `0.0`, infinities match by sign), and their suffix
+selects how strictly the numeric *type* is checked, so suffixed literals
+double as type discriminators:
+
+```raft
+1 = n       // matches integer 1 or float 1.0
+1i = n      // matches integer 1 only
+1f = n      // matches float 1.0 only (same for 1.0 and 1e0)
+```
 
 ### No user-defined types
 
@@ -256,31 +280,96 @@ Lists and records are mutable heap objects by default and can be frozen
 
 ### Embedding host functions
 
-Beyond `fn`-defined functions, the host can expose Rust closures to scripts
-by registering them on the `Runtime`. A registered closure receives the
-runtime and the evaluated arguments, and returns the result together with
-how many of the given arguments it actually consumed — the same convention
-`fn`-defined functions use internally to support currying (see
-[Functions](#functions)):
+Every callable — `fn`-defined (AST-walked or bytecode-compiled), partially
+applied, or host-provided — is an `Any::Fn(FnValue)`. An `FnValue` pairs a
+`Function` implementor with an argument-count hint: a full application
+takes at least `min_args` and at most `max_args` (`None` = unbounded)
+arguments; how many a call actually consumes is somewhere in between and
+is reported back by the call itself. The runtime uses the lower bound to
+build partial applications *before* calling, so implementations never see
+an underfull argument list.
+
+The `Function` trait has two call flavors:
+
+- `call(&self, rt, args) -> (Any, usize)` — mandatory; returns the result
+  and how many arguments were consumed (consuming fewer than given makes
+  the runtime re-apply the leftovers to the returned value).
+- `call_once(self, rt, args)` — optional, defaults to `call`. Takes `self`
+  by value: the runtime dispatches here when the value being called holds
+  the last reference to the function, so implementations can move captured
+  state instead of cloning it — e.g. the built-in partial-application
+  wrapper moves its captured arguments.
+
+`call_once`'s by-value `self` makes `Function` deliberately
+non-dyn-compatible; `FnValue` stores implementors through a hidden
+dyn-compatible bridge trait that recovers the by-value call when its
+`Rc` unwraps as unique, and falls back to `call` when shared.
+
+The easiest way to expose a Rust closure is `register_external` (hint
+`(0, None)`: "takes anything, decides itself how much to consume") or
+`register_function` / `Any::function` with a precise hint:
 
 ```rust
 use raft_runtime::{Any, Runtime};
 
 let mut rt = Runtime::new();
+
+// consumes everything it is given
 rt.register_external("print", |_rt, args| {
     for a in args {
         println!("{}", a);
     }
     (Any::nil(), args.len())
 });
+
+// takes exactly two arguments — calls with fewer partially apply
+rt.register_function("hypot2", 2, Some(2), |_rt, args| {
+    // args.len() >= 2 is guaranteed here
+    (Any::nil(), 2)
+});
 ```
 
-Returning a consumed count smaller than `args.len()` lets a host function
-opt into the same partial-application behavior as `fn`-defined functions;
-returning `args.len()` (as above) is the common case of "consume everything
-given".
+Stateful or allocation-sensitive callables can implement `Function`
+directly and be wrapped with `FnValue::new`/`FnValue::exact`.
 
-The bundled REPL (`repl/src/main.rs`) registers `print` and `quit` this way.
+The bundled REPL (`repl/src/main.rs`) registers `print` (hint `(0, None)`)
+and `quit` (hint `(0, Some(0))`) this way.
+
+### Execution modes: AST walking and bytecode
+
+The runtime has two interchangeable execution modes. By default everything
+is interpreted by walking the AST. Alternatively, `fn` definitions can be
+compiled to a stack-based instruction set (`raft_runtime::vm::Instr`) that
+is encoded into a flat byte array: operand widths — and the most common
+operand values, like small slot indices, small integers, `True`/`False`
+and operator kinds — are packed into the opcode byte itself; larger
+integers follow as compact immediates instead of const-pool entries; jump
+targets are fixed 4-byte byte offsets. A small virtual machine executes
+the bytes directly (`vm::Code::disassemble` decodes them back for
+inspection):
+
+```rust
+let mut rt = Runtime::new();
+rt.set_compile_fns(true); // `fn` statements compile to bytecode from here on
+```
+
+The modes mix freely inside one runtime: a compiled function is an ordinary
+`Fn` value with the same calling convention (including currying and partial
+application), so AST-interpreted code can call bytecode functions and vice
+versa, and host functions work from both. Anything the compiler rejects
+falls back to the tree walker transparently.
+
+Compiled functions share a per-runtime `VmContext` (`Runtime::vm`):
+constants, variable names and patterns are interned once across all
+functions, and every compiled frame executes on the context's single
+operand stack instead of allocating its own. That stack is public —
+`rt.vm.stack` — so a host function called from compiled code can inspect
+the caller's live temporaries (mutate them at your own risk).
+
+The REPL compiles functions by default; pass `--no-vm` to stay on the tree
+walker. `cargo bench -p raft-runtime` (or `cargo criterion`, if installed)
+runs Criterion benchmarks comparing the two modes, plus compiler and
+pattern-binding micro-benchmarks (`runtime/benches/vm.rs`).
 
 ## Roadmap
 

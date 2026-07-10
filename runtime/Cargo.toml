@@ -9,3 +9,12 @@ default = ["std"]
 
 [dependencies]
 raft-ast = { path = "../ast", default-features = false }
+smallvec = "1.0"
+
+[dev-dependencies]
+criterion = "0.8.2"
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+
+[[bench]]
+name = "vm"
+harness = false

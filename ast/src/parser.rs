@@ -2,8 +2,8 @@ use alloc::rc::Rc;
 use core::fmt;
 
 use crate::{
-    Atom, BinaryOp, BinaryOpKind, Expr, ExprKind, ExprRecordField, Ident, Literal, Pat, PatKind,
-    PatRecordField, Span, Stmt, StmtKind, UnaryOp, UnaryOpKind,
+    Atom, BinOp, BinOpKind, Expr, ExprKind, ExprRecordField, Ident, Lit, Module, Pat, PatKind,
+    PatRecordField, Span, Stmt, StmtKind, UnOp, UnOpKind,
 };
 
 use raft_lexer::{Spacing, SpannedSource, Token};
@@ -13,6 +13,9 @@ pub enum ParseErrorKind {
     UnexpectedToken,
     UnexpectedEndOfInput,
     InvalidAssignmentTarget,
+    /// A literal the lexer accepted but the language rejects, e.g. a number
+    /// with an unknown suffix (`1z`; only `i` and `f` are valid).
+    InvalidLiteral,
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -21,6 +24,7 @@ impl fmt::Display for ParseErrorKind {
             ParseErrorKind::UnexpectedToken => write!(f, "Unexpected token"),
             ParseErrorKind::UnexpectedEndOfInput => write!(f, "Unexpected end of input"),
             ParseErrorKind::InvalidAssignmentTarget => write!(f, "Invalid assignment target"),
+            ParseErrorKind::InvalidLiteral => write!(f, "Invalid literal"),
         }
     }
 }
@@ -126,16 +130,16 @@ impl TokenStream {
         Atom::parse(self)
     }
 
-    pub fn parse_literal(&mut self) -> ParseResult<Literal> {
-        Literal::parse(self)
+    pub fn parse_literal(&mut self) -> ParseResult<Lit> {
+        Lit::parse(self)
     }
 
-    pub fn parse_unary_op(&mut self) -> ParseResult<UnaryOp> {
-        UnaryOp::parse(self)
+    pub fn parse_unary_op(&mut self) -> ParseResult<UnOp> {
+        UnOp::parse(self)
     }
 
-    pub fn parse_binary_op(&mut self) -> ParseResult<BinaryOp> {
-        BinaryOp::parse(self)
+    pub fn parse_binary_op(&mut self) -> ParseResult<BinOp> {
+        BinOp::parse(self)
     }
 
     pub fn parse_pat(&mut self) -> ParseResult<Pat> {
@@ -148,6 +152,10 @@ impl TokenStream {
 
     pub fn parse_stmt(&mut self) -> ParseResult<Stmt> {
         Stmt::parse(self)
+    }
+
+    pub fn parse_module(&mut self) -> ParseResult<Module> {
+        Module::parse(self)
     }
 
     pub fn start_span(&self) -> Span {
@@ -326,7 +334,31 @@ impl Atom {
     }
 }
 
-impl Literal {
+enum AtomIdent {
+    Atom(Atom),
+    Ident(Ident),
+}
+
+impl AtomIdent {
+    fn from_ident(ident: raft_lexer::Ident) -> Result<Self, ParseError> {
+        let s = ident.repr();
+        let starts_with_uppercase = s.chars().next().map_or(false, |c| c.is_uppercase());
+
+        if starts_with_uppercase {
+            Ok(AtomIdent::Atom(Atom {
+                name: ident.rc_repr(),
+                span: ident.span(),
+            }))
+        } else {
+            Ok(AtomIdent::Ident(Ident {
+                name: ident.rc_repr(),
+                span: ident.span(),
+            }))
+        }
+    }
+}
+
+impl Lit {
     // fn peek(stream: &TokenStream) -> Option<Literal> {
     //     match stream.peek() {
     //         Some(Token::Literal(l)) => {
@@ -341,16 +373,11 @@ impl Literal {
     //     }
     // }
 
-    fn parse(stream: &mut TokenStream) -> ParseResult<Literal> {
+    fn parse(stream: &mut TokenStream) -> ParseResult<Lit> {
         match stream.peek() {
             Some(Token::Literal(l)) => {
                 stream.advance();
-                let lit = l.clone();
-                match lit {
-                    raft_lexer::Literal::Number(n) => Ok(Literal::Number(n)),
-                    raft_lexer::Literal::Char(c) => Ok(Literal::Char(c)),
-                    raft_lexer::Literal::String(s) => Ok(Literal::String(s)),
-                }
+                literal_from_lexer(l.clone())
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
             None => Err(ParseError::new(
@@ -361,21 +388,36 @@ impl Literal {
     }
 }
 
-impl UnaryOp {
-    fn peek(stream: &TokenStream) -> Option<UnaryOp> {
+/// Convert a lexer literal into an AST literal, validating what the lexer
+/// is agnostic about: number suffixes (only `i` and `f` are part of the
+/// language). All literal parsing — expressions, patterns, `Literal::parse`
+/// — funnels through here.
+fn literal_from_lexer(lit: raft_lexer::Lit) -> ParseResult<Lit> {
+    match lit {
+        raft_lexer::Lit::Num(n) => match n.suffix() {
+            None | Some("i" | "f") => Ok(Lit::Num(n)),
+            Some(_) => Err(ParseError::new(ParseErrorKind::InvalidLiteral, n.span())),
+        },
+        raft_lexer::Lit::Char(c) => Ok(Lit::Char(c)),
+        raft_lexer::Lit::Str(s) => Ok(Lit::Str(s)),
+    }
+}
+
+impl UnOp {
+    fn peek(stream: &TokenStream) -> Option<UnOp> {
         match stream.peek() {
             Some(Token::Punct(p)) => {
                 let ch = p.repr();
                 let kind = match ch {
-                    '!' => Some(UnaryOpKind::Not),
-                    '~' => Some(UnaryOpKind::BitNot),
-                    '+' => Some(UnaryOpKind::Pos),
-                    '-' => Some(UnaryOpKind::Neg),
+                    '!' => Some(UnOpKind::Not),
+                    '~' => Some(UnOpKind::BitNot),
+                    '+' => Some(UnOpKind::Pos),
+                    '-' => Some(UnOpKind::Neg),
                     _ => None,
                 };
                 if let Some(k) = kind {
                     let span = p.span();
-                    Some(UnaryOp { kind: k, span })
+                    Some(UnOp { kind: k, span })
                 } else {
                     None
                 }
@@ -384,21 +426,21 @@ impl UnaryOp {
         }
     }
 
-    fn parse(stream: &mut TokenStream) -> ParseResult<UnaryOp> {
+    fn parse(stream: &mut TokenStream) -> ParseResult<UnOp> {
         match stream.peek() {
             Some(Token::Punct(p)) => {
                 let ch = p.repr();
                 let kind = match ch {
-                    '!' => Some(UnaryOpKind::Not),
-                    '~' => Some(UnaryOpKind::BitNot),
-                    '+' => Some(UnaryOpKind::Pos),
-                    '-' => Some(UnaryOpKind::Neg),
+                    '!' => Some(UnOpKind::Not),
+                    '~' => Some(UnOpKind::BitNot),
+                    '+' => Some(UnOpKind::Pos),
+                    '-' => Some(UnOpKind::Neg),
                     _ => None,
                 };
                 if let Some(k) = kind {
                     let span = p.span();
                     stream.advance();
-                    Ok(UnaryOp { kind: k, span })
+                    Ok(UnOp { kind: k, span })
                 } else {
                     Err(ParseError::new(ParseErrorKind::UnexpectedToken, p.span()))
                 }
@@ -412,117 +454,117 @@ impl UnaryOp {
     }
 }
 
-impl BinaryOp {
-    fn peek(stream: &TokenStream) -> Option<BinaryOp> {
+impl BinOp {
+    fn peek(stream: &TokenStream) -> Option<BinOp> {
         match stream.peek() {
             Some(Token::Punct(p1)) => match (p1.repr(), stream.peek1()) {
                 ('<', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '<' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Shl,
+                    return Some(BinOp {
+                        kind: BinOpKind::Shl,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('>', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '>' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Shr,
+                    return Some(BinOp {
+                        kind: BinOpKind::Shr,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('*', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '*' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Pow,
+                    return Some(BinOp {
+                        kind: BinOpKind::Pow,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('=', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Eq,
+                    return Some(BinOp {
+                        kind: BinOpKind::Eq,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('!', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Ne,
+                    return Some(BinOp {
+                        kind: BinOpKind::Ne,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('<', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Le,
+                    return Some(BinOp {
+                        kind: BinOpKind::Le,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('>', Some(Token::Punct(p2)))
                     if p1.spacing() == Spacing::Joint && p2.repr() == '=' =>
                 {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Ge,
+                    return Some(BinOp {
+                        kind: BinOpKind::Ge,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('&', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::BitAnd,
+                    return Some(BinOp {
+                        kind: BinOpKind::BitAnd,
                         span: p1.span(),
                     });
                 }
                 ('|', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::BitOr,
+                    return Some(BinOp {
+                        kind: BinOpKind::BitOr,
                         span: p1.span(),
                     });
                 }
                 ('^', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::BitXor,
+                    return Some(BinOp {
+                        kind: BinOpKind::BitXor,
                         span: p1.span(),
                     });
                 }
                 ('*', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Mul,
+                    return Some(BinOp {
+                        kind: BinOpKind::Mul,
                         span: p1.span(),
                     });
                 }
                 ('/', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Div,
+                    return Some(BinOp {
+                        kind: BinOpKind::Div,
                         span: p1.span(),
                     });
                 }
                 ('+', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Add,
+                    return Some(BinOp {
+                        kind: BinOpKind::Add,
                         span: p1.span(),
                     });
                 }
                 ('-', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Sub,
+                    return Some(BinOp {
+                        kind: BinOpKind::Sub,
                         span: p1.span(),
                     });
                 }
                 ('<', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Lt,
+                    return Some(BinOp {
+                        kind: BinOpKind::Lt,
                         span: p1.span(),
                     });
                 }
                 ('>', _) => {
-                    return Some(BinaryOp {
-                        kind: BinaryOpKind::Gt,
+                    return Some(BinOp {
+                        kind: BinOpKind::Gt,
                         span: p1.span(),
                     });
                 }
@@ -532,125 +574,125 @@ impl BinaryOp {
         }
     }
 
-    fn parse(stream: &mut TokenStream) -> ParseResult<BinaryOp> {
+    fn parse(stream: &mut TokenStream) -> ParseResult<BinOp> {
         match stream.peek() {
             Some(Token::Punct(p1)) => match (p1.repr(), stream.peek1()) {
                 ('<', Some(Token::Punct(p2))) if p2.repr() == '<' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Shl,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Shl,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('>', Some(Token::Punct(p2))) if p2.repr() == '>' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Shr,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Shr,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('*', Some(Token::Punct(p2))) if p2.repr() == '*' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Pow,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Pow,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('=', Some(Token::Punct(p2))) if p2.repr() == '=' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Eq,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Eq,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('!', Some(Token::Punct(p2))) if p2.repr() == '=' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Ne,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Ne,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('<', Some(Token::Punct(p2))) if p2.repr() == '=' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Le,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Le,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('>', Some(Token::Punct(p2))) if p2.repr() == '=' => {
                     stream.advance();
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Ge,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Ge,
                         span: p1.span().join(p2.span()),
                     });
                 }
                 ('&', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::BitAnd,
+                    return Ok(BinOp {
+                        kind: BinOpKind::BitAnd,
                         span: p1.span(),
                     });
                 }
                 ('|', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::BitOr,
+                    return Ok(BinOp {
+                        kind: BinOpKind::BitOr,
                         span: p1.span(),
                     });
                 }
                 ('^', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::BitXor,
+                    return Ok(BinOp {
+                        kind: BinOpKind::BitXor,
                         span: p1.span(),
                     });
                 }
                 ('*', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Mul,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Mul,
                         span: p1.span(),
                     });
                 }
                 ('/', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Div,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Div,
                         span: p1.span(),
                     });
                 }
                 ('+', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Add,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Add,
                         span: p1.span(),
                     });
                 }
                 ('-', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Sub,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Sub,
                         span: p1.span(),
                     });
                 }
                 ('<', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Lt,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Lt,
                         span: p1.span(),
                     });
                 }
                 ('>', _) => {
                     stream.advance();
-                    return Ok(BinaryOp {
-                        kind: BinaryOpKind::Gt,
+                    return Ok(BinOp {
+                        kind: BinOpKind::Gt,
                         span: p1.span(),
                     });
                 }
@@ -675,7 +717,7 @@ impl Expr {
     fn parse_binary(stream: &mut TokenStream, min_prec: u8) -> ParseResult<Self> {
         let mut lhs = Self::parse_application(stream)?;
         loop {
-            match BinaryOp::peek(stream) {
+            match BinOp::peek(stream) {
                 Some(op) => {
                     if op.kind.precedence() > min_prec {
                         for _ in 0..op.kind.token_size() {
@@ -713,10 +755,10 @@ impl Expr {
         loop {
             match stream.peek() {
                 Some(Token::Punct(_)) => {
-                    if BinaryOp::peek(stream).is_some() {
+                    if BinOp::peek(stream).is_some() {
                         break;
                     }
-                    if UnaryOp::peek(stream).is_none() {
+                    if UnOp::peek(stream).is_none() {
                         break;
                     }
                 }
@@ -758,7 +800,7 @@ impl Expr {
     }
 
     fn parse_unary(stream: &mut TokenStream) -> ParseResult<Self> {
-        if let Ok(op) = UnaryOp::parse(stream) {
+        if let Ok(op) = UnOp::parse(stream) {
             let operand = Self::parse_unary(stream)?;
             let span = op.span().join(operand.span());
             Ok(Expr {
@@ -778,6 +820,13 @@ impl Expr {
                     stream.advance();
 
                     let field = Ident::parse(stream)?;
+                    if field.name() == "_" {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            field.span(),
+                        ));
+                    }
+
                     let span = expr.span().join(field.span());
                     expr = Expr {
                         kind: ExprKind::Field(Rc::new(expr), field),
@@ -824,7 +873,10 @@ impl Expr {
                         kind: ExprKind::Parenthesized(kind),
                         span: g.span(),
                     },
-                    _ => Expr { span: g.span(), kind: ExprKind::Parenthesized(Rc::new(expr)) }
+                    _ => Expr {
+                        span: g.span(),
+                        kind: ExprKind::Parenthesized(Rc::new(expr)),
+                    },
                 })
             }
             Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {
@@ -866,6 +918,13 @@ impl Expr {
                 let mut fields = Vec::new();
                 while group_stream.peek().is_some() {
                     let key = Ident::parse(&mut group_stream)?;
+                    if key.name() == "_" {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            key.span(),
+                        ));
+                    }
+
                     group_stream.skip_comments_and_newlines();
 
                     match group_stream.peek() {
@@ -940,11 +999,7 @@ impl Expr {
                 let lit = l.clone();
                 let span = lit.span();
                 Ok(Expr {
-                    kind: ExprKind::Literal(match lit {
-                        raft_lexer::Literal::Number(n) => Literal::Number(n),
-                        raft_lexer::Literal::Char(c) => Literal::Char(c),
-                        raft_lexer::Literal::String(s) => Literal::String(s),
-                    }),
+                    kind: ExprKind::Literal(literal_from_lexer(lit)?),
                     span,
                 })
             }
@@ -952,27 +1007,16 @@ impl Expr {
                 stream.advance();
 
                 let span = i.span();
-                match i.repr().chars().next().unwrap() {
-                    ch if ch.is_uppercase() => {
-                        let a = Atom {
-                            name: i.rc_repr(),
-                            span,
-                        };
-                        Ok(Expr {
-                            kind: ExprKind::Atom(a),
-                            span,
-                        })
-                    }
-                    _ch => {
-                        let id = Ident {
-                            name: i.rc_repr(),
-                            span,
-                        };
-                        Ok(Expr {
-                            kind: ExprKind::Ident(id),
-                            span,
-                        })
-                    }
+                match AtomIdent::from_ident(i) {
+                    Ok(AtomIdent::Atom(a)) => Ok(Expr {
+                        kind: ExprKind::Atom(a),
+                        span,
+                    }),
+                    Ok(AtomIdent::Ident(id)) => Ok(Expr {
+                        kind: ExprKind::Ident(id),
+                        span,
+                    }),
+                    Err(e) => Err(e),
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
@@ -1016,10 +1060,10 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
             let mut pats = Vec::new();
             for f in fields.iter() {
                 if let Some(value) = &f.value {
-                    if let Some(pat) = expr_to_pattern(value) {
+                    if let Some(pattern) = expr_to_pattern(value) {
                         pats.push(PatRecordField {
                             key: f.key.clone(),
-                            pat: Some(pat),
+                            pattern: Some(pattern),
                             span: f.span,
                         });
                     } else {
@@ -1028,7 +1072,7 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
                 } else {
                     pats.push(PatRecordField {
                         key: f.key.clone(),
-                        pat: None,
+                        pattern: None,
                         span: f.span,
                     });
                 }
@@ -1054,13 +1098,13 @@ impl Pat {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
                 group_stream.skip_comments_and_newlines();
 
-                let mut pat = Pat::parse(&mut group_stream)?;
+                let mut pattern = Pat::parse(&mut group_stream)?;
                 group_stream.skip_comments_and_newlines();
                 group_stream.expect_end()?;
 
-                pat.span = g.span();
+                pattern.span = g.span();
                 stream.advance();
-                Ok(pat)
+                Ok(pattern)
             }
             Some(Token::Group(g)) if g.delimiter() == raft_lexer::Delimiter::Bracket => {
                 let mut group_stream = TokenStream::new(g.rc_tokens());
@@ -1100,18 +1144,25 @@ impl Pat {
                 let mut fields = Vec::new();
                 while group_stream.peek().is_some() {
                     let key = Ident::parse(&mut group_stream)?;
+                    if key.name() == "_" {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            key.span(),
+                        ));
+                    }
+
                     group_stream.skip_comments_and_newlines();
 
                     match group_stream.peek() {
                         Some(Token::Punct(p)) if p.repr() == ':' => {
                             group_stream.advance();
                             group_stream.skip_comments_and_newlines();
-                            let pat = Pat::parse(&mut group_stream)?;
+                            let pattern = Pat::parse(&mut group_stream)?;
                             group_stream.skip_comments_and_newlines();
-                            let field_span = key.span.join(pat.span);
+                            let field_span = key.span.join(pattern.span);
                             fields.push(PatRecordField {
                                 key,
-                                pat: Some(pat),
+                                pattern: Some(pattern),
                                 span: field_span,
                             });
                             match group_stream.peek() {
@@ -1136,7 +1187,7 @@ impl Pat {
                             let key_span = key.span;
                             fields.push(PatRecordField {
                                 key: key.clone(),
-                                pat: None,
+                                pattern: None,
                                 span: key_span,
                             });
                             continue;
@@ -1151,7 +1202,7 @@ impl Pat {
                             let key_span = key.span;
                             fields.push(PatRecordField {
                                 key: key.clone(),
-                                pat: None,
+                                pattern: None,
                                 span: key_span,
                             });
                             break;
@@ -1169,38 +1220,23 @@ impl Pat {
                 stream.advance();
                 Ok(Pat {
                     span: lit.span(),
-                    kind: PatKind::Literal(match lit {
-                        raft_lexer::Literal::Number(n) => Literal::Number(n),
-                        raft_lexer::Literal::Char(c) => Literal::Char(c),
-                        raft_lexer::Literal::String(s) => Literal::String(s),
-                    }),
+                    kind: PatKind::Literal(literal_from_lexer(lit)?),
                 })
             }
             Some(Token::Ident(i)) => {
                 stream.advance();
 
                 let span = i.span();
-                match i.repr().chars().next().unwrap() {
-                    ch if ch.is_uppercase() => {
-                        let a = Atom {
-                            name: i.rc_repr(),
-                            span,
-                        };
-                        Ok(Pat {
-                            kind: PatKind::Atom(a),
-                            span,
-                        })
-                    }
-                    _ch => {
-                        let id = Ident {
-                            name: i.rc_repr(),
-                            span,
-                        };
-                        Ok(Pat {
-                            kind: PatKind::Ident(id),
-                            span,
-                        })
-                    }
+                match AtomIdent::from_ident(i) {
+                    Ok(AtomIdent::Atom(a)) => Ok(Pat {
+                        kind: PatKind::Atom(a),
+                        span,
+                    }),
+                    Ok(AtomIdent::Ident(id)) => Ok(Pat {
+                        kind: PatKind::Ident(id),
+                        span,
+                    }),
+                    Err(e) => Err(e),
                 }
             }
             Some(tok) => Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
@@ -1243,11 +1279,11 @@ impl Stmt {
                         });
                     }
                     _ => {
-                        if let Some(pat) = expr_to_pattern(&lhs) {
+                        if let Some(pattern) = expr_to_pattern(&lhs) {
                             return Ok(Stmt {
-                                span: pat.span.join(rhs.span),
-                                kind: StmtKind::AssignPattern {
-                                    target: pat,
+                                span: pattern.span.join(rhs.span),
+                                kind: StmtKind::AssignPat {
+                                    target: pattern,
                                     value: rhs,
                                 },
                             });
@@ -1370,8 +1406,8 @@ impl Stmt {
         let mut stmts = Vec::new();
         stream.skip_comments_and_newlines();
         while !stream.is_empty() {
-            let stmt = Self::parse(stream)?;
-            stmts.push(stmt);
+            let statement = Self::parse(stream)?;
+            stmts.push(statement);
             stream.skip_comments_and_newlines();
         }
         Ok(stmts)
@@ -1403,15 +1439,12 @@ impl Stmt {
                             ));
                         }
                         None => {
-                            return Err(ParseError::new(
-                                ParseErrorKind::UnexpectedEndOfInput,
-                                stream.end_span(),
-                            ));
+                            return Ok(Vec::new());
                         }
                     }
                 } else {
-                    let stmt = Stmt::parse_line(stream)?;
-                    return Ok(vec![stmt]);
+                    let statement = Stmt::parse_line(stream)?;
+                    return Ok(vec![statement]);
                 }
             }
             Some(tok) => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, tok.span())),
@@ -1485,7 +1518,6 @@ impl Stmt {
     }
 
     pub fn parse_for(stream: &mut TokenStream, for_span: Span) -> ParseResult<Self> {
-        stream.advance();
         let target = Pat::parse(stream)?;
 
         match Keyword::peek(stream) {
@@ -1540,8 +1572,8 @@ impl Stmt {
                     break;
                 }
                 _ => {
-                    let pat = Pat::parse(stream)?;
-                    params.push(pat);
+                    let pattern = Pat::parse(stream)?;
+                    params.push(pattern);
                 }
             }
         }
@@ -1560,3 +1592,19 @@ impl Stmt {
         })
     }
 }
+
+impl Module {
+    pub fn parse(stream: &mut TokenStream) -> ParseResult<Self> {
+        let mut stmts = Vec::new();
+        stream.skip_comments_and_newlines();
+        while !stream.is_empty() {
+            let statement = Stmt::parse(stream)?;
+            stmts.push(statement);
+            stream.skip_comments_and_newlines();
+        }
+        Ok(Self {
+            stmts: Rc::from(stmts),
+        })
+    }
+}
+

@@ -9,20 +9,25 @@ fn main() {
 
     let mut rt = raft_runtime::Runtime::new();
 
+    // `fn` statements compile to bytecode unless --no-vm is given;
+    // top-level statements are always interpreted from the AST.
+    rt.set_compile_fns(!std::env::args().any(|arg| arg == "--no-vm"));
+
     let quit_flag = Rc::new(std::cell::Cell::new(false));
 
-    rt.set_var("print", Any::Fn(Rc::new(|_rt, args| {
-        for arg in args {
+    // print takes any number of arguments, quit takes exactly none
+    rt.set_var("print", Any::host_function(0, None, |rt, args| {
+        for arg in rt.vm.drain_off_stack(args).rev() {
             println!("{}", arg);
         }
-        (Any::nil(), args.len())
-    })));
+        Any::nil()
+    }));
 
     let quit_flag_clone = quit_flag.clone();
-    rt.set_var("quit", Any::Fn(Rc::new(move |_rt, _args| {
+    rt.set_var("quit", Any::host_function(0, Some(0), move |_rt, _args| {
         quit_flag_clone.set(true);
-        (Any::nil(), 0)
-    })));
+        Any::nil()
+    }));
 
     let mut lines = String::new();
 
@@ -39,15 +44,21 @@ fn main() {
             break;
         }
 
-        match raft_ast::lexer::parse_str(&lines, &raft_ast::lexer::Options::wss_repl()) {
+        // Remove one last occurrence of '\n', '\r' or '\r\n' from the end of the string
+        let stripped = lines.strip_suffix("\r\n")
+            .or_else(|| lines.strip_suffix('\n'))
+            .or_else(|| lines.strip_suffix('\r'))
+            .unwrap_or(&lines[..]);
+
+        match raft_ast::lexer::parse_str(stripped, &raft_ast::lexer::Options::wss_repl()) {
             Ok(tokens) => {
                 let mut stream = raft_ast::parser::TokenStream::new(tokens);
                 match raft_ast::Stmt::parse_many(&mut stream) {
                     Ok(stmts) => {
                         lines.clear();
 
-                        for stmt in &stmts {
-                            match rt.exec_stmt(&stmt) {
+                        for statement in &stmts {
+                            match rt.exec_stmt(&statement) {
                                 Ok(Exec::Value(value)) => {
                                     if value != Any::nil() {
                                         println!("{}", value);

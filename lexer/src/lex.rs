@@ -331,7 +331,7 @@ impl Radix {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LiteralNumber {
+pub struct LitNum {
     repr: Rc<str>,
     span: Span,
     radix: Radix,
@@ -340,7 +340,7 @@ pub struct LiteralNumber {
     suffix_start: Option<usize>,
 }
 
-impl LiteralNumber {
+impl LitNum {
     pub fn new(
         repr: Rc<str>,
         span: Span,
@@ -349,7 +349,7 @@ impl LiteralNumber {
         exp_pos: Option<usize>,
         suffix_start: Option<usize>,
     ) -> Self {
-        LiteralNumber {
+        LitNum {
             repr,
             span,
             radix,
@@ -506,14 +506,14 @@ impl LiteralNumber {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LiteralChar {
+pub struct LitChar {
     repr: Rc<str>,
     span: Span,
 }
 
-impl LiteralChar {
+impl LitChar {
     pub fn new(repr: Rc<str>, span: Span) -> Self {
-        LiteralChar { repr, span }
+        LitChar { repr, span }
     }
 
     pub fn repr(&self) -> &str {
@@ -573,14 +573,14 @@ impl LiteralChar {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LiteralString {
+pub struct LitStr {
     repr: Rc<str>,
     span: Span,
 }
 
-impl LiteralString {
+impl LitStr {
     pub fn new(repr: Rc<str>, span: Span) -> Self {
-        LiteralString { repr, span }
+        LitStr { repr, span }
     }
 
     pub fn repr(&self) -> &str {
@@ -643,13 +643,13 @@ impl LiteralString {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Literal {
-    Number(LiteralNumber),
-    Char(LiteralChar),
-    String(LiteralString),
+pub enum Lit {
+    Num(LitNum),
+    Char(LitChar),
+    Str(LitStr),
 }
 
-impl Literal {
+impl Lit {
     pub fn new_number(
         repr: Rc<str>,
         span: Span,
@@ -658,7 +658,7 @@ impl Literal {
         exp_pos: Option<usize>,
         suffix_start: Option<usize>,
     ) -> Self {
-        Literal::Number(LiteralNumber {
+        Lit::Num(LitNum {
             repr,
             span,
             radix,
@@ -669,58 +669,58 @@ impl Literal {
     }
 
     pub fn new_char(repr: Rc<str>, span: Span) -> Self {
-        Literal::Char(LiteralChar { repr, span })
+        Lit::Char(LitChar { repr, span })
     }
 
     pub fn new_string(repr: Rc<str>, span: Span) -> Self {
-        Literal::String(LiteralString { repr, span })
+        Lit::Str(LitStr { repr, span })
     }
 
     pub fn span(&self) -> Span {
         match self {
-            Literal::Number(n) => n.span(),
-            Literal::Char(c) => c.span(),
-            Literal::String(s) => s.span(),
+            Lit::Num(n) => n.span(),
+            Lit::Char(c) => c.span(),
+            Lit::Str(s) => s.span(),
         }
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            Literal::Number(n) => n.repr(),
-            Literal::Char(c) => c.repr(),
-            Literal::String(s) => s.repr(),
+            Lit::Num(n) => n.repr(),
+            Lit::Char(c) => c.repr(),
+            Lit::Str(s) => s.repr(),
         }
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self, Literal::Number(_))
+        matches!(self, Lit::Num(_))
     }
 
-    pub fn as_number(&self) -> Option<LiteralNumber> {
+    pub fn as_number(&self) -> Option<LitNum> {
         match self {
-            Literal::Number(n) => Some(n.clone()),
+            Lit::Num(n) => Some(n.clone()),
             _ => None,
         }
     }
 
     pub fn is_char(&self) -> bool {
-        matches!(self, Literal::Char(_))
+        matches!(self, Lit::Char(_))
     }
 
-    pub fn as_char(&self) -> Option<LiteralChar> {
+    pub fn as_char(&self) -> Option<LitChar> {
         match self {
-            Literal::Char(c) => Some(c.clone()),
+            Lit::Char(c) => Some(c.clone()),
             _ => None,
         }
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self, Literal::String(_))
+        matches!(self, Lit::Str(_))
     }
 
-    pub fn as_string(&self) -> Option<LiteralString> {
+    pub fn as_string(&self) -> Option<LitStr> {
         match self {
-            Literal::String(s) => Some(s.clone()),
+            Lit::Str(s) => Some(s.clone()),
             _ => None,
         }
     }
@@ -904,7 +904,7 @@ impl Literal {
                 let literal = Rc::from(literal_str);
                 let end_pos = stream.pos();
 
-                Ok(Literal::new_number(
+                Ok(Lit::new_number(
                     literal,
                     Span::new(start_pos, end_pos),
                     radix,
@@ -936,7 +936,7 @@ impl Literal {
 
                             let end_pos = stream.pos();
 
-                            return Ok(Literal::new_string(literal, Span::new(start_pos, end_pos)));
+                            return Ok(Lit::new_string(literal, Span::new(start_pos, end_pos)));
                         }
                         '\\' => {
                             let start = pos;
@@ -1001,7 +1001,7 @@ impl Literal {
 
                         let end_pos = stream.pos();
 
-                        Ok(Literal::new_char(literal, Span::new(start_pos, end_pos)))
+                        Ok(Lit::new_char(literal, Span::new(start_pos, end_pos)))
                     }
                     Some((pos, ch)) => Err(LexError {
                         span: Span::new(start_pos, start_pos + pos + ch.len_utf8()),
@@ -1116,21 +1116,6 @@ impl Group {
 
             if options.ignore_blank_lines {
                 stream.skip_blank_lines();
-            }
-
-            if stream.is_empty() {
-                if open_delim == Delimiter::Block && options.block_end_on_eof {
-                    return Ok(Group::new(
-                        open_delim,
-                        tokens,
-                        Span::new(start_pos, stream.pos()),
-                    ));
-                } else {
-                    return Err(LexError {
-                        span: Span::new(start_pos, stream.pos()),
-                        kind: LexErrorKind::UnexpectedEndOfInput,
-                    });
-                }
             }
 
             if options.group_blocks && stream.is_linestart() {
@@ -1388,7 +1373,7 @@ impl Newline {
 pub enum Token {
     Punct(Punct),
     Ident(Ident),
-    Literal(Literal),
+    Literal(Lit),
     Group(Group),
     Comment(Comment),
     Newline(Newline),
@@ -1445,8 +1430,8 @@ fn next_token(stream: &mut Stream, options: &Options) -> Result<Token, LexError>
             return Ok(Token::Ident(ident));
         }
 
-        if Literal::is_literal(stream) {
-            let literal = Literal::parse(stream)?;
+        if Lit::is_literal(stream) {
+            let literal = Lit::parse(stream)?;
             stream.skip_whitespace();
             return Ok(Token::Literal(literal));
         }
