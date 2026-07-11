@@ -9,7 +9,9 @@ default = ["std"]
 
 [dependencies]
 raft-ast = { path = "../ast", default-features = false }
-smallvec = "1.0"
+smallvec = { version = "1.0", default-features = false }
+hashbrown = { version = "0.12", default-features = false }
+foldhash = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"

@@ -36,22 +36,24 @@
 
 use alloc::{
     boxed::Box,
-    collections::BTreeMap,
     rc::Rc,
     string::{String, ToString},
     vec::Vec,
 };
 use core::fmt;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
 
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
 
 use crate::{
-    Any, Atom, DynFunction, FnValue, Number, ObjectKind, Runtime, RuntimeError,
-    assign_field, assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey,
-    literal_value,
+    Atom, ConstId, Context, DynFn, FnVal, Frame, Number, ObjectKind, PatId, Runtime, RuntimeError,
+    SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary,
+    field_of, index_of, is_falsey, literal_value,
 };
+
+type HashSet<T> = hashbrown::HashSet<T, foldhash::fast::RandomState>;
+type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
+type FixedHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;
 
 /// One virtual-machine instruction.
 ///
@@ -64,8 +66,65 @@ use crate::{
 /// Stack effects below are written `before → after`, top of stack rightmost.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Instr {
+    /// `→ v` — push a copy of frame slot `slot`.
+    /// If unassigned, loads from outer scope using slot's name index stored in function object.
+    LoadSlot(SlotId),
+    /// `v →` — pop and store into frame slot `slot` (assignments inside a
+    /// function always target locals).
+    StoreSlot(SlotId),
+    /// `→ v` — push parent's slot `slot` of the executing function's module.
+    /// Falls back to the global scope using the slot's name index stored in the module object.
+    LoadParent(SlotId),
+    /// `→` — add/subtract 1 to frame slot `slot` in place (no stack
+    /// traffic). Falls back to the global `names[name]` when the slot is
+    /// still unassigned, exactly like `LoadLocal`.
+    IncSlot(SlotId),
+    DecSlot(SlotId),
+    /// `v1 .. vn → list` — pop `n` values, push a new list of them.
+    MakeList(u32),
+    /// `k1 v1 .. kn vn → record` — pop `n` key/value pairs (keys are
+    /// string constants pushed by the compiler), push a new record.
+    MakeRecord(u32),
+    /// `f a1 .. an → ret` — apply `f` to `n` arguments with the language's
+    /// currying rules: a callee consuming fewer than `n` arguments has the
+    /// leftovers re-applied to its result.
+    Call(u32),
     /// `→ const` — push `consts[i]`.
-    Const(u32),
+    Const(ConstId),
+    /// `→ v` — push global variable `names[i]`; error if unbound. Used for
+    /// names never assigned in the function — they can only be globals.
+    LoadGlobal(StringId),
+    /// `v →` — pop and bind against pattern `pats[i]`, which may bind
+    /// several frame slots (destructuring) or fail the match with an error.
+    Bind(PatId),
+    /// `obj → obj.names[i]` — read a record field.
+    GetField(StringId),
+    /// `obj v →` — write record field `names[i]`.
+    SetField(StringId),
+    /// `a → op(a)` — apply a unary operator.
+    Unary(UnOpKind),
+    /// `a b → a op b` — apply a binary operator.
+    Binary(BinOpKind),
+    /// `v →` — pop and discard.
+    Pop,
+    /// `obj idx → obj[idx]` — read a list element.
+    GetIndex,
+    /// `obj idx v →` — write a list element.
+    SetIndex,
+    /// `iterable →` — pop, open an iterator over it and push it on the
+    /// iterator stack.
+    IterInit,
+    /// `→` — close the innermost iterator (used by `break` in a `for`).
+    IterPop,
+    /// `v →` — pop the return value and leave the function.
+    Return,
+    /// `→` — unconditional jump to code index `t`.
+    Jump(u32),
+    /// `c →` — pop; jump to `t` if the value is falsey.
+    JumpIfFalse(u32),
+    /// `→ item` *or* jump — advance the innermost iterator: push the next
+    /// item, or (when exhausted) close the iterator and jump to `t`.
+    IterNext(u32),
     /// `→ Nil` — push the `Nil` atom.
     Nil,
     /// `→ True` — push the `True` atom.
@@ -77,84 +136,11 @@ pub enum Instr {
     /// signed or unsigned payload that holds it (`INT_8`..`INT_64`,
     /// `UINT_8`..`UINT_32`). Integers never touch the const pool.
     Int(i64),
-    /// `v →` — pop and discard (an expression statement whose value is
-    /// not the function's result).
-    Pop,
-    /// `→ v` — push a copy of frame slot `slot`. Only emitted for names
-    /// the compiler proved always-initialized (parameters and names bound
-    /// by the parameter-destructuring prologue).
-    LoadSlot(u32),
-    /// `→ v` — push a copy of frame slot `slot`; if the slot is still
-    /// unassigned, fall back to reading global `names[name]` (a body-local
-    /// name may be read before its first assignment, which reaches the
-    /// global of the same name).
-    LoadLocal {
-        slot: u32,
-        name: u32,
-    },
-    /// `→ v` — push global variable `names[i]`; error if unbound. Used for
-    /// names never assigned in the function — they can only be globals.
-    LoadGlobal(u32),
-    /// `v →` — pop and store into frame slot `slot` (assignments inside a
-    /// function always target locals).
-    StoreLocal(u32),
-    /// `v →` — pop and bind against pattern `pats[i]`, which may bind
-    /// several frame slots (destructuring) or fail the match with an error.
-    Bind(u32),
-    /// `v1 .. vn → list` — pop `n` values, push a new list of them.
-    MakeList(u32),
-    /// `k1 v1 .. kn vn → record` — pop `n` key/value pairs (keys are
-    /// string constants pushed by the compiler), push a new record.
-    MakeRecord(u32),
-    /// `a → op(a)` — apply a unary operator.
-    Unary(UnOpKind),
-    /// `a b → a op b` — apply a binary operator.
-    Binary(BinOpKind),
     /// `a → a op n` — apply a binary operator whose right operand is an
     /// integer carried by the opcode. `Add`/`Sub` take values from
     /// [`SMALL_INTS`], `BitAnd`/`BitOr`/`BitXor` from [`TINY_MASKS`], and
     /// the six comparisons from [`TINY_INTS`].
     BinaryInt(BinOpKind, i16),
-    /// `→` — add/subtract 1 to frame slot `slot` in place (no stack
-    /// traffic). Falls back to the global `names[name]` when the slot is
-    /// still unassigned, exactly like `LoadLocal`.
-    IncSlot {
-        slot: u32,
-        name: u32,
-    },
-    DecSlot {
-        slot: u32,
-        name: u32,
-    },
-    /// `obj → obj.names[i]` — read a record field.
-    GetField(u32),
-    /// `obj idx → obj[idx]` — read a list element.
-    GetIndex,
-    /// `obj v →` — write record field `names[i]`.
-    SetField(u32),
-    /// `obj idx v →` — write a list element.
-    SetIndex,
-    /// `f a1 .. an → ret` — apply `f` to `n` arguments with the language's
-    /// currying rules: a callee consuming fewer than `n` arguments has the
-    /// leftovers re-applied to its result.
-    Call(u32),
-    /// `v → ret` — a value in call position with no arguments: if `v` is a
-    /// zero-argument function it is invoked, otherwise it passes through.
-    CallBare,
-    /// `→` — unconditional jump to code index `t`.
-    Jump(u32),
-    /// `c →` — pop; jump to `t` if the value is falsey.
-    JumpIfFalse(u32),
-    /// `iterable →` — pop, open an iterator over it and push it on the
-    /// iterator stack.
-    IterInit,
-    /// `→ item` *or* jump — advance the innermost iterator: push the next
-    /// item, or (when exhausted) close the iterator and jump to `t`.
-    IterNext(u32),
-    /// `→` — close the innermost iterator (used by `break` in a `for`).
-    IterPop,
-    /// `v →` — pop the return value and leave the function.
-    Return,
 }
 
 /// One byte per instruction, with the operand width — or the operand
@@ -171,118 +157,108 @@ pub enum Instr {
 mod opcode {
     /// Frame-local operands (slots) and counts are small by nature, so
     /// these blocks spend 11 opcodes each: `base+0..=base+7` carry the
-    /// operand inline, `base+8/9/10` take a u8/u16/u32 payload.
+    /// operand inline, `base+8/9` take a u8/u16 payload.
     pub const LOAD_SLOT: u8 = 0;
     pub const LOAD_SLOT_END: u8 = LOAD_SLOT + 10;
-    pub const STORE_LOCAL: u8 = 11;
-    pub const STORE_LOCAL_END: u8 = STORE_LOCAL + 10;
-    pub const MAKE_LIST: u8 = 22;
+    pub const STORE_SLOT: u8 = LOAD_SLOT_END;
+    pub const STORE_SLOT_END: u8 = STORE_SLOT + 10;
+    pub const LOAD_PARENT: u8 = STORE_SLOT_END;
+    pub const LOAD_PARENT_END: u8 = LOAD_PARENT + 10;
+    pub const INC_SLOT: u8 = LOAD_PARENT_END;
+    pub const INC_SLOT_END: u8 = INC_SLOT + 10;
+    pub const DEC_SLOT: u8 = INC_SLOT_END;
+    pub const DEC_SLOT_END: u8 = DEC_SLOT + 10;
+    pub const MAKE_LIST: u8 = DEC_SLOT_END;
     pub const MAKE_LIST_END: u8 = MAKE_LIST + 10;
-    pub const MAKE_RECORD: u8 = 33;
+    pub const MAKE_RECORD: u8 = MAKE_LIST_END;
     pub const MAKE_RECORD_END: u8 = MAKE_RECORD + 10;
-    pub const CALL: u8 = 44;
+    pub const CALL: u8 = MAKE_RECORD_END;
     pub const CALL_END: u8 = CALL + 10;
 
     /// Operands indexing the shared `VmContext` pools grow with the whole
     /// program, so inline values would be wasted opcodes — these blocks
     /// only encode the operand's byte width: `base+0/1/2` = u8/u16/u32.
-    pub const CONST: u8 = 55;
-    pub const CONST_END: u8 = CONST + 2;
-    pub const LOAD_GLOBAL: u8 = 58;
-    pub const LOAD_GLOBAL_END: u8 = LOAD_GLOBAL + 2;
-    pub const BIND: u8 = 61;
-    pub const BIND_END: u8 = BIND + 2;
-    pub const GET_FIELD: u8 = 64;
-    pub const GET_FIELD_END: u8 = GET_FIELD + 2;
-    pub const SET_FIELD: u8 = 67;
-    pub const SET_FIELD_END: u8 = SET_FIELD + 2;
-
-    /// Two operands: a block of 11 × 3 opcodes,
-    /// `LOAD_LOCAL + slot_variant * 3 + name_width`. The slot follows the
-    /// same principle as LOAD_SLOT (8 inline values, then u8/u16/u32); the
-    /// name is a pool index and carries only its byte width.
-    pub const LOAD_LOCAL: u8 = 70;
-    pub const LOAD_LOCAL_END: u8 = LOAD_LOCAL + 32;
+    pub const CONST: u8 = CALL_END;
+    pub const CONST_END: u8 = CONST + 3;
+    pub const LOAD_GLOBAL: u8 = CONST_END;
+    pub const LOAD_GLOBAL_END: u8 = LOAD_GLOBAL + 3;
+    pub const BIND: u8 = LOAD_GLOBAL_END;
+    pub const BIND_END: u8 = BIND + 3;
+    pub const GET_FIELD: u8 = BIND_END;
+    pub const GET_FIELD_END: u8 = GET_FIELD + 3;
+    pub const SET_FIELD: u8 = GET_FIELD_END;
+    pub const SET_FIELD_END: u8 = SET_FIELD + 3;
 
     /// One opcode per operator kind — no operand bytes at all.
-    pub const UNARY: u8 = 103; // + unop_to_byte(kind), 4 kinds
-    pub const UNARY_END: u8 = UNARY + 3;
-    pub const BINARY: u8 = 107; // + binop_to_byte(kind), 16 kinds
-    pub const BINARY_END: u8 = BINARY + 15;
+    pub const UNARY: u8 = SET_FIELD_END; // + unop_to_byte(kind), 4 kinds
+    pub const UNARY_END: u8 = UNARY + 4;
+    pub const BINARY: u8 = UNARY_END; // + binop_to_byte(kind), 16 kinds
+    pub const BINARY_END: u8 = BINARY + 16;
 
     /// No operands.
-    pub const NIL: u8 = 123;
-    pub const POP: u8 = 124;
-    pub const GET_INDEX: u8 = 125;
-    pub const SET_INDEX: u8 = 126;
-    pub const CALL_BARE: u8 = 127;
-    pub const ITER_INIT: u8 = 128;
-    pub const ITER_POP: u8 = 129;
-    pub const RETURN: u8 = 130;
+    pub const POP: u8 = BINARY_END;
+    pub const GET_INDEX: u8 = POP + 1;
+    pub const SET_INDEX: u8 = GET_INDEX + 1;
+    pub const ITER_INIT: u8 = SET_INDEX + 1;
+    pub const ITER_POP: u8 = ITER_INIT + 1;
+    pub const RETURN: u8 = ITER_POP + 1;
 
     /// Fixed 4-byte little-endian byte-offset operand.
-    pub const JUMP: u8 = 131;
-    pub const JUMP_IF_FALSE: u8 = 132;
-    pub const ITER_NEXT: u8 = 133;
+    pub const JUMP: u8 = RETURN + 1;
+    pub const JUMP_IF_FALSE: u8 = JUMP + 1;
+    pub const ITER_NEXT: u8 = JUMP_IF_FALSE + 1;
 
-    /// Immediate values: the singleton atoms, and one opcode per entry of
+    /// `True`/`False` are common enough to deserve their own opcodes, and
+    pub const NIL: u8 = ITER_NEXT + 1;
+    pub const TRUE: u8 = NIL + 1;
+    pub const FALSE: u8 = TRUE + 1;
+
+    /// Immediate values - one opcode per entry of
     /// [`super::SMALL_INTS`] (`INT + index`). No operand bytes and no
     /// const-pool access at runtime.
-    pub const TRUE: u8 = 134;
-    pub const FALSE: u8 = 135;
-    pub const INT: u8 = 136;
-    pub const INT_END: u8 = INT + super::SMALL_INTS.len() as u8 - 1;
+    pub const INT: u8 = FALSE + 1;
+    pub const INT_END: u8 = INT + super::SMALL_INTS.len() as u8;
+
+    /// Integer immediates too large for [`super::SMALL_INTS`] but fitting
+    /// 8/16 bits: the value follows as a little-endian payload,
+    /// sign-extended (`INT_*`) or zero-extended (`UINT_*`) to `i64`.
+    /// Anything larger lives in the const pool.
+    pub const INT_8: u8 = INT_END;
+    pub const INT_16: u8 = INT_8 + 1;
+    pub const UINT_8: u8 = INT_16 + 1;
+    pub const UINT_16: u8 = UINT_8 + 1;
 
     /// Fused binary ops with a small-integer right operand: `base + index`
     /// into [`super::SMALL_INTS`]. One instruction, no operand bytes, no
     /// const-pool access.
-    pub const ADD_INT: u8 = 148;
-    pub const ADD_INT_END: u8 = ADD_INT + super::SMALL_INTS.len() as u8 - 1;
-    pub const SUB_INT: u8 = 160;
-    pub const SUB_INT_END: u8 = SUB_INT + super::SMALL_INTS.len() as u8 - 1;
-
-    /// Integer immediates too large for [`super::SMALL_INTS`] but fitting
-    /// 16 bits: the value follows as a little-endian payload,
-    /// sign-extended (`INT_*`) or zero-extended (`UINT_*`) to `i64`.
-    /// Anything larger lives in the const pool.
-    pub const INT_8: u8 = 172;
-    pub const INT_16: u8 = 173;
-    pub const UINT_8: u8 = 174;
-    pub const UINT_16: u8 = 175;
+    pub const ADD_INT: u8 = UINT_16 + 1;
+    pub const ADD_INT_END: u8 = ADD_INT + super::SMALL_INTS.len() as u8;
+    pub const SUB_INT: u8 = ADD_INT_END;
+    pub const SUB_INT_END: u8 = SUB_INT + super::SMALL_INTS.len() as u8;
 
     /// Fused bitwise ops with a mask from [`super::TINY_MASKS`]
     /// (`base + index`), no operand bytes.
-    pub const AND_MASK: u8 = 176;
-    pub const AND_MASK_END: u8 = AND_MASK + super::TINY_MASKS.len() as u8 - 1;
-    pub const OR_MASK: u8 = 180;
-    pub const OR_MASK_END: u8 = OR_MASK + super::TINY_MASKS.len() as u8 - 1;
-    pub const XOR_MASK: u8 = 184;
-    pub const XOR_MASK_END: u8 = XOR_MASK + super::TINY_MASKS.len() as u8 - 1;
+    pub const AND_MASK: u8 = SUB_INT_END;
+    pub const AND_MASK_END: u8 = AND_MASK + super::TINY_MASKS.len() as u8;
+    pub const OR_MASK: u8 = AND_MASK_END;
+    pub const OR_MASK_END: u8 = OR_MASK + super::TINY_MASKS.len() as u8;
+    pub const XOR_MASK: u8 = OR_MASK_END;
+    pub const XOR_MASK_END: u8 = XOR_MASK + super::TINY_MASKS.len() as u8;
 
     /// Fused comparisons with an integer from [`super::TINY_INTS`]
     /// (`base + index`), no operand bytes.
-    pub const INT_EQ: u8 = 188;
-    pub const INT_EQ_END: u8 = INT_EQ + super::TINY_INTS.len() as u8 - 1;
-    pub const INT_NE: u8 = 194;
-    pub const INT_NE_END: u8 = INT_NE + super::TINY_INTS.len() as u8 - 1;
-    pub const INT_LT: u8 = 200;
-    pub const INT_LT_END: u8 = INT_LT + super::TINY_INTS.len() as u8 - 1;
-    pub const INT_GT: u8 = 206;
-    pub const INT_GT_END: u8 = INT_GT + super::TINY_INTS.len() as u8 - 1;
-    pub const INT_LE: u8 = 212;
-    pub const INT_LE_END: u8 = INT_LE + super::TINY_INTS.len() as u8 - 1;
-    pub const INT_GE: u8 = 218;
-    pub const INT_GE_END: u8 = INT_GE + super::TINY_INTS.len() as u8 - 1;
-
-    /// Whole-statement fusions of `x = x + 1` / `x = x - 1`: 11-opcode
-    /// blocks where the slot follows the LOAD_SLOT principle (8 inline
-    /// values + u8/u16/u32 payload), followed by a fixed `u16` name index
-    /// for the unassigned-slot global fallback. The compiler falls back to
-    /// the unfused sequence when the name index does not fit.
-    pub const INC_SLOT: u8 = 224;
-    pub const INC_SLOT_END: u8 = INC_SLOT + 10;
-    pub const DEC_SLOT: u8 = 235;
-    pub const DEC_SLOT_END: u8 = DEC_SLOT + 10;
+    pub const INT_EQ: u8 = XOR_MASK_END;
+    pub const INT_EQ_END: u8 = INT_EQ + super::TINY_INTS.len() as u8;
+    pub const INT_NE: u8 = INT_EQ_END;
+    pub const INT_NE_END: u8 = INT_NE + super::TINY_INTS.len() as u8;
+    pub const INT_LT: u8 = INT_NE_END;
+    pub const INT_LT_END: u8 = INT_LT + super::TINY_INTS.len() as u8;
+    pub const INT_GT: u8 = INT_LT_END;
+    pub const INT_GT_END: u8 = INT_GT + super::TINY_INTS.len() as u8;
+    pub const INT_LE: u8 = INT_GT_END;
+    pub const INT_LE_END: u8 = INT_LE + super::TINY_INTS.len() as u8;
+    pub const INT_GE: u8 = INT_LE_END;
+    pub const INT_GE_END: u8 = INT_GE + super::TINY_INTS.len() as u8;
 }
 
 /// Bitmasks common enough to deserve their own opcodes for bit operations.
@@ -353,7 +329,7 @@ fn operand_variant(v: u32) -> u8 {
         0..=7 => v as u8,
         8..=0xff => 8,
         0x100..=0xffff => 9,
-        _ => 10,
+        _ => panic!("operand_variant: value too large for a slot-style operand"),
     }
 }
 
@@ -400,10 +376,10 @@ fn width_idx(v: u32) -> u8 {
 
 /// Payload size in bytes for a `width_idx` value.
 #[inline]
-fn width_len(idx: u8) -> usize {
-    match idx {
-        0 => 1,
-        1 => 2,
+fn width_len(v: u32) -> usize {
+    match v {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
         _ => 4,
     }
 }
@@ -460,7 +436,7 @@ fn read_u32(code: &[u8], pc: &mut usize) -> Result<u32, RuntimeError> {
 }
 
 fn truncated() -> RuntimeError {
-    RuntimeError::Other("vm: truncated bytecode".to_string())
+    RuntimeError::Other("vm: truncated bytecode".into())
 }
 
 fn unop_to_byte(k: UnOpKind) -> u8 {
@@ -478,7 +454,7 @@ fn byte_to_unop(b: u8) -> Result<UnOpKind, RuntimeError> {
         1 => UnOpKind::BitNot,
         2 => UnOpKind::Pos,
         3 => UnOpKind::Neg,
-        _ => return Err(RuntimeError::Other("vm: bad unary op".to_string())),
+        _ => return Err(RuntimeError::Other("vm: bad unary op".into())),
     })
 }
 
@@ -521,26 +497,30 @@ fn byte_to_binop(b: u8) -> Result<BinOpKind, RuntimeError> {
         13 => BinOpKind::Gt,
         14 => BinOpKind::Le,
         15 => BinOpKind::Ge,
-        _ => return Err(RuntimeError::Other("vm: bad binary op".to_string())),
+        _ => return Err(RuntimeError::Other("vm: bad binary op".into())),
     })
 }
 
 /// Encoded size of one instruction: opcode byte + operands.
 fn instr_len(i: &Instr) -> usize {
     1 + match i {
-        Instr::LoadSlot(v)
-        | Instr::StoreLocal(v)
+        Instr::LoadSlot(SlotId(v))
+        | Instr::StoreSlot(SlotId(v))
+        | Instr::LoadParent(SlotId(v))
         | Instr::MakeList(v)
         | Instr::MakeRecord(v)
-        | Instr::Call(v) => operand_len(*v),
-        Instr::Const(v)
-        | Instr::LoadGlobal(v)
-        | Instr::Bind(v)
-        | Instr::GetField(v)
-        | Instr::SetField(v) => width_len(width_idx(*v)),
-        Instr::LoadLocal { slot, name } => operand_len(*slot) + width_len(width_idx(*name)),
+        | Instr::Call(v)
+        | Instr::IncSlot(SlotId(v))
+        | Instr::DecSlot(SlotId(v)) => operand_len(*v),
+
+        Instr::Const(ConstId(v))
+        | Instr::LoadGlobal(StringId(v))
+        | Instr::Bind(PatId(v))
+        | Instr::GetField(StringId(v))
+        | Instr::SetField(StringId(v)) => width_len(*v),
+
         Instr::Unary(_) | Instr::Binary(_) | Instr::BinaryInt(..) => 0,
-        Instr::IncSlot { slot, .. } | Instr::DecSlot { slot, .. } => operand_len(*slot) + 2,
+
         Instr::Jump(_) | Instr::JumpIfFalse(_) | Instr::IterNext(_) => 4,
         Instr::Int(n) => int_payload_len(*n),
         Instr::Nil
@@ -549,7 +529,6 @@ fn instr_len(i: &Instr) -> usize {
         | Instr::Pop
         | Instr::GetIndex
         | Instr::SetIndex
-        | Instr::CallBare
         | Instr::IterInit
         | Instr::IterPop
         | Instr::Return => 0,
@@ -582,27 +561,17 @@ pub fn encode(instrs: &[Instr]) -> Code {
     let mut bytes = Vec::with_capacity(off as usize);
     for i in instrs {
         match *i {
-            Instr::Const(v) => push_wop(&mut bytes, opcode::CONST, v),
+            Instr::Const(v) => push_wop(&mut bytes, opcode::CONST, v.0),
             Instr::Nil => bytes.push(opcode::NIL),
             Instr::True => bytes.push(opcode::TRUE),
             Instr::False => bytes.push(opcode::FALSE),
             Instr::Int(n) => push_int(&mut bytes, n),
             Instr::Pop => bytes.push(opcode::POP),
-            Instr::LoadSlot(v) => push_op(&mut bytes, opcode::LOAD_SLOT, v),
-            Instr::LoadLocal { slot, name } => {
-                let sv = operand_variant(slot);
-                let nw = width_idx(name);
-                bytes.push(opcode::LOAD_LOCAL + sv * 3 + nw);
-                push_payload(&mut bytes, sv, slot);
-                match nw {
-                    0 => bytes.push(name as u8),
-                    1 => bytes.extend_from_slice(&(name as u16).to_le_bytes()),
-                    _ => bytes.extend_from_slice(&name.to_le_bytes()),
-                }
-            }
-            Instr::LoadGlobal(v) => push_wop(&mut bytes, opcode::LOAD_GLOBAL, v),
-            Instr::StoreLocal(v) => push_op(&mut bytes, opcode::STORE_LOCAL, v),
-            Instr::Bind(v) => push_wop(&mut bytes, opcode::BIND, v),
+            Instr::LoadSlot(v) => push_op(&mut bytes, opcode::LOAD_SLOT, v.0),
+            Instr::LoadParent(slot) => push_op(&mut bytes, opcode::LOAD_PARENT, slot.0),
+            Instr::LoadGlobal(v) => push_wop(&mut bytes, opcode::LOAD_GLOBAL, v.0),
+            Instr::StoreSlot(v) => push_op(&mut bytes, opcode::STORE_SLOT, v.0),
+            Instr::Bind(v) => push_wop(&mut bytes, opcode::BIND, v.0),
             Instr::MakeList(v) => push_op(&mut bytes, opcode::MAKE_LIST, v),
             Instr::MakeRecord(v) => push_op(&mut bytes, opcode::MAKE_RECORD, v),
             Instr::Unary(k) => bytes.push(opcode::UNARY + unop_to_byte(k)),
@@ -628,27 +597,20 @@ pub fn encode(instrs: &[Instr]) -> Code {
                     .expect("BinaryInt value not in its kind's table");
                 bytes.push(base + idx as u8);
             }
-            Instr::IncSlot { slot, name } | Instr::DecSlot { slot, name } => {
-                let base = if matches!(*i, Instr::IncSlot { .. }) {
+            Instr::IncSlot(slot) | Instr::DecSlot(slot) => push_op(
+                &mut bytes,
+                if matches!(*i, Instr::IncSlot { .. }) {
                     opcode::INC_SLOT
                 } else {
                     opcode::DEC_SLOT
-                };
-                let variant = operand_variant(slot);
-                bytes.push(base + variant);
-                push_payload(&mut bytes, variant, slot);
-                bytes.extend_from_slice(
-                    &u16::try_from(name)
-                        .expect("IncSlot/DecSlot name must fit u16")
-                        .to_le_bytes(),
-                );
-            }
-            Instr::GetField(v) => push_wop(&mut bytes, opcode::GET_FIELD, v),
+                },
+                slot.0,
+            ),
+            Instr::GetField(v) => push_wop(&mut bytes, opcode::GET_FIELD, v.0),
             Instr::GetIndex => bytes.push(opcode::GET_INDEX),
-            Instr::SetField(v) => push_wop(&mut bytes, opcode::SET_FIELD, v),
+            Instr::SetField(v) => push_wop(&mut bytes, opcode::SET_FIELD, v.0),
             Instr::SetIndex => bytes.push(opcode::SET_INDEX),
             Instr::Call(v) => push_op(&mut bytes, opcode::CALL, v),
-            Instr::CallBare => bytes.push(opcode::CALL_BARE),
             Instr::Jump(t) => {
                 bytes.push(opcode::JUMP);
                 bytes.extend_from_slice(&offsets[t as usize].to_le_bytes());
@@ -692,123 +654,118 @@ impl Code {
     pub fn decode_at(&self, mut pc: usize) -> Result<(Instr, usize), RuntimeError> {
         let code = &self.bytes[..];
         let op = read_u8(code, &mut pc)?;
-        let instr = match op {
-            opcode::CONST..=opcode::CONST_END => {
-                Instr::Const(decode_wop(op - opcode::CONST, code, &mut pc)?)
-            }
-            opcode::LOAD_SLOT..=opcode::LOAD_SLOT_END => {
-                Instr::LoadSlot(decode_operand(op - opcode::LOAD_SLOT, code, &mut pc)?)
-            }
-            opcode::LOAD_GLOBAL..=opcode::LOAD_GLOBAL_END => {
-                Instr::LoadGlobal(decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?)
-            }
-            opcode::STORE_LOCAL..=opcode::STORE_LOCAL_END => {
-                Instr::StoreLocal(decode_operand(op - opcode::STORE_LOCAL, code, &mut pc)?)
-            }
-            opcode::BIND..=opcode::BIND_END => {
-                Instr::Bind(decode_wop(op - opcode::BIND, code, &mut pc)?)
-            }
-            opcode::MAKE_LIST..=opcode::MAKE_LIST_END => {
-                Instr::MakeList(decode_operand(op - opcode::MAKE_LIST, code, &mut pc)?)
-            }
-            opcode::MAKE_RECORD..=opcode::MAKE_RECORD_END => {
-                Instr::MakeRecord(decode_operand(op - opcode::MAKE_RECORD, code, &mut pc)?)
-            }
-            opcode::GET_FIELD..=opcode::GET_FIELD_END => {
-                Instr::GetField(decode_wop(op - opcode::GET_FIELD, code, &mut pc)?)
-            }
-            opcode::SET_FIELD..=opcode::SET_FIELD_END => {
-                Instr::SetField(decode_wop(op - opcode::SET_FIELD, code, &mut pc)?)
-            }
-            opcode::CALL..=opcode::CALL_END => {
-                Instr::Call(decode_operand(op - opcode::CALL, code, &mut pc)?)
-            }
-            opcode::LOAD_LOCAL..=opcode::LOAD_LOCAL_END => {
-                let rel = op - opcode::LOAD_LOCAL;
-                let slot = decode_operand(rel / 3, code, &mut pc)?;
-                let name = match rel % 3 {
-                    0 => read_u8(code, &mut pc)? as u32,
-                    1 => read_u16(code, &mut pc)? as u32,
-                    _ => read_u32(code, &mut pc)?,
-                };
-                Instr::LoadLocal { slot, name }
-            }
-            opcode::UNARY..=opcode::UNARY_END => Instr::Unary(byte_to_unop(op - opcode::UNARY)?),
-            opcode::BINARY..=opcode::BINARY_END => {
-                Instr::Binary(byte_to_binop(op - opcode::BINARY)?)
-            }
-            opcode::ADD_INT..=opcode::ADD_INT_END => Instr::BinaryInt(
-                BinOpKind::Add,
-                SMALL_INTS[(op - opcode::ADD_INT) as usize] as i16,
-            ),
-            opcode::SUB_INT..=opcode::SUB_INT_END => Instr::BinaryInt(
-                BinOpKind::Sub,
-                SMALL_INTS[(op - opcode::SUB_INT) as usize] as i16,
-            ),
-            opcode::AND_MASK..=opcode::AND_MASK_END => Instr::BinaryInt(
-                BinOpKind::BitAnd,
-                TINY_MASKS[(op - opcode::AND_MASK) as usize] as i16,
-            ),
-            opcode::OR_MASK..=opcode::OR_MASK_END => Instr::BinaryInt(
-                BinOpKind::BitOr,
-                TINY_MASKS[(op - opcode::OR_MASK) as usize] as i16,
-            ),
-            opcode::XOR_MASK..=opcode::XOR_MASK_END => Instr::BinaryInt(
-                BinOpKind::BitXor,
-                TINY_MASKS[(op - opcode::XOR_MASK) as usize] as i16,
-            ),
-            opcode::INT_EQ..=opcode::INT_EQ_END => Instr::BinaryInt(
-                BinOpKind::Eq,
-                TINY_INTS[(op - opcode::INT_EQ) as usize] as i16,
-            ),
-            opcode::INT_NE..=opcode::INT_NE_END => Instr::BinaryInt(
-                BinOpKind::Ne,
-                TINY_INTS[(op - opcode::INT_NE) as usize] as i16,
-            ),
-            opcode::INT_LT..=opcode::INT_LT_END => Instr::BinaryInt(
-                BinOpKind::Lt,
-                TINY_INTS[(op - opcode::INT_LT) as usize] as i16,
-            ),
-            opcode::INT_GT..=opcode::INT_GT_END => Instr::BinaryInt(
-                BinOpKind::Gt,
-                TINY_INTS[(op - opcode::INT_GT) as usize] as i16,
-            ),
-            opcode::INT_LE..=opcode::INT_LE_END => Instr::BinaryInt(
-                BinOpKind::Le,
-                TINY_INTS[(op - opcode::INT_LE) as usize] as i16,
-            ),
-            opcode::INT_GE..=opcode::INT_GE_END => Instr::BinaryInt(
-                BinOpKind::Ge,
-                TINY_INTS[(op - opcode::INT_GE) as usize] as i16,
-            ),
-            opcode::INC_SLOT..=opcode::INC_SLOT_END => Instr::IncSlot {
-                slot: decode_operand(op - opcode::INC_SLOT, code, &mut pc)?,
-                name: read_u16(code, &mut pc)? as u32,
-            },
-            opcode::DEC_SLOT..=opcode::DEC_SLOT_END => Instr::DecSlot {
-                slot: decode_operand(op - opcode::DEC_SLOT, code, &mut pc)?,
-                name: read_u16(code, &mut pc)? as u32,
-            },
-            opcode::NIL => Instr::Nil,
-            opcode::TRUE => Instr::True,
-            opcode::FALSE => Instr::False,
-            opcode::INT..=opcode::INT_END => Instr::Int(SMALL_INTS[(op - opcode::INT) as usize]),
-            opcode::INT_8 => Instr::Int(read_u8(code, &mut pc)? as i8 as i64),
-            opcode::INT_16 => Instr::Int(read_u16(code, &mut pc)? as i16 as i64),
-            opcode::UINT_8 => Instr::Int(read_u8(code, &mut pc)? as i64),
-            opcode::UINT_16 => Instr::Int(read_u16(code, &mut pc)? as i64),
-            opcode::POP => Instr::Pop,
-            opcode::GET_INDEX => Instr::GetIndex,
-            opcode::SET_INDEX => Instr::SetIndex,
-            opcode::CALL_BARE => Instr::CallBare,
-            opcode::ITER_INIT => Instr::IterInit,
-            opcode::ITER_POP => Instr::IterPop,
-            opcode::RETURN => Instr::Return,
-            opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
-            opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
-            opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
-            _ => return Err(RuntimeError::Other("vm: unknown opcode".to_string())),
-        };
+        let instr =
+            match op {
+                opcode::CONST..opcode::CONST_END => {
+                    Instr::Const(ConstId(decode_wop(op - opcode::CONST, code, &mut pc)?))
+                }
+                opcode::LOAD_SLOT..opcode::LOAD_SLOT_END => Instr::LoadSlot(SlotId(
+                    decode_operand(op - opcode::LOAD_SLOT, code, &mut pc)?,
+                )),
+                opcode::LOAD_PARENT..opcode::LOAD_PARENT_END => {
+                    Instr::LoadParent(SlotId(decode_wop(op - opcode::LOAD_PARENT, code, &mut pc)?))
+                }
+                opcode::LOAD_GLOBAL..opcode::LOAD_GLOBAL_END => Instr::LoadGlobal(StringId(
+                    decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?,
+                )),
+                opcode::STORE_SLOT..opcode::STORE_SLOT_END => Instr::StoreSlot(SlotId(
+                    decode_operand(op - opcode::STORE_SLOT, code, &mut pc)?,
+                )),
+                opcode::BIND..opcode::BIND_END => {
+                    Instr::Bind(PatId(decode_wop(op - opcode::BIND, code, &mut pc)?))
+                }
+                opcode::MAKE_LIST..opcode::MAKE_LIST_END => {
+                    Instr::MakeList(decode_operand(op - opcode::MAKE_LIST, code, &mut pc)?)
+                }
+                opcode::MAKE_RECORD..opcode::MAKE_RECORD_END => {
+                    Instr::MakeRecord(decode_operand(op - opcode::MAKE_RECORD, code, &mut pc)?)
+                }
+                opcode::GET_FIELD..opcode::GET_FIELD_END => {
+                    Instr::GetField(StringId(decode_wop(op - opcode::GET_FIELD, code, &mut pc)?))
+                }
+                opcode::SET_FIELD..opcode::SET_FIELD_END => {
+                    Instr::SetField(StringId(decode_wop(op - opcode::SET_FIELD, code, &mut pc)?))
+                }
+                opcode::CALL..opcode::CALL_END => {
+                    Instr::Call(decode_operand(op - opcode::CALL, code, &mut pc)?)
+                }
+                opcode::UNARY..opcode::UNARY_END => Instr::Unary(byte_to_unop(op - opcode::UNARY)?),
+                opcode::BINARY..opcode::BINARY_END => {
+                    Instr::Binary(byte_to_binop(op - opcode::BINARY)?)
+                }
+                opcode::ADD_INT..opcode::ADD_INT_END => Instr::BinaryInt(
+                    BinOpKind::Add,
+                    SMALL_INTS[(op - opcode::ADD_INT) as usize] as i16,
+                ),
+                opcode::SUB_INT..opcode::SUB_INT_END => Instr::BinaryInt(
+                    BinOpKind::Sub,
+                    SMALL_INTS[(op - opcode::SUB_INT) as usize] as i16,
+                ),
+                opcode::AND_MASK..opcode::AND_MASK_END => Instr::BinaryInt(
+                    BinOpKind::BitAnd,
+                    TINY_MASKS[(op - opcode::AND_MASK) as usize] as i16,
+                ),
+                opcode::OR_MASK..opcode::OR_MASK_END => Instr::BinaryInt(
+                    BinOpKind::BitOr,
+                    TINY_MASKS[(op - opcode::OR_MASK) as usize] as i16,
+                ),
+                opcode::XOR_MASK..opcode::XOR_MASK_END => Instr::BinaryInt(
+                    BinOpKind::BitXor,
+                    TINY_MASKS[(op - opcode::XOR_MASK) as usize] as i16,
+                ),
+                opcode::INT_EQ..opcode::INT_EQ_END => Instr::BinaryInt(
+                    BinOpKind::Eq,
+                    TINY_INTS[(op - opcode::INT_EQ) as usize] as i16,
+                ),
+                opcode::INT_NE..opcode::INT_NE_END => Instr::BinaryInt(
+                    BinOpKind::Ne,
+                    TINY_INTS[(op - opcode::INT_NE) as usize] as i16,
+                ),
+                opcode::INT_LT..opcode::INT_LT_END => Instr::BinaryInt(
+                    BinOpKind::Lt,
+                    TINY_INTS[(op - opcode::INT_LT) as usize] as i16,
+                ),
+                opcode::INT_GT..opcode::INT_GT_END => Instr::BinaryInt(
+                    BinOpKind::Gt,
+                    TINY_INTS[(op - opcode::INT_GT) as usize] as i16,
+                ),
+                opcode::INT_LE..opcode::INT_LE_END => Instr::BinaryInt(
+                    BinOpKind::Le,
+                    TINY_INTS[(op - opcode::INT_LE) as usize] as i16,
+                ),
+                opcode::INT_GE..opcode::INT_GE_END => Instr::BinaryInt(
+                    BinOpKind::Ge,
+                    TINY_INTS[(op - opcode::INT_GE) as usize] as i16,
+                ),
+                opcode::INC_SLOT..opcode::INC_SLOT_END => Instr::IncSlot(SlotId(decode_operand(
+                    op - opcode::INC_SLOT,
+                    code,
+                    &mut pc,
+                )?)),
+                opcode::DEC_SLOT..opcode::DEC_SLOT_END => Instr::DecSlot(SlotId(decode_operand(
+                    op - opcode::DEC_SLOT,
+                    code,
+                    &mut pc,
+                )?)),
+                opcode::NIL => Instr::Nil,
+                opcode::TRUE => Instr::True,
+                opcode::FALSE => Instr::False,
+                opcode::INT..opcode::INT_END => Instr::Int(SMALL_INTS[(op - opcode::INT) as usize]),
+                opcode::INT_8 => Instr::Int(read_u8(code, &mut pc)? as i8 as i64),
+                opcode::INT_16 => Instr::Int(read_u16(code, &mut pc)? as i16 as i64),
+                opcode::UINT_8 => Instr::Int(read_u8(code, &mut pc)? as i64),
+                opcode::UINT_16 => Instr::Int(read_u16(code, &mut pc)? as i64),
+                opcode::POP => Instr::Pop,
+                opcode::GET_INDEX => Instr::GetIndex,
+                opcode::SET_INDEX => Instr::SetIndex,
+                opcode::ITER_INIT => Instr::IterInit,
+                opcode::ITER_POP => Instr::IterPop,
+                opcode::RETURN => Instr::Return,
+                opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
+                opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
+                opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
+                _ => return Err(RuntimeError::Other("vm: unknown opcode".into())),
+            };
         Ok((instr, pc))
     }
 
@@ -854,15 +811,15 @@ impl fmt::Debug for Code {
 pub enum CompiledPat {
     Ignore,
     /// Bind the whole value to frame slot `slot`.
-    Var(u32),
+    Var(SlotId),
     /// Match an atom by name.
     Atom(Atom),
     /// Match a number literal (see [`NumberPat`] for the semantics the
     /// suffix selects).
     Number(NumberPat),
-    /// Match a string literal (pre-unescaped).
+    /// Match a string literal (unescaped).
     String(Rc<str>),
-    /// Match a char literal (pre-unescaped).
+    /// Match a char literal (unescaped).
     Char(char),
     /// Destructure a list of exactly this shape.
     List(Box<[CompiledPat]>),
@@ -927,230 +884,16 @@ impl NumberPat {
     }
 }
 
-/// Compile-time map of a function's variable names to frame slot indices.
-/// Parameters occupy the argument slots (positions `0..arity`, numbered so
-/// a plain-ident parameter's slot is exactly where its argument lands on
-/// the stack — no moves); names introduced by the body extend the same
-/// index space from `arity` upward.
-pub struct SlotTable {
-    map: HashMap<Rc<str>, Slot>,
-    reads: HashSet<Rc<str>>,
-    total: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Slot {
-    index: u32,
-    /// Whether the slot is provably assigned before any load (parameters
-    /// and names bound by the parameter prologue); such loads skip the
-    /// unset-check and global fallback.
-    definite: bool,
-}
-
-impl SlotTable {
-    fn get(&self, name: &str) -> Option<Slot> {
-        self.map.get(name).copied()
-    }
-
-    fn add_read(&mut self, name: Rc<str>) {
-        self.reads.insert(name);
-    }
-
-    fn add_local(&mut self, name: Rc<str>, is_uniform: bool) {
-        let definite = is_uniform && !self.reads.contains(&name);
-
-        // first allocation wins: a body re-assignment to a parameter name
-        // reuses the parameter's slot
-        if !self.map.contains_key(&name) {
-            let index = self.total;
-            self.map.insert(name, Slot { index, definite });
-            self.total += 1;
-        }
-    }
-}
-
-/// Scan parameters and body for every name the function can bind, and
-/// assign each a frame slot. Nested `fn` bodies are separate frames — only
-/// the nested function's *name* is a local here.
-fn collect_slots(params: &[Pat], body: &[Stmt]) -> SlotTable {
-    let arity = params.len() as u32;
-    let mut table = SlotTable {
-        map: HashMap::new(),
-        reads: HashSet::new(),
-        total: arity,
-    };
-
-    // arguments arrive first-on-top, so parameter i's value sits in slot
-    // arity-1-i; a later duplicate parameter name shadows an earlier one
-    for (i, p) in params.iter().enumerate() {
-        if let PatKind::Ident(id) = p.kind() {
-            // a `_` parameter still occupies its argument slot, but binds
-            // nothing — reads of `_` in the body reach the global scope
-            if id.name() == "_" {
-                continue;
-            }
-            table.map.insert(
-                id.rc_name(),
-                Slot {
-                    index: arity - 1 - i as u32,
-                    definite: true,
-                },
-            );
-        } else {
-            // names inside destructuring params are bound by the prologue,
-            // so they are definitely assigned before the body runs
-            collect_pat_names(p, &mut table, true);
-        }
-    }
-
-    collect_stmt_names(body, &mut table, true);
-    table
-}
-
-fn collect_expr_names(expr: &Expr, table: &mut SlotTable) {
-    match expr.kind() {
-        ExprKind::Atom(_) | ExprKind::Literal(_) => {}
-        ExprKind::Ident(ident) => table.add_read(ident.rc_name()),
-        ExprKind::Unary(_, operand) => collect_expr_names(operand, table),
-        ExprKind::Binary(lhs, _, rhs) => {
-            collect_expr_names(lhs, table);
-            collect_expr_names(rhs, table);
-        }
-        ExprKind::Apply(f, args) => {
-            collect_expr_names(f, table);
-            for a in args.iter() {
-                collect_expr_names(a, table);
-            }
-        }
-        ExprKind::Field(obj, _) => collect_expr_names(obj, table),
-        ExprKind::Index(obj, idx) => {
-            collect_expr_names(obj, table);
-            collect_expr_names(idx, table);
-        }
-        ExprKind::List(items) => {
-            for e in items.iter() {
-                collect_expr_names(e, table);
-            }
-        }
-        ExprKind::Record(fields) => {
-            for f in fields.iter() {
-                if let Some(e) = f.value() {
-                    collect_expr_names(e, table);
-                } else {
-                    // shorthand `{ x }` requires the field but binds nothing
-                    table.add_read(f.key().rc_name());
-                }
-            }
-        }
-        ExprKind::Parenthesized(expr) => collect_expr_names(expr, table),
-    }
-}
-
-fn collect_pat_names(pattern: &Pat, table: &mut SlotTable, is_uniform: bool) {
-    match pattern.kind() {
-        PatKind::Ident(id) if id.name() == "_" => {}
-        PatKind::Ident(id) => table.add_local(id.rc_name(), is_uniform),
-        PatKind::Atom(_) | PatKind::Literal(_) => {}
-        PatKind::List(items) => {
-            for p in items.iter() {
-                collect_pat_names(p, table, is_uniform);
-            }
-        }
-        PatKind::Record(fields) => {
-            for f in fields.iter() {
-                match f.pattern() {
-                    Some(p) => collect_pat_names(p, table, is_uniform),
-                    // shorthand `{ _ }` requires the field but binds nothing
-                    None => table.add_local(f.key().rc_name(), is_uniform),
-                }
-            }
-        }
-    }
-}
-
-fn collect_stmt_names(stmts: &[Stmt], table: &mut SlotTable, is_uniform: bool) {
-    for stmt in stmts {
-        match stmt.kind() {
-            StmtKind::AssignPat { target, value } => {
-                collect_expr_names(value, table);
-                collect_pat_names(target, table, is_uniform);
-            }
-            StmtKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                collect_expr_names(cond, table);
-                collect_stmt_names(then_branch, table, false);
-                if let Some(eb) = else_branch {
-                    collect_stmt_names(eb, table, false);
-                }
-            }
-            StmtKind::While {
-                cond,
-                body,
-                else_branch,
-            } => {
-                collect_expr_names(cond, table);
-                collect_stmt_names(body, table, false);
-                if let Some(eb) = else_branch {
-                    collect_stmt_names(eb, table, false);
-                }
-            }
-            StmtKind::For {
-                target,
-                iterable,
-                body,
-                else_branch,
-            } => {
-                collect_expr_names(iterable, table);
-                collect_pat_names(target, table, false);
-                collect_stmt_names(body, table, false);
-                if let Some(eb) = else_branch {
-                    collect_stmt_names(eb, table, false);
-                }
-            }
-            // the nested function's body is its own frame
-            StmtKind::Fn { name, .. } => {
-                table.add_local(name.rc_name(), is_uniform);
-            }
-            StmtKind::Expr(expr) => {
-                collect_expr_names(expr, table);
-            }
-            StmtKind::AssignField { target, value, .. } => {
-                collect_expr_names(target, table);
-                collect_expr_names(value, table);
-            }
-            StmtKind::AssignIndex {
-                target,
-                index,
-                value,
-            } => {
-                collect_expr_names(target, table);
-                collect_expr_names(index, table);
-                collect_expr_names(value, table);
-            }
-            StmtKind::Return(expr) => {
-                if let Some(e) = expr {
-                    collect_expr_names(e, table);
-                }
-            }
-            StmtKind::Break | StmtKind::Continue => {}
-        }
-    }
-}
-
 /// Lower an AST pattern, resolving bound names to frame slots through
 /// `slots`. Infallible: bad suffixes are rejected by the parser before
 /// patterns exist, and an out-of-range number literal compiles to a
 /// pattern that matches nothing (`NumberPat::Never`) — the same non-match
 /// the tree walker produces for it.
-pub fn compile_pat(pattern: &Pat, slots: &SlotTable) -> CompiledPat {
-    fn slot_of(slots: &SlotTable, name: &str) -> u32 {
+fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledPat {
+    fn slot_of(slots: &SlotTable, name: &str) -> SlotId {
         slots
             .get(name)
             .expect("collect_slots missed a pattern name")
-            .index
     }
 
     match pattern.kind() {
@@ -1159,19 +902,20 @@ pub fn compile_pat(pattern: &Pat, slots: &SlotTable) -> CompiledPat {
         PatKind::Atom(a) => CompiledPat::Atom(Atom::new(a.rc_name())),
         PatKind::Literal(lit) => match lit {
             Lit::Num(n) => CompiledPat::Number(NumberPat::from_literal(n)),
-            Lit::Str(s) => CompiledPat::String(Rc::from(s.unescape())),
+            Lit::Str(s) => CompiledPat::String(s.unescape().into()),
             Lit::Char(c) => CompiledPat::Char(c.unescape()),
         },
         PatKind::List(items) => {
-            CompiledPat::List(items.iter().map(|p| compile_pat(p, slots)).collect())
+            CompiledPat::List(items.iter().map(|p| compile_pat(p, slots, ctx)).collect())
         }
         PatKind::Record(fields) => {
             let fields = fields
                 .iter()
                 .filter_map(|f| {
                     let key = f.key().rc_name();
+
                     let pattern = match f.pattern() {
-                        Some(p) => compile_pat(p, slots),
+                        Some(p) => compile_pat(p, slots, ctx),
                         // shorthand `{ x }` binds the field to its own name
                         None => CompiledPat::Var(slot_of(slots, &key)),
                     };
@@ -1193,7 +937,7 @@ impl CompiledPat {
     /// Match `val` against this pattern, binding variables into the slots
     /// of the frame based at `base`. Mirrors `Runtime::bind_pattern` —
     /// including its failure behavior of leaving earlier bindings in place.
-    pub fn bind(&self, rt: &mut Runtime, base: usize, val: &Any) -> Result<(), RuntimeError> {
+    pub fn bind(&self, rt: &mut Runtime, base: usize, val: &Val) -> Result<(), RuntimeError> {
         fn fail() -> RuntimeError {
             RuntimeError::Other("pattern match failed".into())
         }
@@ -1201,27 +945,27 @@ impl CompiledPat {
         match self {
             CompiledPat::Ignore => Ok(()),
             CompiledPat::Var(slot) => {
-                rt.vm.set_slot(base, *slot, val.clone());
+                rt.stack.set(base + slot.0 as usize, val.clone());
                 Ok(())
             }
             CompiledPat::Atom(a) => match val {
-                Any::Atom(av) if av == a => Ok(()),
+                Val::Atom(av) if av == a => Ok(()),
                 _ => Err(fail()),
             },
             CompiledPat::Number(expected) => match val {
-                Any::Number(actual) if expected.matches(*actual) => Ok(()),
+                Val::Number(actual) if expected.matches(*actual) => Ok(()),
                 _ => Err(fail()),
             },
             CompiledPat::String(s) => match val {
-                Any::String(v) if v == s => Ok(()),
+                Val::String(v) if v == s => Ok(()),
                 _ => Err(fail()),
             },
             CompiledPat::Char(c) => match val {
-                Any::Char(v) if v == c => Ok(()),
+                Val::Char(v) if v == c => Ok(()),
                 _ => Err(fail()),
             },
             CompiledPat::List(items) => match val {
-                Any::Object(o) => match &o.borrow().kind {
+                Val::Object(o) => match &o.borrow().kind {
                     ObjectKind::List(vec) if vec.len() == items.len() => {
                         for (p, v) in items.iter().zip(vec.iter()) {
                             p.bind(rt, base, v)?;
@@ -1233,7 +977,7 @@ impl CompiledPat {
                 _ => Err(fail()),
             },
             CompiledPat::Record(fields) => match val {
-                Any::Object(o) => match &o.borrow().kind {
+                Val::Object(o) => match &o.borrow().kind {
                     ObjectKind::Record(map) => {
                         for (key, pattern) in fields.iter() {
                             match map.get(key) {
@@ -1251,143 +995,6 @@ impl CompiledPat {
     }
 }
 
-/// Shared compilation and execution context for all of a runtime's
-/// compiled functions, living at `Runtime::vm`. Compilation interns
-/// constants, variable names and patterns here (deduplicated, so `fib` and
-/// `add` share one copy of the name `"n"` or the constant `1`), and
-/// execution runs every compiled frame on the one operand `stack`.
-pub struct VmContext {
-    consts: Vec<Any>,
-    names: Vec<Rc<str>>,
-    pats: Vec<Rc<CompiledPat>>,
-    /// The operand stack shared by all compiled-function frames. Public for
-    /// inspection — a host function called from compiled code can watch the
-    /// caller's temporaries live. Each frame works relative to the stack
-    /// height at its entry and restores it on exit; pushing extra values
-    /// from a host function mid-call is at your own peril.
-    stack: Vec<Any>,
-}
-
-impl VmContext {
-    pub fn new() -> Self {
-        VmContext {
-            consts: Vec::new(),
-            names: Vec::new(),
-            pats: Vec::new(),
-            stack: Vec::new(),
-        }
-    }
-
-    /// Intern a constant. Only immutable scalar values are deduplicated —
-    /// and never across numeric kinds, since `Any`'s equality treats `1`
-    /// and `1.0` as equal but the program must observe distinct values.
-    fn const_(&mut self, v: Any) -> u32 {
-        fn same(a: &Any, b: &Any) -> bool {
-            match (a, b) {
-                (Any::Number(Number::Integer(x)), Any::Number(Number::Integer(y))) => x == y,
-                (Any::Number(Number::Float(x)), Any::Number(Number::Float(y))) => {
-                    x.to_bits() == y.to_bits()
-                }
-                (Any::String(x), Any::String(y)) => x == y,
-                (Any::Char(x), Any::Char(y)) => x == y,
-                (Any::Atom(x), Any::Atom(y)) => x == y,
-                _ => false,
-            }
-        }
-
-        if let Some(i) = self.consts.iter().position(|c| same(c, &v)) {
-            return i as u32;
-        }
-        self.consts.push(v);
-        (self.consts.len() - 1) as u32
-    }
-
-    fn name(&mut self, n: Rc<str>) -> u32 {
-        if let Some(i) = self.names.iter().position(|m| *m == n) {
-            return i as u32;
-        }
-        self.names.push(n);
-        (self.names.len() - 1) as u32
-    }
-
-    fn pattern(&mut self, p: &Pat, slots: &SlotTable) -> u32 {
-        self.pats.push(Rc::new(compile_pat(p, slots)));
-        (self.pats.len() - 1) as u32
-    }
-
-    /// Read frame slot `slot` of the frame based at `base`.
-    #[inline]
-    pub fn slot(&self, base: usize, slot: u32) -> &Any {
-        &self.stack[base + slot as usize]
-    }
-
-    /// Write frame slot `slot` of the frame based at `base`.
-    #[inline]
-    pub fn set_slot(&mut self, base: usize, slot: u32, v: Any) {
-        self.stack[base + slot as usize] = v;
-    }
-
-    /// Reserve `n` not-yet-assigned locals on top of the stack.
-    #[inline]
-    pub fn extend_uninit(&mut self, n: usize) {
-        self.stack.resize_with(self.stack.len() + n, || Any::Uninit);
-    }
-
-    #[inline]
-    pub fn push_stack(&mut self, v: Any) {
-        self.stack.push(v);
-    }
-
-    #[inline]
-    pub fn stack_len(&self) -> usize {
-        self.stack.len()
-    }
-
-    #[inline]
-    pub fn pop_stack(&mut self) -> Any {
-        match self.stack.pop() {
-            Some(v) => v,
-            None => unreachable!("Attempted to pop from an empty VM stack"),
-        }
-    }
-
-    #[inline]
-    pub fn peek_stack(&self) -> &Any {
-        match self.stack.last() {
-            Some(v) => v,
-            None => unreachable!("Attempted to peek from an empty VM stack"),
-        }
-    }
-
-    #[inline]
-    pub fn extend_stack(&mut self, values: impl IntoIterator<Item = Any>) {
-        self.stack.extend(values);
-    }
-
-    #[inline]
-    pub fn reverse_stack(&mut self, count: usize) {
-        let at = self.stack.len() - count;
-        self.stack[at..].reverse();
-    }
-
-    #[inline]
-    pub fn drain_off_stack(&mut self, count: usize) -> impl DoubleEndedIterator<Item = Any> {
-        let at = self.stack.len() - count;
-        self.stack.drain(at..)
-    }
-
-    #[inline]
-    pub fn truncate_stack(&mut self, len: usize) {
-        self.stack.truncate(len);
-    }
-}
-
-impl Default for VmContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A function lowered to instructions. Its operands index the pools of the
 /// [`VmContext`] it was compiled against — running it on a different
 /// runtime's context yields wrong constants or errors.
@@ -1401,10 +1008,15 @@ impl Default for VmContext {
 pub struct CompiledFn {
     /// Number of arguments a full application consumes.
     pub arity: u32,
-    /// Total frame slots, arguments included.
-    pub slots: u32,
+
+    pub frame_size: u32,
+
     /// Variable-length-encoded instructions (see [`Code`]).
     pub code: Code,
+    /// Environment of the module this function was defined in, if any;
+    /// installed as the current module for the duration of a call so free
+    /// names resolve module-first.
+    pub frame: Rc<Frame>,
 }
 
 impl CompiledFn {
@@ -1417,12 +1029,55 @@ impl CompiledFn {
     /// convention as AST-defined and host functions — partial application
     /// and currying are handled by the runtime through the arity hint.
     #[inline]
-    pub fn into_function(self) -> Any {
-        Any::Fn(FnValue::new_dyn(self))
+    pub fn into_function(self) -> Val {
+        Val::Fn(FnVal::new_dyn(self))
+    }
+
+    fn get_slot(&self, base: usize, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        let val = rt.stack.get(base + slot.0 as usize).clone();
+        if !matches!(val, Val::Uninit) {
+            return Ok(val);
+        }
+
+        core::hint::cold_path();
+
+        // self.frame.get(slot, rt).init_or_else(|| {
+        //     RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.frame.name(slot)))
+        // })
+
+        let val = match &self.frame.parent {
+            Some(parent) => {
+                if let Some(slot) = parent.slot_map[slot.0 as usize] {
+                    parent.frame.get(slot, rt)
+                } else {
+                    let name = self.frame.names.borrow()[slot.0 as usize];
+                    rt.get_var(name)
+                }
+            }
+            None => {
+                let name = self.frame.names.borrow()[slot.0 as usize];
+                rt.get_var(name)
+            }
+        };
+
+        val.init_or_else(|| {
+            RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.frame.name(slot)))
+        })
+    }
+
+    fn get_parent(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        match &self.frame.parent {
+            None => Err(RuntimeError::Other(
+                "vm: load parent from function with no parent scope".into(),
+            )),
+            Some(parent) => parent.frame.get(slot, rt).init_or_else(|| {
+                RuntimeError::UnboundIdentifier(rt.ctx.get_string(parent.frame.name(slot)))
+            }),
+        }
     }
 }
 
-impl DynFunction for CompiledFn {
+impl DynFn for CompiledFn {
     #[inline]
     fn min_args(&self) -> usize {
         self.arity()
@@ -1437,11 +1092,11 @@ impl DynFunction for CompiledFn {
         let arity = self.arity();
         if args < arity {
             if args == 0 {
-                rt.vm.push_stack(Any::Fn(FnValue(self.clone())));
+                rt.stack.push(Val::Fn(FnVal(self.clone())));
                 return 0;
             }
-            let partial = FnValue::partial_dyn(self.clone(), rt, args);
-            rt.vm.push_stack(Any::Fn(partial));
+            let partial = FnVal::partial_dyn(self.clone(), rt, args);
+            rt.stack.push(Val::Fn(partial));
             return args;
         }
 
@@ -1449,7 +1104,7 @@ impl DynFunction for CompiledFn {
             Ok(v) => v,
             Err(e) => {
                 rt.set_error(e);
-                rt.vm.push_stack(Any::nil());
+                rt.stack.push(Val::nil());
             }
         };
 
@@ -1511,18 +1166,21 @@ impl fmt::Display for CompileError {
 /// the AST walker on error, which reproduces the interpreter's runtime
 /// behavior for those cases.
 pub fn compile_fn(
-    ctx: &mut VmContext,
+    rt: &mut Runtime,
     params: Rc<[Pat]>,
     body: &[Stmt],
+    parent: Rc<Frame>,
 ) -> Result<CompiledFn, CompileError> {
-    let arity = params.len();
-    let slots = collect_slots(&params, body);
+    let arity = params.len() as u32;
+    let mut slots = SlotTable::with_params(&params);
+    slots.add_stmts(body);
 
     let mut c = Compiler {
-        ctx,
+        rt,
         slots,
         code: Vec::new(),
         loops: Vec::new(),
+        parent: parent.clone(),
     };
 
     // prologue: unpack destructuring parameters out of their argument
@@ -1530,9 +1188,10 @@ pub fn compile_fn(
     // stay where their argument landed)
     for (i, p) in params.iter().enumerate() {
         if !matches!(p.kind(), PatKind::Ident(_)) {
-            let arg_slot = (arity - 1 - i) as u32;
-            c.emit(Instr::LoadSlot(arg_slot));
-            let pattern = c.ctx.pattern(p, &c.slots);
+            let arg_slot = arity - 1 - i as u32;
+            c.emit(Instr::LoadSlot(SlotId(arg_slot)));
+            let pattern = compile_pat(p, &c.slots, &mut c.rt.ctx);
+            let pattern = c.rt.ctx.pattern(pattern);
             c.emit(Instr::Bind(pattern));
         }
     }
@@ -1542,10 +1201,16 @@ pub fn compile_fn(
     c.compile_block(body, true)?;
     c.emit(Instr::Return);
 
+    let names = c.slots.names(c.rt);
+    let frame_size = c.slots.next.0 - arity;
+
+    let frame = Frame::from_names(names).with_parent(parent);
+
     Ok(CompiledFn {
-        arity: arity as u32,
-        slots: c.slots.total,
+        arity: arity,
+        frame_size,
         code: encode(&c.code),
+        frame: Rc::new(frame),
     })
 }
 
@@ -1576,18 +1241,19 @@ fn int_literal_of(expr: &Expr) -> Option<i64> {
         _ => return None,
     };
     match literal_value(lit) {
-        Ok(Any::Number(Number::Integer(n))) => Some(if negated { n.wrapping_neg() } else { n }),
+        Ok(Val::Number(Number::Integer(n))) => Some(if negated { n.wrapping_neg() } else { n }),
         _ => None,
     }
 }
 
 struct Compiler<'a> {
     /// Shared pools of the owning runtime; instruction operands index here.
-    ctx: &'a mut VmContext,
+    rt: &'a mut Runtime,
     /// This function's name→frame-slot resolution.
     slots: SlotTable,
     code: Vec<Instr>,
     loops: Vec<LoopCtx>,
+    parent: Rc<Frame>,
 }
 
 impl Compiler<'_> {
@@ -1633,21 +1299,11 @@ impl Compiler<'_> {
         let Some(slot) = self.slots.get(id.name()) else {
             return false;
         };
-        let name = self.ctx.name(id.rc_name());
-        if name > u16::MAX as u32 {
-            return false;
-        }
 
         self.emit(if op.kind() == BinOpKind::Add {
-            Instr::IncSlot {
-                slot: slot.index,
-                name,
-            }
+            Instr::IncSlot(slot)
         } else {
-            Instr::DecSlot {
-                slot: slot.index,
-                name,
-            }
+            Instr::DecSlot(slot)
         });
         true
     }
@@ -1665,12 +1321,12 @@ impl Compiler<'_> {
                 let slot = self
                     .slots
                     .get(id.name())
-                    .expect("collect_slots missed an assignment target")
-                    .index;
-                self.emit(Instr::StoreLocal(slot));
+                    .expect("collect_slots missed an assignment target");
+                self.emit(Instr::StoreSlot(slot));
             }
             _ => {
-                let i = self.ctx.pattern(target, &self.slots);
+                let p = compile_pat(target, &self.slots, &mut self.rt.ctx);
+                let i = self.rt.ctx.pattern(p);
                 self.emit(Instr::Bind(i));
             }
         }
@@ -1680,22 +1336,22 @@ impl Compiler<'_> {
     /// slot, a maybe-unset slot with global fallback, or a plain global.
     /// Emit a constant value: small integers and the singleton atoms get
     /// immediate opcodes, everything else goes through the const pool.
-    fn emit_const_value(&mut self, v: Any) {
+    fn emit_const_value(&mut self, v: Val) {
         match v {
-            Any::Number(Number::Integer(n)) if int_fits_immediate(n) => {
+            Val::Number(Number::Integer(n)) if int_fits_immediate(n) => {
                 self.emit(Instr::Int(n));
             }
-            Any::Atom(Atom::Nil) => {
+            Val::Atom(Atom::Nil) => {
                 self.emit(Instr::Nil);
             }
-            Any::Atom(Atom::True) => {
+            Val::Atom(Atom::True) => {
                 self.emit(Instr::True);
             }
-            Any::Atom(Atom::False) => {
+            Val::Atom(Atom::False) => {
                 self.emit(Instr::False);
             }
             v => {
-                let i = self.ctx.const_(v);
+                let i = self.rt.ctx.const_(v);
                 self.emit(Instr::Const(i));
             }
         }
@@ -1703,22 +1359,20 @@ impl Compiler<'_> {
 
     fn emit_load_name(&mut self, name: Rc<str>) {
         match self.slots.get(&name) {
-            Some(Slot {
-                index,
-                definite: true,
-            }) => {
+            Some(index) => {
                 self.emit(Instr::LoadSlot(index));
             }
-            Some(Slot {
-                index,
-                definite: false,
-            }) => {
-                let name = self.ctx.name(name);
-                self.emit(Instr::LoadLocal { slot: index, name });
-            }
             None => {
-                let name = self.ctx.name(name);
-                self.emit(Instr::LoadGlobal(name));
+                let name_id = self.rt.ctx.string(name);
+
+                match self.parent.name_slot(name_id) {
+                    Some(parent_slot) => {
+                        self.emit(Instr::LoadParent(parent_slot));
+                    }
+                    None => {
+                        self.emit(Instr::LoadGlobal(name_id));
+                    }
+                }
             }
         }
     }
@@ -1754,7 +1408,7 @@ impl Compiler<'_> {
             StmtKind::Expr(e) => {
                 // Use expression value only in tail position.
                 // Otherwise compile only side effects.
-                self.compile_expr_callfn(e,tail)?;
+                self.compile_expr_callfn(e, tail)?;
             }
             StmtKind::AssignPat { target, value } => {
                 if !self.try_inc_dec(target, value) {
@@ -1772,7 +1426,7 @@ impl Compiler<'_> {
             } => {
                 self.compile_expr(target, true)?;
                 self.compile_expr(value, true)?;
-                let i = self.ctx.name(field.rc_name());
+                let i = self.rt.ctx.string(field.rc_name());
                 self.emit(Instr::SetField(i));
                 if tail {
                     self.emit(Instr::Nil);
@@ -1948,16 +1602,14 @@ impl Compiler<'_> {
             }
             StmtKind::Fn { name, params, body } => {
                 // nested definitions are compiled too, becoming constants
-                let compiled = compile_fn(self.ctx, params.clone(), body)?;
-                self.ctx.consts.push(compiled.into_function());
-                let i = (self.ctx.consts.len() - 1) as u32;
+                let compiled = compile_fn(self.rt, params.clone(), body, self.parent.clone())?;
+                let i = self.rt.ctx.const_(compiled.into_function());
                 self.emit(Instr::Const(i));
                 let slot = self
                     .slots
                     .get(name.name())
-                    .expect("collect_slots missed a fn name")
-                    .index;
-                self.emit(Instr::StoreLocal(slot));
+                    .expect("collect_slots missed a fn name");
+                self.emit(Instr::StoreSlot(slot));
                 if tail {
                     self.emit(Instr::Nil); // definitions yield nil
                 }
@@ -1984,7 +1636,7 @@ impl Compiler<'_> {
             }
             ExprKind::Atom(a) => {
                 if used {
-                    self.emit_const_value(Any::new_atom(a.rc_name()));
+                    self.emit_const_value(Val::new_atom(a.rc_name()));
                 }
             }
             ExprKind::List(elements) => {
@@ -1998,7 +1650,7 @@ impl Compiler<'_> {
             ExprKind::Record(fields) => {
                 for f in fields.iter() {
                     let key = f.key().rc_name();
-                    let ki = self.ctx.const_(Any::String(key.clone()));
+                    let ki = self.rt.ctx.const_(Val::String(key.clone()));
                     self.emit(Instr::Const(ki));
                     match f.value() {
                         Some(v) => self.compile_expr(v, used)?,
@@ -2021,11 +1673,11 @@ impl Compiler<'_> {
                 if let (UnOpKind::Neg, ExprKind::Literal(lit)) = (op.kind(), operand.kind()) {
                     let v = literal_value(lit)
                         .map_err(|e| CompileError::new(expr.span(), e.to_string()))?;
-                    if let Any::Number(n) = v {
+                    if let Val::Number(n) = v {
                         let negated = n
                             .neg()
                             .map_err(|e| CompileError::new(expr.span(), e.to_string()))?;
-                        self.emit_const_value(Any::Number(negated));
+                        self.emit_const_value(Val::Number(negated));
                         return Ok(());
                     }
                 }
@@ -2072,7 +1724,7 @@ impl Compiler<'_> {
             }
             ExprKind::Field(obj, field) => {
                 self.compile_expr(obj, used)?;
-                let i = self.ctx.name(field.rc_name());
+                let i = self.rt.ctx.string(field.rc_name());
                 if used {
                     self.emit(Instr::GetField(i));
                 }
@@ -2097,7 +1749,7 @@ impl Compiler<'_> {
         match expr.kind() {
             ExprKind::Ident(id) => {
                 self.emit_load_name(id.rc_name());
-                self.emit(Instr::CallBare);
+                self.emit(Instr::Call(0));
                 if !used {
                     self.emit(Instr::Pop);
                 }
@@ -2114,19 +1766,20 @@ impl Compiler<'_> {
 /// that — so `run` itself is just the instruction loop.
 ///
 /// The frame executes on the runtime's shared operand stack
-/// (`rt.vm.stack`): it treats the stack height at entry as its floor and
+/// (`rt.stack`): it treats the stack height at entry as its floor and
 /// restores it on the way out, whether it returns a value or an error, so
 /// nested and recursive frames (including mixed-mode reentry through host
 /// or AST functions) compose without per-call stack allocations.
 pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     // the caller's arguments are already on the stack and become the
     // frame's first slots; reserve the rest for body-introduced locals
-    debug_assert!(rt.vm.stack.len() >= f.arity());
-    let base = rt.vm.stack.len() - f.arity();
-    rt.vm.extend_uninit((f.slots - f.arity) as usize);
+    debug_assert!(rt.stack.len() >= f.arity());
+    let base = rt.stack.len() - f.arity();
+
+    rt.stack.extend_uninit(f.frame_size as usize);
 
     let result = run_frame(rt, &f.code.bytes, base, f);
-    debug_assert!(rt.vm.stack.len() >= base);
+    debug_assert!(rt.stack.len() >= base);
     result
 }
 
@@ -2135,19 +1788,20 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
 /// that — so `run` itself is just the instruction loop.
 ///
 /// The frame executes on the runtime's shared operand stack
-/// (`rt.vm.stack`): it treats the stack height at entry as its floor and
+/// (`rt.stack`): it treats the stack height at entry as its floor and
 /// restores it on the way out, whether it returns a value or an error, so
 /// nested and recursive frames (including mixed-mode reentry through host
 /// or AST functions) compose without per-call stack allocations.
 pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<(), RuntimeError> {
     // the caller's arguments are already on the stack and become the
     // frame's first slots; reserve the rest for body-introduced locals
-    debug_assert!(rt.vm.stack.len() >= f.arity());
-    let base = rt.vm.stack.len() - f.arity();
-    rt.vm.extend_uninit((f.slots - f.arity) as usize);
+    debug_assert!(rt.stack.len() >= f.arity());
+    let base = rt.stack.len() - f.arity();
+    rt.stack
+        .extend_uninit((f.frame.slots.borrow().len() as u32 - f.arity) as usize);
 
     let result = run_frame(rt, code, base, f);
-    debug_assert!(rt.vm.stack.len() >= base);
+    debug_assert!(rt.stack.len() >= base);
     result
 }
 
@@ -2164,348 +1818,347 @@ fn run_frame(
         // `pc` is a byte offset; each opcode decodes its own operands
         let Some(&op) = code.get(pc) else {
             return Err(RuntimeError::Other(
-                "vm: execution ran past the end of code".to_string(),
+                "vm: execution ran past the end of code".into(),
             ));
         };
         pc += 1;
 
         match op {
-            opcode::CONST..=opcode::CONST_END => {
+            opcode::CONST..opcode::CONST_END => {
                 let i = decode_wop(op - opcode::CONST, code, &mut pc)?;
-                let v = rt.vm.consts.get(i as usize).cloned().ok_or_else(|| {
-                    RuntimeError::Other("vm: constant index out of range".to_string())
-                })?;
-                rt.vm.stack.push(v);
+                let v = rt.ctx.get_const(ConstId(i));
+                rt.stack.push(v);
             }
-            opcode::NIL => rt.vm.stack.push(Any::nil()),
-            opcode::TRUE => rt.vm.stack.push(Any::true_()),
-            opcode::FALSE => rt.vm.stack.push(Any::false_()),
-            opcode::INT..=opcode::INT_END => {
+            opcode::NIL => rt.stack.push(Val::nil()),
+            opcode::TRUE => rt.stack.push(Val::true_()),
+            opcode::FALSE => rt.stack.push(Val::false_()),
+            opcode::INT..opcode::INT_END => {
                 let n = SMALL_INTS[(op - opcode::INT) as usize];
-                rt.vm.stack.push(Any::Number(Number::Integer(n)));
+                rt.stack.push(Val::Number(Number::Integer(n)));
             }
             opcode::INT_8 => {
                 let n = read_u8(code, &mut pc)? as i8 as i64;
-                rt.vm.stack.push(Any::Number(Number::Integer(n)));
+                rt.stack.push(Val::Number(Number::Integer(n)));
             }
             opcode::INT_16 => {
                 let n = read_u16(code, &mut pc)? as i16 as i64;
-                rt.vm.stack.push(Any::Number(Number::Integer(n)));
+                rt.stack.push(Val::Number(Number::Integer(n)));
             }
             opcode::UINT_8 => {
                 let n = read_u8(code, &mut pc)? as i64;
-                rt.vm.stack.push(Any::Number(Number::Integer(n)));
+                rt.stack.push(Val::Number(Number::Integer(n)));
             }
             opcode::UINT_16 => {
                 let n = read_u16(code, &mut pc)? as i64;
-                rt.vm.stack.push(Any::Number(Number::Integer(n)));
+                rt.stack.push(Val::Number(Number::Integer(n)));
             }
             opcode::POP => {
-                rt.vm.pop_stack();
+                rt.stack.pop();
             }
-            opcode::LOAD_SLOT..=opcode::LOAD_SLOT_END => {
+            opcode::LOAD_SLOT..opcode::LOAD_SLOT_END => {
                 let slot = decode_operand(op - opcode::LOAD_SLOT, code, &mut pc)?;
-                let v = rt.vm.slot(base, slot).clone();
-                debug_assert!(
-                    !matches!(v, Any::Uninit),
-                    "vm: LoadSlot on an unassigned slot"
-                );
-                rt.vm.stack.push(v);
+                let val = f.get_slot(base, SlotId(slot), rt)?;
+                rt.stack.push(val);
             }
-            opcode::LOAD_LOCAL..=opcode::LOAD_LOCAL_END => {
-                let rel = op - opcode::LOAD_LOCAL;
-                let slot = decode_operand(rel / 3, code, &mut pc)?;
-                let name = match rel % 3 {
-                    0 => read_u8(code, &mut pc)? as u32,
-                    1 => read_u16(code, &mut pc)? as u32,
-                    _ => read_u32(code, &mut pc)?,
-                };
-                let v = rt.vm.slot(base, slot).clone();
-                let v = if matches!(v, Any::Uninit) {
-                    // not assigned yet: the name reaches the global scope
-                    let name = rt.vm.names.get(name as usize).ok_or_else(|| {
-                        RuntimeError::Other("vm: name index out of range".to_string())
-                    })?;
-                    rt.global
-                        .get(&name[..])
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::UnboundIdentifier(name[..].to_string()))?
-                } else {
-                    v
-                };
-                rt.vm.stack.push(v);
+            opcode::LOAD_PARENT..opcode::LOAD_PARENT_END => {
+                let slot = decode_operand(op - opcode::LOAD_PARENT, code, &mut pc)?;
+                let v = f.get_parent(SlotId(slot), rt)?;
+                rt.stack.push(v);
             }
-            opcode::LOAD_GLOBAL..=opcode::LOAD_GLOBAL_END => {
+            opcode::LOAD_GLOBAL..opcode::LOAD_GLOBAL_END => {
                 let i = decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?;
-                let name = rt.vm.names.get(i as usize).ok_or_else(|| {
-                    RuntimeError::Other("vm: name index out of range".to_string())
+                let name = StringId(i);
+                let v = rt.get_var(name).init_or_else(|| {
+                    core::hint::cold_path();
+                    RuntimeError::UnboundIdentifier(rt.ctx.get_string(name))
                 })?;
-                let v = rt
-                    .global
-                    .get(&name[..])
-                    .cloned()
-                    .ok_or_else(|| RuntimeError::UnboundIdentifier(name[..].to_string()))?;
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::STORE_LOCAL..=opcode::STORE_LOCAL_END => {
-                let slot = decode_operand(op - opcode::STORE_LOCAL, code, &mut pc)?;
-                let v = rt.vm.pop_stack();
-                rt.vm.set_slot(base, slot, v);
+            opcode::STORE_SLOT..opcode::STORE_SLOT_END => {
+                let slot = decode_operand(op - opcode::STORE_SLOT, code, &mut pc)?;
+                let v = rt.stack.pop();
+                rt.stack.set(base + slot as usize, v);
             }
-            opcode::BIND..=opcode::BIND_END => {
+            opcode::BIND..opcode::BIND_END => {
                 let i = decode_wop(op - opcode::BIND, code, &mut pc)?;
-                let v = rt.vm.pop_stack();
+                let v = rt.stack.pop();
                 let pattern = rt
-                    .vm
+                    .ctx
                     .pats
                     .get(i as usize)
                     .ok_or_else(|| {
-                        RuntimeError::Other("vm: pattern index out of range".to_string())
+                        core::hint::cold_path();
+                        RuntimeError::Other("vm: pattern index out of range".into())
                     })?
                     .clone();
                 pattern.bind(rt, base, &v)?;
             }
-            opcode::MAKE_LIST..=opcode::MAKE_LIST_END => {
+            opcode::MAKE_LIST..opcode::MAKE_LIST_END => {
                 let n = decode_operand(op - opcode::MAKE_LIST, code, &mut pc)?;
-                let elements = rt.vm.drain_off_stack(n as usize);
-                let list = Any::new_list(elements.collect());
-                rt.vm.push_stack(list);
+                let elements = rt.stack.drain_top(n as usize);
+                let list = Val::new_list(elements.collect());
+                rt.stack.push(list);
             }
-            opcode::MAKE_RECORD..=opcode::MAKE_RECORD_END => {
+            opcode::MAKE_RECORD..opcode::MAKE_RECORD_END => {
                 let n = decode_operand(op - opcode::MAKE_RECORD, code, &mut pc)?;
-                let mut map = BTreeMap::new();
+                let mut map = FixedHashMap::default();
                 {
-                    let mut fields = rt.vm.drain_off_stack(n as usize * 2);
+                    let mut fields = rt.stack.drain_top(n as usize * 2);
                     while let (Some(key), Some(val)) = (fields.next(), fields.next()) {
                         match key {
-                            Any::String(key) => {
+                            Val::String(key) => {
                                 map.insert(key, val);
                             }
                             _ => {
+                                core::hint::cold_path();
                                 return Err(RuntimeError::TypeError(
-                                    "vm: record key must be a string".to_string(),
+                                    "vm: record key must be a string".into(),
                                 ));
                             }
                         }
                     }
                 }
-                let record = Any::new_record(map);
-                rt.vm.push_stack(record);
+                let record = Val::new_record(map);
+                rt.stack.push(record);
             }
-            opcode::UNARY..=opcode::UNARY_END => {
+            opcode::UNARY..opcode::UNARY_END => {
                 let k = byte_to_unop(op - opcode::UNARY)?;
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = eval_unary(k, &a)?;
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::BINARY..=opcode::BINARY_END => {
+            opcode::BINARY..opcode::BINARY_END => {
                 let k = byte_to_binop(op - opcode::BINARY)?;
-                let b = rt.vm.pop_stack();
-                let a = rt.vm.pop_stack();
+                let b = rt.stack.pop();
+                let a = rt.stack.pop();
                 let v = eval_binary(k, &a, &b)?;
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::ADD_INT..=opcode::ADD_INT_END => {
+            opcode::ADD_INT..opcode::ADD_INT_END => {
                 let n = SMALL_INTS[(op - opcode::ADD_INT) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
                     // fast path mirroring Number::add's wrapping semantics
-                    Any::Number(Number::Integer(x)) => {
-                        Any::Number(Number::Integer(x.wrapping_add(n)))
+                    Val::Number(Number::Integer(x)) => {
+                        Val::Number(Number::Integer(x.wrapping_add(n)))
                     }
-                    a => eval_binary(BinOpKind::Add, &a, &Any::Number(Number::Integer(n)))?,
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Add, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::SUB_INT..=opcode::SUB_INT_END => {
+            opcode::SUB_INT..opcode::SUB_INT_END => {
                 let n = SMALL_INTS[(op - opcode::SUB_INT) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => {
-                        Any::Number(Number::Integer(x.wrapping_sub(n)))
+                    Val::Number(Number::Integer(x)) => {
+                        Val::Number(Number::Integer(x.wrapping_sub(n)))
                     }
-                    a => eval_binary(BinOpKind::Sub, &a, &Any::Number(Number::Integer(n)))?,
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Sub, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::AND_MASK..=opcode::AND_MASK_END => {
+            opcode::AND_MASK..opcode::AND_MASK_END => {
                 let n = TINY_MASKS[(op - opcode::AND_MASK) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::Number(Number::Integer(x & n)),
-                    a => eval_binary(BinOpKind::BitAnd, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::Number(Number::Integer(x & n)),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::BitAnd, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::OR_MASK..=opcode::OR_MASK_END => {
+            opcode::OR_MASK..opcode::OR_MASK_END => {
                 let n = TINY_MASKS[(op - opcode::OR_MASK) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::Number(Number::Integer(x | n)),
-                    a => eval_binary(BinOpKind::BitOr, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::Number(Number::Integer(x | n)),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::BitOr, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::XOR_MASK..=opcode::XOR_MASK_END => {
+            opcode::XOR_MASK..opcode::XOR_MASK_END => {
                 let n = TINY_MASKS[(op - opcode::XOR_MASK) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::Number(Number::Integer(x ^ n)),
-                    a => eval_binary(BinOpKind::BitXor, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::Number(Number::Integer(x ^ n)),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::BitXor, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_EQ..=opcode::INT_EQ_END => {
+            opcode::INT_EQ..opcode::INT_EQ_END => {
                 let n = TINY_INTS[(op - opcode::INT_EQ) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x == n),
-                    a => eval_binary(BinOpKind::Eq, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x == n),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Eq, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_NE..=opcode::INT_NE_END => {
+            opcode::INT_NE..opcode::INT_NE_END => {
                 let n = TINY_INTS[(op - opcode::INT_NE) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x != n),
-                    a => eval_binary(BinOpKind::Ne, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x != n),
+                    a => eval_binary(BinOpKind::Ne, &a, &Val::Number(Number::Integer(n)))?,
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_LT..=opcode::INT_LT_END => {
+            opcode::INT_LT..opcode::INT_LT_END => {
                 let n = TINY_INTS[(op - opcode::INT_LT) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x < n),
-                    a => eval_binary(BinOpKind::Lt, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x < n),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Lt, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_GT..=opcode::INT_GT_END => {
+            opcode::INT_GT..opcode::INT_GT_END => {
                 let n = TINY_INTS[(op - opcode::INT_GT) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x > n),
-                    a => eval_binary(BinOpKind::Gt, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x > n),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Gt, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_LE..=opcode::INT_LE_END => {
+            opcode::INT_LE..opcode::INT_LE_END => {
                 let n = TINY_INTS[(op - opcode::INT_LE) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x <= n),
-                    a => eval_binary(BinOpKind::Le, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x <= n),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Le, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INT_GE..=opcode::INT_GE_END => {
+            opcode::INT_GE..opcode::INT_GE_END => {
                 let n = TINY_INTS[(op - opcode::INT_GE) as usize];
-                let a = rt.vm.pop_stack();
+                let a = rt.stack.pop();
                 let v = match a {
-                    Any::Number(Number::Integer(x)) => Any::bool_(x >= n),
-                    a => eval_binary(BinOpKind::Ge, &a, &Any::Number(Number::Integer(n)))?,
+                    Val::Number(Number::Integer(x)) => Val::bool_(x >= n),
+                    a => {
+                        core::hint::cold_path();
+                        eval_binary(BinOpKind::Ge, &a, &Val::Number(Number::Integer(n)))?
+                    }
                 };
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::INC_SLOT..=opcode::DEC_SLOT_END => {
-                let inc = op <= opcode::INC_SLOT_END;
+            opcode::INC_SLOT..opcode::DEC_SLOT_END => {
+                let inc = op < opcode::INC_SLOT_END;
                 let rel = if inc {
                     op - opcode::INC_SLOT
                 } else {
                     op - opcode::DEC_SLOT
                 };
                 let slot = decode_operand(rel, code, &mut pc)?;
-                let name = read_u16(code, &mut pc)? as u32;
-                let cur = rt.vm.slot(base, slot).clone();
-                let cur = if matches!(cur, Any::Uninit) {
-                    // not assigned yet: the read reaches the global scope
-                    let name = rt.vm.names.get(name as usize).ok_or_else(|| {
-                        RuntimeError::Other("vm: name index out of range".to_string())
-                    })?;
-                    rt.global
-                        .get(&name[..])
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::UnboundIdentifier(name[..].to_string()))?
-                } else {
-                    cur
-                };
-                let kind = if inc { BinOpKind::Add } else { BinOpKind::Sub };
+                let cur = f.get_slot(base, SlotId(slot), rt)?;
                 let v = match cur {
-                    Any::Number(Number::Integer(x)) => Any::Number(Number::Integer(if inc {
+                    Val::Number(Number::Integer(x)) => Val::Number(Number::Integer(if inc {
                         x.wrapping_add(1)
                     } else {
                         x.wrapping_sub(1)
                     })),
-                    cur => eval_binary(kind, &cur, &Any::Number(Number::Integer(1)))?,
+                    cur => {
+                        core::hint::cold_path();
+                        eval_binary(
+                            if inc { BinOpKind::Add } else { BinOpKind::Sub },
+                            &cur,
+                            &Val::Number(Number::Integer(1)),
+                        )?
+                    }
                 };
-                rt.vm.set_slot(base, slot, v);
+                rt.stack.set(base + slot as usize, v);
             }
-            opcode::GET_FIELD..=opcode::GET_FIELD_END => {
+            opcode::GET_FIELD..opcode::GET_FIELD_END => {
                 let i = decode_wop(op - opcode::GET_FIELD, code, &mut pc)?;
-                let obj = rt.vm.pop_stack();
-                let v = field_of(&obj, &rt.vm.names[i as usize])?;
-                rt.vm.stack.push(v);
+                let key = rt.ctx.get_string(StringId(i));
+                let obj = rt.stack.pop();
+                let v = field_of(&obj, &key)?;
+                rt.stack.push(v);
             }
             opcode::GET_INDEX => {
-                let idx = rt.vm.pop_stack();
-                let obj = rt.vm.pop_stack();
+                let idx = rt.stack.pop();
+                let obj = rt.stack.pop();
                 let v = index_of(&obj, &idx)?;
-                rt.vm.stack.push(v);
+                rt.stack.push(v);
             }
-            opcode::SET_FIELD..=opcode::SET_FIELD_END => {
+            opcode::SET_FIELD..opcode::SET_FIELD_END => {
                 let i = decode_wop(op - opcode::SET_FIELD, code, &mut pc)?;
-                let val = rt.vm.pop_stack();
-                let obj = rt.vm.pop_stack();
-                assign_field(obj, rt.vm.names[i as usize].clone(), val)?;
+                let key = rt.ctx.get_string(StringId(i));
+                let val = rt.stack.pop();
+                let obj = rt.stack.pop();
+                assign_field(obj, &key, val)?;
             }
             opcode::SET_INDEX => {
-                let val = rt.vm.pop_stack();
-                let idx = rt.vm.pop_stack();
-                let obj = rt.vm.pop_stack();
+                let val = rt.stack.pop();
+                let idx = rt.stack.pop();
+                let obj = rt.stack.pop();
                 assign_index(obj, idx, val)?;
             }
-            opcode::CALL..=opcode::CALL_END => {
+            opcode::CALL..opcode::CALL_END => {
                 let n = decode_operand(op - opcode::CALL, code, &mut pc)?;
-                rt.vm.reverse_stack(n as usize + 1);
-                let fval = rt.vm.peek_stack();
+                if n > 0 {
+                    rt.stack.reverse(n as usize + 1);
+                }
 
+                let fval = rt.stack.peek();
                 match fval {
-                    Any::Fn(fval) if core::ptr::eq(&*fval.0, f) && f.arity == n => {
+                    Val::Fn(fval) if core::ptr::eq(&*fval.0, f) && f.arity == n => {
                         // Calls self.
                         run_recursive(rt, code, f)?;
                     }
                     _ => {
-                        rt.apply_value(n as usize)?;
+                        rt.call(n as usize)?;
                     }
                 }
-            }
-            opcode::CALL_BARE => {
-                let v = rt.vm.pop_stack();
-                rt.call_bare(v)?;
             }
             opcode::JUMP => {
                 pc = read_u32(code, &mut pc)? as usize;
             }
             opcode::JUMP_IF_FALSE => {
                 let t = read_u32(code, &mut pc)?;
-                let c = rt.vm.pop_stack();
+                let c = rt.stack.pop();
                 if is_falsey(&c) {
                     pc = t as usize;
                 }
             }
             opcode::ITER_INIT => {
-                let v = rt.vm.pop_stack();
+                let v = rt.stack.pop();
                 iters.push(v.iter()?.into_iter());
             }
             opcode::ITER_NEXT => {
                 let t = read_u32(code, &mut pc)?;
-                let iter = iters
-                    .last_mut()
-                    .ok_or_else(|| RuntimeError::Other("vm: no active iterator".to_string()))?;
+                let iter = iters.last_mut().ok_or_else(|| {
+                    core::hint::cold_path();
+                    RuntimeError::Other("vm: no active iterator".into())
+                })?;
                 match iter.next() {
-                    Some(item) => rt.vm.stack.push(item),
+                    Some(item) => rt.stack.push(item),
                     None => {
                         iters.pop();
                         pc = t as usize;
@@ -2516,14 +2169,14 @@ fn run_frame(
                 iters.pop();
             }
             opcode::RETURN => {
-                if rt.vm.stack.len() != base + 1 {
-                    let ret = rt.vm.pop_stack();
-                    rt.vm.stack.truncate(base);
-                    rt.vm.push_stack(ret);
+                if rt.stack.len() != base + 1 {
+                    let ret = rt.stack.pop();
+                    rt.stack.truncate(base);
+                    rt.stack.push(ret);
                 }
                 return Ok(());
             }
-            _ => return Err(RuntimeError::Other("vm: unknown opcode".to_string())),
+            _ => return Err(RuntimeError::Other("vm: unknown opcode".into())),
         }
     }
 }
@@ -2541,42 +2194,327 @@ mod tests {
         raft_ast::Stmt::parse_many(&mut stream).unwrap()
     }
 
-    fn run_mode(src: &str, compiled: bool) -> Result<Runtime, RuntimeError> {
+    fn run_mode(src: &str, compiled: bool) -> Result<(Runtime, Rc<Frame>), RuntimeError> {
         let stmts = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         rt.set_compile_fns(compiled);
         for statement in &stmts {
-            rt.exec_stmt(statement)?;
+            rt.exec_stmt(statement, frame.clone())?;
         }
-        Ok(rt)
+        Ok((rt, frame))
     }
 
     /// Run `src` through the AST walker and the bytecode VM and assert that
     /// every global variable ends up displaying identically.
-    fn assert_modes_agree(src: &str) -> Runtime {
-        let walked = run_mode(src, false).expect("AST walker failed");
-        let vmed = run_mode(src, true).expect("VM failed");
+    fn assert_modes_agree(src: &str) -> (Runtime, Rc<Frame>) {
+        let (walked_rt, walked_frame) = run_mode(src, false).expect("AST walker failed");
+        let (mut vmed_rt, vmed_frame) = run_mode(src, true).expect("VM failed");
 
-        let mut walked_keys: Vec<_> = walked.global.keys().collect();
-        let mut vmed_keys: Vec<_> = vmed.global.keys().collect();
+        let mut walked_keys: Vec<_> = walked_frame
+            .names()
+            .into_iter()
+            .map(|k| walked_rt.ctx.get_string(k))
+            .collect();
+        let mut vmed_keys: Vec<_> = vmed_frame
+            .names()
+            .into_iter()
+            .map(|k| vmed_rt.ctx.get_string(k))
+            .collect();
         walked_keys.sort();
         vmed_keys.sort();
         assert_eq!(walked_keys, vmed_keys, "modes bound different globals");
-        for (name, walked_val) in &walked.global {
-            let vmed_val = &vmed.global[name];
+
+        for (idx, walked_val) in walked_frame.slots().into_iter().enumerate() {
+            let name = walked_rt
+                .ctx
+                .get_string(walked_frame.name(SlotId(idx as u32)));
+            let vmed_val = &vmed_frame.get_var(vmed_rt.ctx.string(name.clone()), &mut vmed_rt);
             assert_eq!(
                 format!("{walked_val}"),
                 format!("{vmed_val}"),
                 "global `{name}` differs between modes"
             );
         }
-        vmed
+        (vmed_rt, vmed_frame)
     }
 
-    fn int_var(rt: &Runtime, name: &str) -> i64 {
-        match rt.get_var(name) {
-            Some(Any::Number(Number::Integer(i))) => i,
+    fn int_var(rt: &mut Runtime, frame: &Frame, name: &str) -> i64 {
+        match frame.get_var(name, rt) {
+            Val::Number(Number::Integer(i)) => i,
             other => panic!("expected integer in `{name}`, got {other:?}"),
+        }
+    }
+
+    const MATH_MODULE: &str = "pi = 3
+fn sq x:
+    return x * x
+fn dist2 a b:
+    return (sq a) + (sq b)
+fn area r:
+    return pi * (sq r)
+export { pi, sq, dist2, area }
+";
+
+    fn module_runtime(compiled: bool) -> Runtime {
+        let mut rt = Runtime::new();
+        rt.set_compile_fns(compiled);
+        rt
+    }
+
+    #[test]
+    fn modules_load_export_and_capture_their_environment() {
+        for compiled in [false, true] {
+            let mut rt = module_runtime(compiled);
+            let frame = Rc::new(Frame::new());
+            let module = rt.load_module("math", MATH_MODULE).unwrap();
+            rt.set_var("math", module);
+
+            // field access, module-value capture, helper-fn capture — the
+            // functions run *after* the load, so they must see the module
+            // environment, not the globals
+            for st in &ast_from_str(
+                "r1 = math.pi
+r2 = math.sq 6
+r3 = math.dist2 3 4
+r4 = math.area 2
+",
+            ) {
+                rt.exec_stmt(st, frame.clone()).unwrap();
+            }
+            assert_eq!(
+                format!("{}", frame.get_var("r1", &mut rt)),
+                "3",
+                "mode {compiled}"
+            );
+            assert_eq!(
+                format!("{}", frame.get_var("r2", &mut rt)),
+                "36",
+                "mode {compiled}"
+            );
+            assert_eq!(
+                format!("{}", frame.get_var("r3", &mut rt)),
+                "25",
+                "mode {compiled}"
+            );
+            assert_eq!(
+                format!("{}", frame.get_var("r4", &mut rt)),
+                "12",
+                "mode {compiled}"
+            );
+
+            // module bindings must not leak into the globals
+            assert!(!frame.get_var("pi", &mut rt).is_init());
+            assert!(!frame.get_var("sq", &mut rt).is_init());
+
+            // record patterns destructure modules
+            for st in &ast_from_str(
+                "{ pi, sq } = math
+r5 = sq pi
+",
+            ) {
+                rt.exec_stmt(st, frame.clone()).unwrap();
+            }
+            assert_eq!(format!("{}", frame.get_var("r5", &mut rt)), "9");
+        }
+    }
+
+    #[test]
+    fn modules_are_cached_and_immutable() {
+        let mut rt = module_runtime(true);
+        let frame = Rc::new(Frame::new());
+        let a = rt.load_module("math", MATH_MODULE).unwrap();
+        let b = rt
+            .load_module("math", "garbage that would not even parse")
+            .unwrap();
+        // second load must come from the cache: same object
+        let (Val::Object(oa), Val::Object(ob)) = (&a, &b) else {
+            panic!("modules are objects");
+        };
+        assert!(Rc::ptr_eq(oa, ob));
+
+        // and the module object rejects mutation
+        rt.set_var("math", a);
+        let stmts = ast_from_str(
+            "math.pi = 4
+",
+        );
+        assert!(rt.exec_stmt(&stmts[0], frame.clone()).is_err());
+    }
+
+    #[test]
+    fn module_export_rules() {
+        let mut rt = module_runtime(true);
+        let frame = Rc::new(Frame::new());
+
+        // a module must terminate with an export
+        assert!(
+            rt.load_module(
+                "bad1", "x = 1
+"
+            )
+            .is_err()
+        );
+        // nothing may follow the export
+        assert!(
+            rt.load_module(
+                "bad2",
+                "export { x: 1 }
+y = 2
+"
+            )
+            .is_err()
+        );
+        // export is structural, not a statement: it cannot nest in blocks
+        assert!(
+            rt.load_module(
+                "bad3",
+                "if True:
+    export { a: 1 }
+"
+            )
+            .is_err()
+        );
+        // an export referencing an unbound name fails the load cleanly
+        // (and the runtime stays usable afterwards)
+        assert!(
+            rt.load_module(
+                "bad4",
+                "export { missing }
+"
+            )
+            .is_err()
+        );
+        let ok = rt
+            .load_module(
+                "ok",
+                "x = 1
+export { x }
+",
+            )
+            .unwrap();
+        rt.set_var("ok", ok);
+        for st in &ast_from_str(
+            "r = ok.x
+",
+        ) {
+            rt.exec_stmt(st, frame.clone()).unwrap();
+        }
+        assert_eq!(
+            format!("{}", frame.get_var(rt.ctx.string("r"), &mut rt)),
+            "1"
+        );
+    }
+
+    #[test]
+    fn module_static_call_resolution_respects_reassignment() {
+        for compiled in [false, true] {
+            let mut rt = module_runtime(compiled);
+            // `f` is reassigned after definition — calls must resolve
+            // dynamically and see the *final* value; `g` is final and
+            // resolves statically; recursion works through both
+            let m = rt
+                .load_module(
+                    "resolve",
+                    "fn g x:
+  x + 1
+fn f x:
+  x * 10
+f = g
+fn use x:
+  f (g x)
+fn fib n:
+  if n < 2: return n
+  fib (n - 1) + fib (n - 2)
+export { use, fib }
+",
+                )
+                .unwrap();
+            rt.set_var("m", m);
+
+            let frame = Rc::new(Frame::new());
+            for st in &ast_from_str(
+                "r1 = m.use 5
+r2 = m.fib 10
+",
+            ) {
+                rt.exec_stmt(st, frame.clone()).unwrap();
+            }
+            // use 5 → f(g 5) → g(6) → 7 (f is g now, not *10)
+            assert_eq!(
+                format!("{}", frame.get_var("r1", &mut rt)),
+                "7",
+                "mode {compiled}"
+            );
+            assert_eq!(
+                format!("{}", frame.get_var("r2", &mut rt)),
+                "55",
+                "mode {compiled}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_cycles_are_detected() {
+        let mut rt = module_runtime(true);
+        // an `import` host that resolves any name to a module importing it back
+        rt.register_function("import_self", 0, Some(0), |rt, _args| {
+            match rt.load_module(
+                "cycle",
+                "m = (import_self)
+export { m }
+",
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    rt.set_error(e);
+                    Val::nil()
+                }
+            }
+        });
+        let err = rt.load_module(
+            "cycle",
+            "m = (import_self)
+export { m }
+",
+        );
+        assert!(err.is_err());
+        assert!(format!("{:?}", err.unwrap_err()).contains("circular"));
+    }
+
+    #[test]
+    fn module_sees_globals_but_prefers_its_own_bindings() {
+        for compiled in [false, true] {
+            let mut rt = module_runtime(compiled);
+            rt.set_var("shift", Val::Number(Number::Integer(100)));
+            rt.set_var("pi", Val::Number(Number::Integer(999)));
+
+            // `shift` resolves to the importer's global; `pi` is shadowed
+            // by the module's own binding
+            let m = rt
+                .load_module(
+                    "shadow",
+                    "pi = 3
+fn f x:
+    return x + shift + pi
+export { f }
+",
+                )
+                .unwrap();
+            rt.set_var("m", m);
+
+            let frame = Rc::new(Frame::new());
+            for st in &ast_from_str(
+                "r = m.f 1
+",
+            ) {
+                rt.exec_stmt(st, frame.clone()).unwrap();
+            }
+            assert_eq!(
+                format!("{}", frame.get_var("r", &mut rt)),
+                "104",
+                "mode {compiled}"
+            );
         }
     }
 
@@ -2587,8 +2525,9 @@ mod tests {
         let StmtKind::Fn { params, body, .. } = stmts[0].kind() else {
             panic!("expected fn statement");
         };
-        let mut ctx = VmContext::new();
-        let compiled = compile_fn(&mut ctx, params.clone(), body).unwrap();
+        let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
+        let compiled = compile_fn(&mut rt, params.clone(), body, frame).unwrap();
         let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
         assert!(matches!(instrs.last(), Some(Instr::Return)));
         assert_eq!(compiled.arity(), 2);
@@ -2598,23 +2537,17 @@ mod tests {
     fn bytecode_roundtrips_through_the_encoder() {
         // every instruction kind, with operands spanning varint widths
         let instrs = vec![
-            Instr::Const(0),
-            Instr::Const(127),
-            Instr::Const(128),
-            Instr::Const(0x4000),
-            Instr::Const(u32::MAX),
+            Instr::Const(ConstId(0)),
+            Instr::Const(ConstId(127)),
+            Instr::Const(ConstId(128)),
+            Instr::Const(ConstId(0x4000)),
+            Instr::Const(ConstId(u32::MAX)),
             Instr::Nil,
             Instr::Pop,
-            Instr::LoadSlot(3),
-            Instr::LoadLocal { slot: 200, name: 5 },
-            Instr::LoadLocal { slot: 3, name: 5 },
-            Instr::LoadLocal {
-                slot: 300,
-                name: 70000,
-            },
-            Instr::LoadGlobal(70000),
-            Instr::StoreLocal(9),
-            Instr::Bind(1),
+            Instr::LoadSlot(SlotId(3)),
+            Instr::LoadGlobal(StringId(70000)),
+            Instr::StoreSlot(SlotId(9)),
+            Instr::Bind(PatId(1)),
             Instr::MakeList(2),
             Instr::MakeRecord(3),
             Instr::Unary(raft_ast::UnOpKind::Neg),
@@ -2642,17 +2575,13 @@ mod tests {
             Instr::BinaryInt(raft_ast::BinOpKind::Gt, 0),
             Instr::BinaryInt(raft_ast::BinOpKind::Le, 3),
             Instr::BinaryInt(raft_ast::BinOpKind::Ge, 1),
-            Instr::IncSlot { slot: 2, name: 9 },
-            Instr::DecSlot {
-                slot: 250,
-                name: 60000,
-            },
-            Instr::GetField(4),
+            Instr::IncSlot(SlotId(2)),
+            Instr::DecSlot(SlotId(250)),
+            Instr::GetField(StringId(4)),
             Instr::GetIndex,
-            Instr::SetField(6),
+            Instr::SetField(StringId(6)),
             Instr::SetIndex,
             Instr::Call(2),
-            Instr::CallBare,
             Instr::Jump(0), // → byte offset of instruction 0
             Instr::JumpIfFalse(5),
             Instr::IterInit,
@@ -2681,171 +2610,170 @@ mod tests {
         }
 
         // the small forms really are as small as promised
-        assert_eq!(encode(&[Instr::LoadSlot(3)]).len(), 1, "inline slot");
+        assert_eq!(
+            encode(&[Instr::LoadSlot(SlotId(3))]).len(),
+            1,
+            "inline slot"
+        );
         assert_eq!(
             encode(&[Instr::Binary(raft_ast::BinOpKind::Add)]).len(),
             1,
             "operator kind lives in the opcode"
         );
-        assert_eq!(encode(&[Instr::LoadSlot(200)]).len(), 2, "u8 slot");
-        assert_eq!(
-            encode(&[Instr::LoadLocal { slot: 3, name: 5 }]).len(),
-            2,
-            "inline slot + u8 name"
-        );
+        assert_eq!(encode(&[Instr::LoadSlot(SlotId(200))]).len(), 2, "u8 slot");
     }
 
     #[test]
     fn arithmetic_and_implicit_return() {
-        let rt = assert_modes_agree("fn add a b:\n    a + b\nr = add 1 2\n");
-        assert_eq!(int_var(&rt, "r"), 3);
+        let (mut rt, frame) = assert_modes_agree("fn add a b:\n    a + b\nr = add 1 2\n");
+        assert_eq!(int_var(&mut rt, &frame, "r"), 3);
     }
 
     #[test]
     fn explicit_return_and_operators() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn mix a b:\n    return a * b + (a << 2) - b / 2 + a ** 2\nr = mix 7 4\n",
         );
-        assert_eq!(int_var(&rt, "r"), 103);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 103);
     }
 
     #[test]
     fn currying_and_partial_application() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn add3 a b c:\n    return a + b + c\n\
              add1 = add3 1\nadd12 = add1 2\n\
              r1 = add12 3\nr2 = add3 10 20 30\nr3 = (add3 1) 2 3\n",
         );
-        assert_eq!(int_var(&rt, "r1"), 6);
-        assert_eq!(int_var(&rt, "r2"), 60);
-        assert_eq!(int_var(&rt, "r3"), 6);
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 6);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), 60);
+        assert_eq!(int_var(&mut rt, &frame, "r3"), 6);
     }
 
     #[test]
     fn over_application_carries_to_returned_function() {
         // `make_adder` returns a function; extra arguments are re-applied
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn add a b:\n    return a + b\n\
              fn make_adder a:\n    return add a\n\
              r = make_adder 3 4\n",
         );
-        assert_eq!(int_var(&rt, "r"), 7);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 7);
     }
 
     #[test]
     fn recursion() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn fib n:\n    if n < 2:\n        return n\n    return (fib (n - 1)) + (fib (n - 2))\n\
              r = fib 15\n",
         );
-        assert_eq!(int_var(&rt, "r"), 610);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 610);
     }
 
     #[test]
     fn while_loop_and_if_else_chain() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn collatz n:\n    steps = 0\n    while n != 1:\n        if n & 1 == 0:\n            n = n / 2\n        else:\n            n = 3 * n + 1\n        steps = steps + 1\n    return steps\n\
              r = collatz 27\n",
         );
-        assert_eq!(int_var(&rt, "r"), 111);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 111);
     }
 
     #[test]
     fn for_else_and_break() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn find xs needle:\n    idx = 0\n    for x in xs:\n        if x == needle:\n            break\n        idx = idx + 1\n    else:\n        return -1\n    return idx\n\
              ys = [10, 20, 30]\nr1 = find ys 20\nr2 = find ys 99\n",
         );
-        assert_eq!(int_var(&rt, "r1"), 1);
-        assert_eq!(int_var(&rt, "r2"), -1);
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 1);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), -1);
     }
 
     #[test]
     fn continue_in_for() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn sum_odds xs:\n    total = 0\n    for x in xs:\n        if x & 1 == 0:\n            continue\n        total = total + x\n    return total\n\
              ys = [1, 2, 3, 4, 5]\nr = sum_odds ys\n",
         );
-        assert_eq!(int_var(&rt, "r"), 9);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 9);
     }
 
     #[test]
     fn nested_for_with_inner_break() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn count:\n    total = 0\n    for i in [1, 2, 3]:\n        for j in [1, 2, 3]:\n            if j > i:\n                break\n            total = total + 1\n    return total\n\
              r = (count)\n",
         );
-        assert_eq!(int_var(&rt, "r"), 6);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 6);
     }
 
     #[test]
     fn while_else_and_break_skips_else() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn wloop n:\n    while n < 10:\n        if n > 3:\n            break\n        n = n + 1\n    else:\n        return -1\n    return n\n\
              r1 = wloop 0\nr2 = wloop 20\n",
         );
-        assert_eq!(int_var(&rt, "r1"), 4);
-        assert_eq!(int_var(&rt, "r2"), -1);
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 4);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), -1);
     }
 
     #[test]
     fn record_param_destructuring() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn dist2 { x, y }:\n    return x * x + y * y\n\
              r = dist2 { x: 3, y: 4 }\n",
         );
-        assert_eq!(int_var(&rt, "r"), 25);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 25);
     }
 
     #[test]
     fn list_param_destructuring_and_shorthand_record() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn swap [a, b]:\n    return [b, a]\n\
              fn wrap x:\n    name = x\n    return { name }\n\
              ys = [1, 2]\nr1 = swap ys\nr2 = wrap \"Ada\"\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "{name: Ada}");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "{name: Ada}");
     }
 
     #[test]
     fn field_and_index_mutation_inside_function() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn setup:\n    o = { a: 1 }\n    o.a = 5\n    xs = [1, 2]\n    xs[1] = 9\n    return [o.a, xs[1]]\n\
              r = (setup)\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r").unwrap()), "[5, 9]");
+        assert_eq!(format!("{}", frame.get_var("r", &mut rt)), "[5, 9]");
     }
 
     #[test]
     fn zero_arg_functions_called_bare_and_parenthesized() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn five:\n    return 5\n\
              fn ten:\n    (five) + (five)\n\
              r1 = (ten)\nr2 = (five)\n",
         );
-        assert_eq!(int_var(&rt, "r1"), 10);
-        assert_eq!(int_var(&rt, "r2"), 5);
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 10);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), 5);
     }
 
     #[test]
     fn last_statement_value_semantics() {
         // assignments yield nil, so a body ending in one returns nil;
         // an if with a false condition and no else also yields nil
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn assigns:\n    x = 5\n\
              fn cond_no_else n:\n    123\n    if n > 100:\n        456\n\
              r1 = (assigns)\nr2 = cond_no_else 1\nr3 = cond_no_else 1000\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "Nil");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "Nil");
-        assert_eq!(int_var(&rt, "r3"), 456);
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "Nil");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Nil");
+        assert_eq!(int_var(&mut rt, &frame, "r3"), 456);
     }
 
     #[test]
     fn loops_in_tail_position() {
         // a loop as the body's final statement: yields its else-block's
         // value on normal exit, nil on break exit or without an else
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn tail_while_else n:\n    while n > 0:\n        n = n - 1\n    else:\n        Done\n\
              fn tail_while_break n:\n    while True:\n        if n > 2:\n            break\n        n = n + 1\n    else:\n        Done\n\
              fn tail_while_bare n:\n    while n > 0:\n        n = n - 1\n\
@@ -2853,30 +2781,30 @@ mod tests {
              r1 = tail_while_else 3\nr2 = tail_while_break 0\nr3 = tail_while_bare 3\n\
              ys = [7, 8]\nr4 = tail_for ys\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "Done");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "Nil");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "Nil");
-        assert_eq!(format!("{}", rt.get_var("r4").unwrap()), "8");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "Done");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Nil");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "Nil");
+        assert_eq!(format!("{}", frame.get_var("r4", &mut rt)), "8");
     }
 
     #[test]
     fn nested_fn_definitions_and_atoms() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn classify n:\n    fn sign x:\n        if x > 0:\n            return Pos\n        if x < 0:\n            return Neg\n        return Zero\n    return sign n\n\
              r1 = classify 5\nr2 = classify (-5)\nr3 = classify 0\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "Pos");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "Neg");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "Zero");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "Pos");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Neg");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "Zero");
     }
 
     #[test]
     fn iterating_records_and_strings_of_ops() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn count_fields rec:\n    n = 0\n    for f in rec:\n        n = n + 1\n    return n\n\
              r = count_fields { a: 1, b: 2, c: 3 }\n",
         );
-        assert_eq!(int_var(&rt, "r"), 3);
+        assert_eq!(int_var(&mut rt, &frame, "r"), 3);
     }
 
     #[test]
@@ -2918,17 +2846,19 @@ mod tests {
         let mut rt = Runtime::new();
         rt.set_compile_fns(true);
         rt.register_function("emit", 0, None, move |rt, args| {
-            for a in rt.vm.drain_off_stack(args).rev() {
+            for a in rt.stack.drain_top(args).rev() {
                 sink.borrow_mut().push(format!("{a}"));
             }
-            Any::nil()
+            Val::nil()
         });
 
+        let frame = Rc::new(Frame::new());
+
         for statement in &stmts {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
         for statement in &ast_from_str("shout 21\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         assert_eq!(*seen.borrow(), vec!["21".to_string(), "42".to_string()]);
@@ -2938,7 +2868,7 @@ mod tests {
     fn all_pattern_kinds_bind_identically_in_both_modes() {
         // atom tags, literal matches, and nested destructuring — every
         // CompiledPat variant, checked against the walker's bind_pattern
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn area { kind: Circle, radius }:\n    return radius * radius * 3\n\
              fn greet \"hi\" name:\n    return name\n\
              fn is_x 'x':\n    return True\n\
@@ -2960,15 +2890,15 @@ mod tests {
              r8 = twon 2.0 44\n\
              r9 = threef 3.0 45\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "12");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "Ada");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "True");
-        assert_eq!(format!("{}", rt.get_var("r4").unwrap()), "5");
-        assert_eq!(format!("{}", rt.get_var("r5").unwrap()), "One");
-        assert_eq!(format!("{}", rt.get_var("r6").unwrap()), "42");
-        assert_eq!(format!("{}", rt.get_var("r7").unwrap()), "43");
-        assert_eq!(format!("{}", rt.get_var("r8").unwrap()), "44");
-        assert_eq!(format!("{}", rt.get_var("r9").unwrap()), "45");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "12");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Ada");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "True");
+        assert_eq!(format!("{}", frame.get_var("r4", &mut rt)), "5");
+        assert_eq!(format!("{}", frame.get_var("r5", &mut rt)), "One");
+        assert_eq!(format!("{}", frame.get_var("r6", &mut rt)), "42");
+        assert_eq!(format!("{}", frame.get_var("r7", &mut rt)), "43");
+        assert_eq!(format!("{}", frame.get_var("r8", &mut rt)), "44");
+        assert_eq!(format!("{}", frame.get_var("r9", &mut rt)), "45");
 
         // mismatches fail identically too — suffixes pin the type: an
         // unsuffixed `1` matches float 1.0, but `1i` matches integers only
@@ -2987,13 +2917,13 @@ mod tests {
         }
 
         // `1` as a pattern matches the float 1.0
-        let rt = assert_modes_agree("fn one 1 x:\n    return x\nr = one 1.0 7\n");
-        assert_eq!(format!("{}", rt.get_var("r").unwrap()), "7");
+        let (mut rt, frame) = assert_modes_agree("fn one 1 x:\n    return x\nr = one 1.0 7\n");
+        assert_eq!(format!("{}", frame.get_var("r", &mut rt)), "7");
     }
 
     #[test]
     fn number_patterns_match_exactly() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn inf_pat 1e999:\n    return Inf\n\
              fn zero 0f:\n    return Zero\n\
              fn big 9007199254740993:\n    return Big\n\
@@ -3002,10 +2932,10 @@ mod tests {
              r3 = big 9007199254740993\n",
         );
         // +inf matches +inf (the old |a-b| < ε test gave NaN for these)
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "Inf");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "Inf");
         // -0.0 matches 0.0, like the language's own `==`
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "Zero");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "Big");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Zero");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "Big");
 
         for src in [
             // exact means exact: no epsilon tolerance
@@ -3027,7 +2957,7 @@ mod tests {
 
     #[test]
     fn underscore_matches_anything_and_binds_nothing() {
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn snd _ b:\n    return b\n\
              fn mid [_, m, _]:\n    return m\n\
              fn tag { kind: _, id }:\n    return id\n\
@@ -3041,17 +2971,17 @@ mod tests {
              r4 = count xs\n\
              r5 = discard 3\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "2");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "8");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "5");
-        assert_eq!(format!("{}", rt.get_var("r4").unwrap()), "3");
-        assert_eq!(format!("{}", rt.get_var("r5").unwrap()), "3");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "2");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "8");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "5");
+        assert_eq!(format!("{}", frame.get_var("r4", &mut rt)), "3");
+        assert_eq!(format!("{}", frame.get_var("r5", &mut rt)), "3");
         // `_` was never bound anywhere along the way
-        assert!(rt.get_var("_").is_none());
+        assert!(!frame.get_var("_", &mut rt).is_init());
 
         // names merely *starting* with an underscore bind normally
-        let rt = assert_modes_agree("fn keep _a:\n    return _a\nr = keep 42\n");
-        assert_eq!(format!("{}", rt.get_var("r").unwrap()), "42");
+        let (mut rt, frame) = assert_modes_agree("fn keep _a:\n    return _a\nr = keep 42\n");
+        assert_eq!(format!("{}", frame.get_var("r", &mut rt)), "42");
 
         // `_` never binds, so *reading* it finds nothing (unless a global
         // named `_` exists) — an unbound-identifier error in both modes
@@ -3066,66 +2996,61 @@ mod tests {
         // `count` is assigned in the body, so it is a local slot — but the
         // read on the right-hand side happens before the store, and must
         // reach the *global* `count`; the global stays untouched after
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "count = 10\n\
              fn bump:\n    count = count + 1\n    return count\n\
              r1 = (bump)\nr2 = (bump)\nr3 = count\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "11");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "11");
-        assert_eq!(format!("{}", rt.get_var("r3").unwrap()), "10");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "11");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "11");
+        assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "10");
 
         // reassigning a parameter reuses the parameter's own slot
-        let rt = assert_modes_agree(
+        let (mut rt, frame) = assert_modes_agree(
             "fn inc n:\n    n = n + 1\n    return n\n\
              fn swap_halves [a, b]:\n    t = a\n    a = b\n    b = t\n    return [a, b]\n\
              xs = [1, 2]\n\
              r1 = inc 41\nr2 = swap_halves xs\n",
         );
-        assert_eq!(format!("{}", rt.get_var("r1").unwrap()), "42");
-        assert_eq!(format!("{}", rt.get_var("r2").unwrap()), "[2, 1]");
+        assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "42");
+        assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "[2, 1]");
     }
 
     #[test]
     fn pools_are_shared_and_deduplicated_across_functions() {
         let mut rt = Runtime::new();
         rt.set_compile_fns(true);
+        let frame = Rc::new(Frame::new());
         for statement in &ast_from_str(
             "fn inc n:\n    return (shift n) + 1.5\n\
              fn dec n:\n    return (shift n) - 1.5\n\
              fn one:\n    return 1\n",
         ) {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
-        // local names are frame slots and never touch the name pool...
-        assert_eq!(
-            rt.vm.names.iter().filter(|m| &m[..] == "n").count(),
-            0,
-            "slot-resolved local `n` should not be interned"
-        );
         // ...while both functions reference the global `shift` and the
         // constant 1.5 through single shared pool entries
         assert_eq!(
-            rt.vm.names.iter().filter(|m| &m[..] == "shift").count(),
+            rt.ctx.strings.iter().filter(|m| &m[..] == "shift").count(),
             1,
             "global name `shift` interned more than once"
         );
         assert_eq!(
-            rt.vm
+            rt.ctx
                 .consts
                 .iter()
-                .filter(|c| matches!(c, Any::Number(Number::Float(f)) if *f == 1.5))
+                .filter(|c| matches!(c, Val::Number(Number::Float(f)) if *f == 1.5))
                 .count(),
             1,
             "constant 1.5 interned more than once"
         );
         // integers ride in opcodes/payloads and never enter the pool
         assert_eq!(
-            rt.vm
+            rt.ctx
                 .consts
                 .iter()
-                .filter(|c| matches!(c, Any::Number(Number::Integer(_))))
+                .filter(|c| matches!(c, Val::Number(Number::Integer(_))))
                 .count(),
             0,
             "integers should be immediates, not pool constants"
@@ -3140,69 +3065,71 @@ mod tests {
         // a host function that reports how deep the caller's frame is —
         // reading the runtime's operand stack mid-call, as promised
         rt.register_function("depth", 0, Some(0), |rt, _args| {
-            Any::Number(Number::Integer(rt.vm.stack.len() as i64))
+            Val::Number(Number::Integer(rt.stack.len() as i64))
         });
 
+        let frame = Rc::new(Frame::new());
         for statement in &ast_from_str(
             "fn probe:\n    return 100 + (depth)\n\
              fn fib n:\n    if n < 2:\n        return n\n    return (fib (n - 1)) + (fib (n - 2))\n",
         ) {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         // inside `probe` the temporary `100` sits on the stack when
         // `depth` runs, so it reports 1
         for statement in &ast_from_str("r = (probe)\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
-        assert_eq!(format!("{}", rt.get_var("r").unwrap()), "101");
+        assert_eq!(format!("{}", frame.get_var("r", &mut rt)), "101");
 
         // recursion nests frames on the one shared stack and unwinds fully
         for statement in &ast_from_str("f = fib 12\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
-        assert_eq!(format!("{}", rt.get_var("f").unwrap()), "144");
-        assert!(rt.vm.stack.is_empty(), "stack not restored after calls");
+        assert_eq!(format!("{}", frame.get_var("f", &mut rt)), "144");
+        assert!(rt.stack.is_empty(), "stack not restored after calls");
 
         // ...and is restored even when a frame errors out mid-expression
         let stmts = ast_from_str("fn bad n:\n    return n + nosuchvar\nfib (bad 1)\n");
         for statement in &stmts[..1] {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
-        assert!(rt.exec_stmt(&stmts[1]).is_err());
-        assert!(rt.vm.stack.is_empty(), "stack not restored after error");
+        assert!(rt.exec_stmt(&stmts[1], frame.clone()).is_err());
+        assert!(rt.stack.is_empty(), "stack not restored after error");
     }
 
     #[test]
     fn modes_mix_in_one_runtime() {
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
 
         // `double` walks the AST...
         rt.set_compile_fns(false);
         for statement in &ast_from_str("fn double x:\n    return x * 2\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         // ...`quad` runs on the VM and calls `double`...
         rt.set_compile_fns(true);
         for statement in &ast_from_str("fn quad x:\n    return double (double x)\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         // ...`octo` walks the AST again and calls compiled `quad`...
         rt.set_compile_fns(false);
         for statement in &ast_from_str("fn octo x:\n    return double (quad x)\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         // ...and the top level is interpreted from the AST.
         for statement in &ast_from_str("r = octo 5\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
 
         assert_eq!(
-            match rt.get_var("r") {
-                Some(Any::Number(Number::Integer(i))) => i,
+            match frame.get_var("r", &mut rt) {
+                Val::Number(Number::Integer(i)) => i,
                 other => panic!("unexpected {other:?}"),
             },
             40
@@ -3212,13 +3139,14 @@ mod tests {
     #[test]
     fn top_level_expression_sees_compiled_function() {
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         rt.set_compile_fns(true);
         for statement in &ast_from_str("fn triple x:\n    return x * 3\n") {
-            rt.exec_stmt(statement).unwrap();
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
         // interpreted expression calling into bytecode
         let stmts = ast_from_str("triple 14\n");
-        let Exec::Value(v) = rt.exec_stmt(&stmts[0]).unwrap() else {
+        let Exec::Value(v) = rt.exec_stmt(&stmts[0], frame.clone()).unwrap() else {
             panic!("expected value");
         };
         assert_eq!(format!("{v}"), "42");

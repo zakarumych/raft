@@ -8,7 +8,7 @@ and easy to reason about.
 > **Status: early / work in progress.** The lexer, parser, tree-walking
 > runtime and REPL are functional, including user-defined functions with
 > currying. The language is still missing pieces you'd expect from a
-> "complete" language (modules, a standard library, real closures — see
+> "complete" language (a standard library, real closures — see
 > [Roadmap](#roadmap)). APIs and syntax may change without notice.
 
 ## Project layout
@@ -278,6 +278,42 @@ tag-directed control flow — see [Roadmap](#roadmap).
 Lists and records are mutable heap objects by default and can be frozen
 (from host code) to prevent further mutation.
 
+### Modules
+
+A module is a file of Raft code whose **tail statement must be
+`export { .. }`** (using record syntax, shorthand included). Importing a
+module executes its code once in a fresh environment and turns the export
+into an immutable, record-shaped module object; repeated imports return
+the cached object. Because module bindings can never change after the
+load, functions defined in a module capture its environment — they keep
+seeing the module's values and helper functions wherever they are called:
+
+```raft
+// geometry.raft
+pi = 3
+fn sq x:
+    return x * x
+fn area r:
+    return pi * (sq r)
+export { pi, sq, area }
+```
+
+```raft
+geo = import "geometry"
+geo.area 5          // 75
+{ sq } = geo        // record patterns destructure modules
+```
+
+The export must be in tail position, which permits conditional exports:
+an `if`/`else` whose branches all end in an `export` is a valid module
+tail. Module code reads the importer's globals (so host functions like
+`print` are available), but its own bindings never leak out; `_` aside,
+whatever is not exported is private. Circular imports are an error.
+
+`import` itself is a host function (the bundled REPL maps
+`import "name"` to loading `name.raft`); embedders wire their own source
+lookup and call `Runtime::load_module(name, source)`.
+
 ### Embedding host functions
 
 Every callable — `fn`-defined (AST-walked or bytecode-compiled), partially
@@ -381,7 +417,6 @@ Raft is under active development. Notable gaps today:
   a function, dispatched by matching each call's arguments against a
   different parameter pattern, is planned (see
   [No user-defined types](#no-user-defined-types)).
-- No module or import system.
 - No standard library.
 
 Contributions and ideas are welcome while the language design is still

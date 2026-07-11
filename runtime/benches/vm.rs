@@ -3,11 +3,11 @@
 //!
 //! Run with `cargo bench -p raft-runtime` or `cargo criterion`.
 
-use std::hint::black_box;
+use std::{hint::black_box, rc::Rc};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use raft_ast::{Stmt, StmtKind};
-use raft_runtime::{Runtime, vm};
+use raft_runtime::{Frame, Runtime, vm};
 
 fn parse(src: &str) -> Vec<Stmt> {
     let tokens = raft_ast::lexer::parse_str(src, &raft_ast::lexer::Options::wss()).unwrap();
@@ -15,13 +15,16 @@ fn parse(src: &str) -> Vec<Stmt> {
     Stmt::parse_many(&mut stream).unwrap()
 }
 
-fn runtime_with(defs: &str, compiled: bool) -> Runtime {
+fn runtime_with(defs: &str, compiled: bool) -> (Runtime, Rc<Frame>) {
     let mut rt = Runtime::new();
     rt.set_compile_fns(compiled);
-    for stmt in &parse(defs) {
-        rt.exec_stmt(stmt).unwrap();
+    let frame = Rc::new(Frame::new());
+
+    for stmt in parse(defs) {
+        rt.exec_stmt(&stmt, frame.clone()).unwrap();
     }
-    rt
+    
+    (rt, frame)
 }
 
 /// Benchmark executing `call` (with functions from `defs` predefined) in
@@ -31,11 +34,11 @@ fn bench_modes(c: &mut Criterion, group: &str, defs: &str, call: &str) {
     let call_stmts = parse(call);
 
     for (mode, compiled) in [("ast-walk", false), ("bytecode", true)] {
-        let mut rt = runtime_with(defs, compiled);
+        let (mut rt, frame) = runtime_with(defs, compiled);
         g.bench_function(mode, |b| {
             b.iter(|| {
                 for stmt in &call_stmts {
-                    black_box(rt.exec_stmt(stmt).unwrap());
+                    black_box(rt.exec_stmt(stmt, frame.clone()).unwrap());
                 }
             })
         });
@@ -96,19 +99,43 @@ fn bench_python(c: &mut Criterion, group: &str, defs: &str, call: &str) {
     g.finish();
 }
 
-const FIB: &str =
-    "fn fib n:\n  if n < 2: return n\n  fib (n - 1) + fib (n - 2)\n";
+const FIB: &str = "fn fib n:\n  if n < 2: return n\n  fib (n - 1) + fib (n - 2)\n";
 
 const FIB_PY: &str =
-    "def fib(n):\n    if n < 2:\n        return n\n    return (fib (n - 1)) + (fib (n - 2))\n";
+    "def fib(n):\n  if n < 2:\n    return n\n  return (fib (n - 1)) + (fib (n - 2))\n";
 
-const LOOP_1000: &str = "fn count n:\n    i = 0\n    total = 0\n    while i < n:\n        total = total + i * 2 - i\n        i = i + 1\n    return total\n";
-const LOOP_1000_PY: &str = "def count(n):\n    i = 0\n    total = 0\n    while i < n:\n        total = total + i * 2 - i\n        i = i + 1\n    return total\n";
+const LOOP_1000: &str = "fn count n:\n  i = 0\n  total = 0\n  while i < n:\n    total = total + i * 2 - i\n    i = i + 1\n  total\n";
+const LOOP_1000_PY: &str = "def count(n):\n  i = 0\n  total = 0\n  while i < n:\n    total = total + i * 2 - i\n    i = i + 1\n  return total\n";
 
-const COLLATZ: &str = "fn collatz n:\n    steps = 0\n    while n != 1:\n        if n & 1 == 0:\n            n = n / 2\n        else:\n            n = 3 * n + 1\n        steps = steps + 1\n    return steps\n";
-const COLLATZ_PY: &str = "def collatz(n):\n    steps = 0\n    while n != 1:\n        if n & 1 == 0:\n            n = int(n / 2)\n        else:\n            n = 3 * n + 1\n        steps = steps + 1\n    return steps\n";
+const COLLATZ: &str = "fn collatz n:\n  steps = 0\n  while n != 1:\n    if n & 1 == 0:\n      n = n / 2\n    else:\n      n = 3 * n + 1\n    steps = steps + 1\n  steps\n";
+const COLLATZ_PY: &str = "def collatz(n):\n  steps = 0\n  while n != 1:\n    if n & 1 == 0:\n      n = int(n / 2)\n    else:\n      n = 3 * n + 1\n    steps = steps + 1\n  return steps\n";
 
 /// Recursion / call-heavy workload.
+fn fib_module(c: &mut Criterion) {
+    // fib defined in a module: recursive calls resolve statically to the
+    // module slot (final-fn analysis) instead of a global hash lookup
+    let mut g = c.benchmark_group("fib-15-module");
+    let mut rt = Runtime::new();
+    rt.set_compile_fns(true);
+    let module = rt
+        .load_module("fibmod", &(FIB.to_string() + "export { fib }\n"))
+        .unwrap();
+    rt.set_var("m", module);
+    let frame = Rc::new(Frame::new());
+    for stmt in parse("fib = m.fib\n") {
+        rt.exec_stmt(&stmt, frame.clone()).unwrap();
+    }
+    let call_stmts = parse("fib 15\n");
+    g.bench_function("bytecode", |b| {
+        b.iter(|| {
+            for stmt in &call_stmts {
+                black_box(rt.exec_stmt(stmt, frame.clone()).unwrap());
+            }
+        })
+    });
+    g.finish();
+}
+
 fn fib(c: &mut Criterion) {
     bench_modes(c, "fib-15", FIB, "fib 15\n");
     bench_python(c, "fib-15", FIB_PY, "fib(15)\n");
@@ -167,40 +194,37 @@ fn collatz(c: &mut Criterion) {
 /// dozen small helpers — records, lists, atoms, destructuring, bit ops.
 /// Call-heavy but without recursion, resembling ordinary scripting code.
 const PIPELINE: &str = r#"fn imod a n:
-    return a - (a / n) * n
+    a - (a / n) * n
 
 fn iabs x:
     if x < 0:
         return 0 - x
-    return x
+    x
 
 fn imin a b:
-    if a < b:
-        return a
-    return b
+    if a < b: return a
+    b
 
 fn imax a b:
-    if a > b:
-        return a
-    return b
+    if a > b: return a
+    b
 
 fn clamp lo hi x:
-    return imax lo (imin hi x)
+    imax lo (imin hi x)
 
 fn tri n:
-    return n * (n + 1) / 2
+    n * (n + 1) / 2
 
 fn parity n:
-    if (n & 1) == 0:
-        return Even
-    return Odd
+    if (n & 1) == 0: return Even
+    Odd
 
 fn digits n:
     total = 0
     while n > 0:
         total = total + (imod n 10)
         n = n / 10
-    return total
+    total
 
 fn classify n:
     if (imod n 15) == 0:
@@ -209,7 +233,7 @@ fn classify n:
         return Fizz
     if (imod n 5) == 0:
         return Buzz
-    return Plain
+    Plain
 
 fn score tag:
     if tag == FizzBuzz:
@@ -218,13 +242,13 @@ fn score tag:
         return 3
     if tag == Buzz:
         return 5
-    return 1
+    1
 
 fn weight { lo, hi } x:
-    return clamp lo hi (x * 2 - 7)
+    clamp lo hi (x * 2 - 7)
 
 fn stats_new:
-    return { total: 0, evens: 0, odds: 0, peak: 0, tags: 0 }
+    { total: 0, evens: 0, odds: 0, peak: 0, tags: 0 }
 
 fn process items bounds:
     st = (stats_new)
@@ -244,7 +268,7 @@ fn process items bounds:
             st.peak = combo
         st.total = st.total + combo
         st.tags = st.tags + pts
-    return st
+    st
 
 fn crunch rounds:
     items = [3, 7, 12, 19, 4, 25, 8, 30, 11, 6, 21, 14, 9, 16, 5]
@@ -256,7 +280,7 @@ fn crunch rounds:
         { total, peak } = st
         acc = acc + total + peak - (st.evens * st.odds) + (tri r)
         r = r + 1
-    return acc
+    acc
 "#;
 
 const PIPELINE_PY: &str = r#"def imod(a, n):
@@ -357,11 +381,11 @@ fn pipeline(c: &mut Criterion) {
     let results: Vec<String> = [false, true]
         .iter()
         .map(|&compiled| {
-            let mut rt = runtime_with(PIPELINE, compiled);
+            let (mut rt, frame) = runtime_with(PIPELINE, compiled);
             for stmt in &parse("r = crunch 10\n") {
-                rt.exec_stmt(stmt).unwrap();
+                rt.exec_stmt(stmt, frame.clone()).unwrap();
             }
-            format!("{}", rt.get_var("r").unwrap())
+            format!("{}", frame.get_var("r", &mut rt))
         })
         .collect();
     assert_eq!(results[0], results[1], "modes disagree on pipeline result");
@@ -396,11 +420,11 @@ fn binding(c: &mut Criterion) {
             "fn f n:\n    p = {{ x: 3, y: 4 }}\n    q = [3, 4]\n    t = \"abc\"\n    x = 3\n    y = 4\n    i = 0\n    s = 0\n    while i < n:\n{body}        s = s + x - y\n        i = i + 1\n    return s\n"
         );
         let call_stmts = parse("f 100\n");
-        let mut rt = runtime_with(&defs, true);
+        let (mut rt, frame) = runtime_with(&defs, true);
         g.bench_function(name, |b| {
             b.iter(|| {
                 for stmt in &call_stmts {
-                    black_box(rt.exec_stmt(stmt).unwrap());
+                    black_box(rt.exec_stmt(stmt, frame.clone()).unwrap());
                 }
             })
         });
@@ -426,10 +450,19 @@ fn compile(c: &mut Criterion) {
         let StmtKind::Fn { params, body, .. } = stmts[0].kind() else {
             panic!("expected fn stmt");
         };
+
+        struct Cx {
+            rt: Runtime,
+            frame: Rc<Frame>,
+        }
+
         g.bench_function(name, |b| {
             b.iter_batched(
-                vm::VmContext::new,
-                |mut ctx| vm::compile_fn(&mut ctx, params.clone(), body).unwrap(),
+                || Cx {
+                    rt: Runtime::new(),
+                    frame: Rc::new(Frame::new()),
+                },
+                |mut cx| vm::compile_fn(&mut cx.rt, params.clone(), body, cx.frame.clone()).unwrap(),
                 BatchSize::SmallInput,
             )
         });
@@ -437,5 +470,7 @@ fn compile(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, fib, tight_loop, collatz, pipeline, calls, binding, compile);
+criterion_group!(
+    benches, fib, fib_module, tight_loop, collatz, pipeline, calls, binding, compile
+);
 criterion_main!(benches);

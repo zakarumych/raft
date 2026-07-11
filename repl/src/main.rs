@@ -1,13 +1,14 @@
 use std::{io::Write, rc::Rc};
 
 use raft_ast::{lexer::LexErrorKind, parser::ParseErrorKind};
-use raft_runtime::{Any, Exec};
+use raft_runtime::{Val, Exec};
 
 fn main() {
     std::io::stdout().write_all(b"Raft REPL\n").unwrap();
     std::io::stdout().flush().unwrap();
 
     let mut rt = raft_runtime::Runtime::new();
+    let root = Rc::new(raft_runtime::Frame::new());
 
     // `fn` statements compile to bytecode unless --no-vm is given;
     // top-level statements are always interpreted from the AST.
@@ -16,26 +17,74 @@ fn main() {
     let quit_flag = Rc::new(std::cell::Cell::new(false));
 
     // print takes any number of arguments, quit takes exactly none
-    rt.set_var("print", Any::host_function(0, None, |rt, args| {
-        for arg in rt.vm.drain_off_stack(args).rev() {
-            println!("{}", arg);
-        }
-        Any::nil()
-    }));
+    rt.set_var(
+        "print",
+        Val::host_function(0, None, |rt, args| {
+            for arg in rt.stack.drain_top(args).rev() {
+                println!("{}", arg);
+            }
+            Val::nil()
+        }),
+    );
 
     // print takes any number of arguments, quit takes exactly none
-    rt.set_var("debugfmt", Any::host_function(0, None, |rt, args| {
-        for arg in rt.vm.drain_off_stack(args).rev() {
-            println!("{:#?}", arg);
-        }
-        Any::nil()
-    }));
+    rt.set_var(
+        "debugfmt",
+        Val::host_function(0, None, |rt, args| {
+            for arg in rt.stack.drain_top(args).rev() {
+                println!("{:#?}", arg);
+            }
+            Val::nil()
+        }),
+    );
 
     let quit_flag_clone = quit_flag.clone();
-    rt.set_var("quit", Any::host_function(0, Some(0), move |_rt, _args| {
-        quit_flag_clone.set(true);
-        Any::nil()
-    }));
+    rt.set_var(
+        "quit",
+        Val::host_function(0, Some(0), move |_rt, _args| {
+            quit_flag_clone.set(true);
+            Val::nil()
+        }),
+    );
+
+    // import "name" loads ./name.raft (or ./name) as a module: the file is
+    // executed once, its `export { .. }` becomes the module object, and
+    // repeated imports return the cached module
+    rt.set_var(
+        "import",
+        Val::host_function(1, Some(1), |rt, args| {
+            let mut popped = rt.stack.drain_top(args);
+            let name = popped.next();
+            drop(popped);
+            let Some(Val::String(name)) = name else {
+                rt.set_error(raft_runtime::RuntimeError::TypeError(
+                    "import expects a module name string".into(),
+                ));
+                return Val::nil();
+            };
+
+            let path = format!("{name}.raft");
+            let source =
+                std::fs::read_to_string(&path).or_else(|_| std::fs::read_to_string(&name[..]));
+            let source = match source {
+                Ok(source) => source,
+                Err(e) => {
+                    rt.set_error(raft_runtime::RuntimeError::Other(
+                        format!("cannot read module '{name}': {e}").into(),
+                    ));
+                    return Val::nil();
+                }
+            };
+
+            match rt.load_module(&name, &source) {
+                Ok(module) => module,
+                Err(e) => {
+                    rt.set_error(e);
+                    Val::nil()
+                }
+            }
+        }),
+    );
 
     let mut lines = String::new();
 
@@ -53,7 +102,8 @@ fn main() {
         }
 
         // Remove one last occurrence of '\n', '\r' or '\r\n' from the end of the string
-        let stripped = lines.strip_suffix("\r\n")
+        let stripped = lines
+            .strip_suffix("\r\n")
             .or_else(|| lines.strip_suffix('\n'))
             .or_else(|| lines.strip_suffix('\r'))
             .unwrap_or(&lines[..]);
@@ -66,9 +116,9 @@ fn main() {
                         lines.clear();
 
                         for statement in &stmts {
-                            match rt.exec_stmt(&statement) {
+                            match rt.exec_stmt(&statement, root.clone()) {
                                 Ok(Exec::Value(value)) => {
-                                    if value != Any::nil() {
+                                    if value != Val::nil() {
                                         println!("{}", value);
                                     }
                                 }

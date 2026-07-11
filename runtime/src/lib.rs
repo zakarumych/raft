@@ -2,17 +2,26 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
-use core::{cell::RefCell, cmp::Ordering, fmt};
-use smallvec::SmallVec;
-use std::{
-    collections::HashMap,
+use alloc::{rc::Rc, vec::Vec};
+
+use core::{
+    cell::RefCell,
+    cmp::Ordering,
+    fmt,
     hash::{Hash, Hasher},
 };
 
+use smallvec::SmallVec;
+
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
 
+use crate::vm::CompiledPat;
+
 pub mod vm;
+
+type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
+
+type FixedHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;
 
 #[derive(Copy, Clone)]
 pub enum Number {
@@ -59,7 +68,7 @@ impl Number {
         match (self, rhs) {
             (Number::Integer(i1), Number::Integer(i2)) => {
                 if i2 == 0 {
-                    return Err(RuntimeError::Other("division by zero".to_owned()));
+                    return Err(RuntimeError::Other("division by zero".into()));
                 }
                 Ok(Number::Integer(i1 / i2))
             }
@@ -120,8 +129,11 @@ impl fmt::Display for Number {
 // Object kinds
 #[derive(Debug)]
 pub enum ObjectKind {
-    List(Vec<Any>),
-    Record(BTreeMap<Rc<str>, Any>),
+    List(Vec<Val>),
+    Record(FixedHashMap<Rc<str>, Val>),
+    /// An imported module's exported bindings. Record-shaped (field access
+    /// and record patterns work on it) but immutable by construction.
+    Module(FixedHashMap<Rc<str>, Val>),
 }
 
 #[derive(Debug)]
@@ -156,12 +168,22 @@ impl fmt::Display for Object {
                 }
                 write!(f, "}}")
             }
+            ObjectKind::Module(fields) => {
+                write!(f, "module {{")?;
+                for (i, (key, value)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", key, value)?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
 
 impl Object {
-    pub fn new_list(elements: Vec<Any>) -> Self {
+    pub fn new_list(elements: Vec<Val>) -> Self {
         Object {
             kind: ObjectKind::List(elements),
             frozen: false,
@@ -169,7 +191,7 @@ impl Object {
         }
     }
 
-    pub fn new_record(fields: BTreeMap<Rc<str>, Any>) -> Self {
+    pub fn new_record(fields: FixedHashMap<Rc<str>, Val>) -> Self {
         Object {
             kind: ObjectKind::Record(fields),
             frozen: false,
@@ -195,6 +217,20 @@ impl Object {
                 Some(v1.len().cmp(&v2.len()))
             }
             _ => None, // different kinds are considered incomparable
+        }
+    }
+
+    pub fn get_field(&self, key: &str) -> Option<Val> {
+        match &self.kind {
+            ObjectKind::Record(fields) | ObjectKind::Module(fields) => fields.get(key).cloned(),
+            _ => None,
+        }
+    }
+
+    pub fn get_index(&self, index: usize) -> Option<Val> {
+        match &self.kind {
+            ObjectKind::List(elements) => elements.get(index).cloned(),
+            _ => None,
         }
     }
 }
@@ -280,119 +316,158 @@ impl fmt::Display for Atom {
 
 // Value reference used by interpreter. Clone cheap for literals and Rc for heap objects.
 #[derive(Clone)]
-pub enum Any {
+pub enum Val {
     Number(Number),
     Char(char),
     String(Rc<str>),
     Atom(Atom),                    // atoms like True/False or symbols
     Object(Rc<RefCell<Object>>),   // lists and records live here
-    Fn(FnValue),                   // function value: fn-defined (AST or bytecode), partial, or host
+    Fn(FnVal),                     // function value: fn-defined (AST or bytecode), partial, or host
     Opaque(Rc<dyn std::any::Any>), // opaque value, uninterpretable by raft code
     /// Internal sentinel: a local slot that has not been assigned yet
     /// (reads of it fall back to the global scope). Never observable from
     /// Raft code or host functions.
+    #[doc(hidden)]
     Uninit,
 }
 
-impl core::cmp::PartialEq for Any {
+impl core::cmp::PartialEq for Val {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Some(Ordering::Equal)
     }
 }
 
-impl fmt::Debug for Any {
+impl fmt::Debug for Val {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() {
             match self {
-                Any::Number(n) => write!(f, "Number({:#?})", n),
-                Any::Char(c) => write!(f, "Char({:#?})", c),
-                Any::String(s) => write!(f, "String({:#?})", s),
-                Any::Atom(a) => write!(f, "Atom({:#?})", a),
-                Any::Object(o) => write!(f, "Object({:#?})", o.borrow()),
-                Any::Fn(fun) => write!(f, "{:#?}", fun),
-                Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
-                Any::Uninit => write!(f, "<uninit>"),
+                Val::Number(n) => write!(f, "Number({:#?})", n),
+                Val::Char(c) => write!(f, "Char({:#?})", c),
+                Val::String(s) => write!(f, "String({:#?})", s),
+                Val::Atom(a) => write!(f, "Atom({:#?})", a),
+                Val::Object(o) => write!(f, "Object({:#?})", o.borrow()),
+                Val::Fn(fun) => write!(f, "{:#?}", fun),
+                Val::Opaque(val) => write!(f, "Opaque({:p})", &**val),
+                Val::Uninit => write!(f, "<uninit>"),
             }
         } else {
             match self {
-                Any::Number(n) => write!(f, "Number({:?})", n),
-                Any::Char(c) => write!(f, "Char({:?})", c),
-                Any::String(s) => write!(f, "String({:?})", s),
-                Any::Atom(a) => write!(f, "Atom({:?})", a),
-                Any::Object(o) => write!(f, "Object({:?})", o.borrow()),
-                Any::Fn(fun) => write!(f, "{:?}", fun),
-                Any::Opaque(val) => write!(f, "Opaque({:p})", &**val),
-                Any::Uninit => write!(f, "<uninit>"),
+                Val::Number(n) => write!(f, "Number({:?})", n),
+                Val::Char(c) => write!(f, "Char({:?})", c),
+                Val::String(s) => write!(f, "String({:?})", s),
+                Val::Atom(a) => write!(f, "Atom({:?})", a),
+                Val::Object(o) => write!(f, "Object({:?})", o.borrow()),
+                Val::Fn(fun) => write!(f, "{:?}", fun),
+                Val::Opaque(val) => write!(f, "Opaque({:p})", &**val),
+                Val::Uninit => write!(f, "<uninit>"),
             }
         }
     }
 }
 
-impl fmt::Display for Any {
+impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Any::Number(n) => write!(f, "{}", n),
-            Any::Char(c) => write!(f, "{}", c),
-            Any::String(s) => write!(f, "{}", s),
-            Any::Atom(a) => write!(f, "{}", a),
-            Any::Object(o) => write!(f, "{}", o.borrow()),
-            Any::Fn(_) => write!(f, "<fn>"),
-            Any::Opaque(val) => write!(f, "{:p}", &**val),
-            Any::Uninit => write!(f, "<uninit>"),
+            Val::Number(n) => write!(f, "{}", n),
+            Val::Char(c) => write!(f, "{}", c),
+            Val::String(s) => write!(f, "{}", s),
+            Val::Atom(a) => write!(f, "{}", a),
+            Val::Object(o) => write!(f, "{}", o.borrow()),
+            Val::Fn(_) => write!(f, "<fn>"),
+            Val::Opaque(val) => write!(f, "{:p}", &**val),
+            Val::Uninit => write!(f, "<uninit>"),
         }
     }
 }
 
-impl Any {
+impl Val {
     #[inline]
     pub fn bool_(b: bool) -> Self {
         match b {
-            true => Any::Atom(Atom::True),
-            false => Any::Atom(Atom::False),
+            true => Val::Atom(Atom::True),
+            false => Val::Atom(Atom::False),
         }
     }
 
     #[inline]
-    pub fn true_() -> Any {
-        Any::Atom(Atom::True)
+    pub fn true_() -> Val {
+        Val::Atom(Atom::True)
     }
 
     #[inline]
-    pub fn false_() -> Any {
-        Any::Atom(Atom::False)
+    pub fn false_() -> Val {
+        Val::Atom(Atom::False)
     }
 
     #[inline]
-    pub fn nil() -> Any {
-        Any::Atom(Atom::Nil)
-    }
-
-    pub fn new_atom(s: Rc<str>) -> Any {
-        Any::Atom(Atom::new(s))
+    pub fn nil() -> Val {
+        Val::Atom(Atom::Nil)
     }
 
     #[inline]
-    pub fn new_record(fields: BTreeMap<Rc<str>, Any>) -> Any {
-        Any::Object(Rc::new(RefCell::new(Object::new_record(fields))))
+    #[doc(hidden)]
+    pub fn is_init(&self) -> bool {
+        !matches!(self, Val::Uninit)
     }
 
     #[inline]
-    pub fn new_list(elements: Vec<Any>) -> Any {
-        Any::Object(Rc::new(RefCell::new(Object::new_list(elements))))
-    }
-
-    #[inline]
-    fn pos(&self) -> Result<Any, RuntimeError> {
+    #[doc(hidden)]
+    pub fn init_or<E>(self, err: E) -> Result<Val, E> {
         match self {
-            Any::Number(n) => Ok(Any::Number(*n)),
+            Val::Uninit => Err(err),
+            _ => Ok(self),
+        }
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    pub fn init_or_else<F, E>(self, f: F) -> Result<Val, E>
+    where
+        F: FnOnce() -> E,
+    {
+        match self {
+            Val::Uninit => Err(f()),
+            _ => Ok(self),
+        }
+    }
+
+    #[inline]
+    pub fn new_atom(s: Rc<str>) -> Val {
+        Val::Atom(Atom::new(s))
+    }
+
+    #[inline]
+    /// Wrap exported bindings into an immutable module object.
+    pub fn new_module(fields: FixedHashMap<Rc<str>, Val>) -> Val {
+        Val::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::Module(fields),
+            frozen: true,
+            mutable: false,
+        })))
+    }
+
+    #[inline]
+    pub fn new_record(fields: FixedHashMap<Rc<str>, Val>) -> Val {
+        Val::Object(Rc::new(RefCell::new(Object::new_record(fields))))
+    }
+
+    #[inline]
+    pub fn new_list(elements: Vec<Val>) -> Val {
+        Val::Object(Rc::new(RefCell::new(Object::new_list(elements))))
+    }
+
+    #[inline]
+    fn pos(&self) -> Result<Val, RuntimeError> {
+        match self {
+            Val::Number(n) => Ok(Val::Number(*n)),
             _ => Err(RuntimeError::TypeError("pos on non-numeric value".into())),
         }
     }
 
     #[inline]
-    fn neg(&self) -> Result<Any, RuntimeError> {
+    fn neg(&self) -> Result<Val, RuntimeError> {
         match self {
-            Any::Number(n) => Ok(Any::Number(n.neg()?)),
+            Val::Number(n) => Ok(Val::Number(n.neg()?)),
             _ => Err(RuntimeError::TypeError(
                 "negation on non-numeric value".into(),
             )),
@@ -400,14 +475,14 @@ impl Any {
     }
 
     #[inline]
-    fn not(&self) -> Any {
-        Any::bool_(is_falsey(self))
+    fn not(&self) -> Val {
+        Val::bool_(is_falsey(self))
     }
 
     #[inline]
-    fn bit_not(&self) -> Result<Any, RuntimeError> {
+    fn bit_not(&self) -> Result<Val, RuntimeError> {
         match self {
-            Any::Number(Number::Integer(i)) => Ok(Any::Number(Number::Integer(!i))),
+            Val::Number(Number::Integer(i)) => Ok(Val::Number(Number::Integer(!i))),
             _ => Err(RuntimeError::TypeError(
                 "bitwise not on non-integer value".into(),
             )),
@@ -415,32 +490,32 @@ impl Any {
     }
 
     #[inline]
-    fn add(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn add(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Ok(Any::Number(n1.add(*n2)?)),
-            (Any::String(s1), Any::String(s2)) => {
+            (Val::Number(n1), Val::Number(n2)) => Ok(Val::Number(n1.add(*n2)?)),
+            (Val::String(s1), Val::String(s2)) => {
                 let mut s = String::new();
                 s.push_str(&*s1);
                 s.push_str(&*s2);
-                Ok(Any::String(Rc::from(s)))
+                Ok(Val::String(Rc::from(s)))
             }
-            (Any::String(s1), Any::Char(c2)) => {
+            (Val::String(s1), Val::Char(c2)) => {
                 let mut s = String::new();
                 s.push_str(&*s1);
                 s.push(*c2);
-                Ok(Any::String(Rc::from(s)))
+                Ok(Val::String(Rc::from(s)))
             }
-            (Any::Char(c1), Any::String(s2)) => {
+            (Val::Char(c1), Val::String(s2)) => {
                 let mut s = String::new();
                 s.push(*c1);
                 s.push_str(&*s2);
-                Ok(Any::String(Rc::from(s)))
+                Ok(Val::String(Rc::from(s)))
             }
-            (Any::Char(c1), Any::Char(c2)) => {
+            (Val::Char(c1), Val::Char(c2)) => {
                 let mut s = String::new();
                 s.push(*c1);
                 s.push(*c2);
-                Ok(Any::String(Rc::from(s)))
+                Ok(Val::String(Rc::from(s)))
             }
             _ => Err(RuntimeError::TypeError(
                 "addition on not numeric or string value".into(),
@@ -449,9 +524,9 @@ impl Any {
     }
 
     #[inline]
-    fn sub(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn sub(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Ok(Any::Number(n1.sub(*n2)?)),
+            (Val::Number(n1), Val::Number(n2)) => Ok(Val::Number(n1.sub(*n2)?)),
             _ => Err(RuntimeError::TypeError(
                 "subtraction on non-numeric value".into(),
             )),
@@ -459,9 +534,9 @@ impl Any {
     }
 
     #[inline]
-    fn mul(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn mul(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Ok(Any::Number(n1.mul(*n2)?)),
+            (Val::Number(n1), Val::Number(n2)) => Ok(Val::Number(n1.mul(*n2)?)),
             _ => Err(RuntimeError::TypeError(
                 "multiplication on non-numeric value".into(),
             )),
@@ -469,9 +544,9 @@ impl Any {
     }
 
     #[inline]
-    fn div(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn div(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Ok(Any::Number(n1.div(*n2)?)),
+            (Val::Number(n1), Val::Number(n2)) => Ok(Val::Number(n1.div(*n2)?)),
             _ => Err(RuntimeError::TypeError(
                 "division on non-numeric value".into(),
             )),
@@ -479,9 +554,9 @@ impl Any {
     }
 
     #[inline]
-    fn pow(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn pow(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Ok(Any::Number(n1.pow(*n2)?)),
+            (Val::Number(n1), Val::Number(n2)) => Ok(Val::Number(n1.pow(*n2)?)),
             _ => Err(RuntimeError::TypeError(
                 "exponentiation on non-numeric value".into(),
             )),
@@ -489,21 +564,21 @@ impl Any {
     }
 
     #[inline]
-    fn cmp(&self, rhs: &Any) -> Option<Ordering> {
+    fn cmp(&self, rhs: &Val) -> Option<Ordering> {
         match (self, rhs) {
-            (Any::Number(n1), Any::Number(n2)) => Some(n1.cmp(*n2)),
-            (Any::Atom(a1), Any::Atom(a2)) => {
+            (Val::Number(n1), Val::Number(n2)) => Some(n1.cmp(*n2)),
+            (Val::Atom(a1), Val::Atom(a2)) => {
                 if a1 == a2 {
                     Some(Ordering::Equal)
                 } else {
                     None
                 }
             }
-            (Any::String(s1), Any::String(s2)) => Some(s1.cmp(s2)),
-            (Any::Char(c1), Any::Char(c2)) => Some(c1.cmp(c2)),
-            (Any::Object(o1), Any::Object(o2)) => o1.borrow().cmp(&o2.borrow()),
-            (Any::Fn(e1), Any::Fn(e2)) => Rc::ptr_eq(&e1.0, &e2.0).then(|| Ordering::Equal),
-            (Any::Opaque(o1), Any::Opaque(o2)) => {
+            (Val::String(s1), Val::String(s2)) => Some(s1.cmp(s2)),
+            (Val::Char(c1), Val::Char(c2)) => Some(c1.cmp(c2)),
+            (Val::Object(o1), Val::Object(o2)) => o1.borrow().cmp(&o2.borrow()),
+            (Val::Fn(e1), Val::Fn(e2)) => Rc::ptr_eq(&e1.0, &e2.0).then(|| Ordering::Equal),
+            (Val::Opaque(o1), Val::Opaque(o2)) => {
                 std::ptr::eq(Rc::as_ptr(o1), Rc::as_ptr(o2)).then(|| Ordering::Equal)
             }
             _ => None, // different kinds are considered incomparable
@@ -511,10 +586,10 @@ impl Any {
     }
 
     #[inline]
-    fn bit_and(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn bit_and(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(Number::Integer(i1)), Any::Number(Number::Integer(i2))) => {
-                Ok(Any::Number(Number::Integer(i1 & i2)))
+            (Val::Number(Number::Integer(i1)), Val::Number(Number::Integer(i2))) => {
+                Ok(Val::Number(Number::Integer(i1 & i2)))
             }
             _ => Err(RuntimeError::TypeError(
                 "bitwise and on non-integer value".into(),
@@ -523,10 +598,10 @@ impl Any {
     }
 
     #[inline]
-    fn bit_or(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn bit_or(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(Number::Integer(i1)), Any::Number(Number::Integer(i2))) => {
-                Ok(Any::Number(Number::Integer(i1 | i2)))
+            (Val::Number(Number::Integer(i1)), Val::Number(Number::Integer(i2))) => {
+                Ok(Val::Number(Number::Integer(i1 | i2)))
             }
             _ => Err(RuntimeError::TypeError(
                 "bitwise or on non-integer value".into(),
@@ -535,10 +610,10 @@ impl Any {
     }
 
     #[inline]
-    fn bit_xor(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn bit_xor(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(Number::Integer(i1)), Any::Number(Number::Integer(i2))) => {
-                Ok(Any::Number(Number::Integer(i1 ^ i2)))
+            (Val::Number(Number::Integer(i1)), Val::Number(Number::Integer(i2))) => {
+                Ok(Val::Number(Number::Integer(i1 ^ i2)))
             }
             _ => Err(RuntimeError::TypeError(
                 "bitwise xor on non-integer value".into(),
@@ -547,15 +622,15 @@ impl Any {
     }
 
     #[inline]
-    fn shl(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn shl(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(Number::Integer(i1)), Any::Number(Number::Integer(i2))) => {
+            (Val::Number(Number::Integer(i1)), Val::Number(Number::Integer(i2))) => {
                 if *i2 < 0 {
                     return Err(RuntimeError::TypeError(
                         "shift left by negative value".into(),
                     ));
                 }
-                Ok(Any::Number(Number::Integer(i1.wrapping_shl(*i2 as u32))))
+                Ok(Val::Number(Number::Integer(i1.wrapping_shl(*i2 as u32))))
             }
             _ => Err(RuntimeError::TypeError(
                 "shift left on non-integer value".into(),
@@ -564,19 +639,33 @@ impl Any {
     }
 
     #[inline]
-    fn shr(&self, rhs: &Any) -> Result<Any, RuntimeError> {
+    fn shr(&self, rhs: &Val) -> Result<Val, RuntimeError> {
         match (self, rhs) {
-            (Any::Number(Number::Integer(i1)), Any::Number(Number::Integer(i2))) => {
+            (Val::Number(Number::Integer(i1)), Val::Number(Number::Integer(i2))) => {
                 if *i2 < 0 {
                     return Err(RuntimeError::TypeError(
                         "shift right by negative value".into(),
                     ));
                 }
-                Ok(Any::Number(Number::Integer(i1.wrapping_shr(*i2 as u32))))
+                Ok(Val::Number(Number::Integer(i1.wrapping_shr(*i2 as u32))))
             }
             _ => Err(RuntimeError::TypeError(
                 "shift right on non-integer value".into(),
             )),
+        }
+    }
+
+    pub fn get_field(&self, key: &str) -> Option<Val> {
+        match &self {
+            Val::Object(o) => o.borrow().get_field(key),
+            _ => None,
+        }
+    }
+
+    pub fn get_index(&self, index: usize) -> Option<Val> {
+        match &self {
+            Val::Object(o) => o.borrow().get_index(index),
+            _ => None,
         }
     }
 
@@ -617,17 +706,17 @@ impl Any {
     // }
 
     #[inline]
-    fn iter(&self) -> Result<impl IntoIterator<Item = Any> + use<>, RuntimeError> {
+    fn iter(&self) -> Result<impl IntoIterator<Item = Val> + use<>, RuntimeError> {
         struct ObjectIter {
             object: Rc<RefCell<Object>>,
             pos: usize,
         }
 
         impl Iterator for ObjectIter {
-            type Item = Any;
+            type Item = Val;
 
             #[inline]
-            fn next(&mut self) -> Option<Any> {
+            fn next(&mut self) -> Option<Val> {
                 let object = self.object.borrow();
 
                 match &object.kind {
@@ -640,12 +729,12 @@ impl Any {
                             None
                         }
                     }
-                    ObjectKind::Record(record) => {
+                    ObjectKind::Record(record) | ObjectKind::Module(record) => {
                         if self.pos < record.len() {
                             let key = record.keys().nth(self.pos).unwrap().clone();
                             let value = record.get(&key).unwrap().clone();
                             self.pos += 1;
-                            Some(Any::new_record(BTreeMap::from([(key, value)])))
+                            Some(Val::new_record(core::iter::once((key, value)).collect()))
                         } else {
                             None
                         }
@@ -655,7 +744,7 @@ impl Any {
         }
 
         match self {
-            Any::Object(o) => Ok(ObjectIter {
+            Val::Object(o) => Ok(ObjectIter {
                 object: o.clone(),
                 pos: 0,
             }),
@@ -666,8 +755,12 @@ impl Any {
     }
 
     #[inline]
-    fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>) -> Any {
-        Any::Fn(FnValue(Rc::new(AstFn { params, body })))
+    fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
+        Val::Fn(FnVal(Rc::new(AstFn {
+            params,
+            body,
+            parent,
+        })))
     }
 
     /// Wrap a host closure into a function value with the given
@@ -675,11 +768,11 @@ impl Any {
     /// then decides how many arguments to consume, as
     /// [`Runtime::register_external`] assumes.
     #[inline]
-    pub fn host_function<F>(min_args: usize, max_args: Option<usize>, f: F) -> Any
+    pub fn host_function<F>(min_args: usize, max_args: Option<usize>, f: F) -> Val
     where
-        F: Fn(&mut Runtime, usize) -> Any + 'static,
+        F: Fn(&mut Runtime, usize) -> Val + 'static,
     {
-        Any::Fn(FnValue::new(HostFn {
+        Val::Fn(FnVal::new(HostFn {
             min_args,
             max_args,
             fun: f,
@@ -745,7 +838,7 @@ pub trait Function: Sized + 'static {
 /// `Rc` — unique ownership unwraps and truly consumes, shared ownership
 /// falls back to the borrowing `call`. That unwrap attempt doubles as the
 /// "is this the last reference?" dispatch.
-trait DynFunction: 'static {
+trait DynFn: 'static {
     /// Minimum number of arguments this function consumes in a call.
     /// If less than that many are supplied, the runtime will return a partially-applied
     /// function value instead of calling.
@@ -764,12 +857,12 @@ fn dyn_call_impl<F: Function>(f: Rc<F>, rt: &mut Runtime, args: usize) -> usize 
         core::hint::cold_path();
 
         if args == 0 {
-            rt.vm.push_stack(Any::Fn(FnValue(f)));
+            rt.stack.push(Val::Fn(FnVal(f)));
             return 0;
         }
 
-        let partial = FnValue::partial(f, rt, args);
-        rt.vm.push_stack(Any::Fn(partial));
+        let partial = FnVal::partial(f, rt, args);
+        rt.stack.push(Val::Fn(partial));
         return args;
     }
 
@@ -787,7 +880,7 @@ fn dyn_call_impl<F: Function>(f: Rc<F>, rt: &mut Runtime, args: usize) -> usize 
     }
 }
 
-impl<F: Function> DynFunction for F {
+impl<F: Function> DynFn for F {
     #[inline]
     fn min_args(&self) -> usize {
         Function::min_args(self)
@@ -820,7 +913,7 @@ struct HostFn<F> {
 
 impl<F> Function for HostFn<F>
 where
-    F: Fn(&mut Runtime, usize) -> Any + 'static,
+    F: Fn(&mut Runtime, usize) -> Val + 'static,
 {
     #[inline]
     fn min_args(&self) -> usize {
@@ -839,7 +932,7 @@ where
             Some(max_args) if args > max_args => (self.fun)(rt, max_args),
             _ => (self.fun)(rt, args),
         };
-        rt.vm.push_stack(ret);
+        rt.stack.push(ret);
     }
 
     #[inline]
@@ -862,17 +955,17 @@ where
 /// actually consumes is somewhere in between and is reported back by
 /// [`Function::call`].
 #[derive(Clone)]
-pub struct FnValue(Rc<dyn DynFunction>);
+pub struct FnVal(Rc<dyn DynFn>);
 
-impl FnValue {
+impl FnVal {
     #[inline]
     pub fn new(func: impl Function + 'static) -> Self {
-        FnValue(Rc::new(func))
+        FnVal(Rc::new(func))
     }
 
     #[inline]
-    fn new_dyn(func: impl DynFunction + 'static) -> Self {
-        FnValue(Rc::new(func))
+    fn new_dyn(func: impl DynFn + 'static) -> Self {
+        FnVal(Rc::new(func))
     }
 
     /// Dispatch a call: [`Function::call_once`] when this `FnValue` holds
@@ -888,22 +981,22 @@ impl FnValue {
     /// Capture `args` (fewer than `min_args` of them) and return a function
     /// value awaiting the rest.
     #[inline]
-    pub fn partial<F: Function>(fun: Rc<F>, runtime: &mut Runtime, args: usize) -> Self {
-        FnValue::partial_dyn(fun, runtime, args)
+    pub fn partial<F: Function>(fun: Rc<F>, rt: &mut Runtime, args: usize) -> Self {
+        FnVal::partial_dyn(fun, rt, args)
     }
 
     /// Capture `args` (fewer than `min_args` of them) and return a function
     /// value awaiting the rest.
     #[inline]
-    fn partial_dyn<F: DynFunction>(fun: Rc<F>, runtime: &mut Runtime, args: usize) -> Self {
-        FnValue(Rc::new(PartialFn {
+    fn partial_dyn<F: DynFn>(fun: Rc<F>, rt: &mut Runtime, args: usize) -> Self {
+        FnVal(Rc::new(PartialFn {
             fun,
-            preapplied: runtime.vm.drain_off_stack(args).collect(),
+            preapplied: rt.stack.drain_top(args).collect(),
         }))
     }
 }
 
-impl fmt::Debug for FnValue {
+impl fmt::Debug for FnVal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.debug_fmt(f)
     }
@@ -912,12 +1005,12 @@ impl fmt::Debug for FnValue {
 /// A function with some arguments already applied, waiting for the rest.
 struct PartialFn<F> {
     fun: Rc<F>,
-    preapplied: SmallVec<[Any; 4]>,
+    preapplied: SmallVec<[Val; 4]>,
 }
 
 impl<F: Function> PartialFn<F> {}
 
-impl<F: DynFunction> DynFunction for PartialFn<F> {
+impl<F: DynFn> DynFn for PartialFn<F> {
     #[inline]
     fn min_args(&self) -> usize {
         self.fun.min_args().saturating_sub(self.preapplied.len())
@@ -937,22 +1030,22 @@ impl<F: DynFunction> DynFunction for PartialFn<F> {
             // supplied (positionally later) arguments go to the front.
             let f = match Rc::get_mut(&mut self) {
                 Some(f) => {
-                    let newly: SmallVec<[Any; 4]> = rt.vm.drain_off_stack(args).collect();
+                    let newly: SmallVec<[Val; 4]> = rt.stack.drain_top(args).collect();
                     f.preapplied.insert_many(0, newly);
-                    Any::Fn(FnValue(self))
+                    Val::Fn(FnVal(self))
                 }
-                None => Any::Fn(FnValue(Rc::new(PartialFn {
+                None => Val::Fn(FnVal(Rc::new(PartialFn {
                     fun: self.fun.clone(),
                     preapplied: {
-                        let mut new_preapplied: SmallVec<[Any; 4]> =
-                            rt.vm.drain_off_stack(args).collect();
+                        let mut new_preapplied: SmallVec<[Val; 4]> =
+                            rt.stack.drain_top(args).collect();
                         new_preapplied.extend(self.preapplied.iter().cloned());
                         new_preapplied
                     },
                 }))),
             };
 
-            rt.vm.push_stack(f);
+            rt.stack.push(f);
             args
         } else {
             core::hint::cold_path();
@@ -962,24 +1055,24 @@ impl<F: DynFunction> DynFunction for PartialFn<F> {
             match self.fun.max_args() {
                 Some(max_args) if max_args < total_args => match Rc::try_unwrap(self) {
                     Ok(me) => {
-                        rt.vm.extend_stack(me.preapplied);
+                        rt.stack.extend(me.preapplied);
                         let consumed = me.fun.dyn_call(rt, max_args);
                         consumed - pre_args
                     }
                     Err(me) => {
-                        rt.vm.extend_stack(me.preapplied.iter().cloned());
+                        rt.stack.extend(me.preapplied.iter().cloned());
                         let consumed = me.fun.clone().dyn_call(rt, max_args);
                         consumed - pre_args
                     }
                 },
                 _ => match Rc::try_unwrap(self) {
                     Ok(me) => {
-                        rt.vm.extend_stack(me.preapplied);
+                        rt.stack.extend(me.preapplied);
                         let consumed = me.fun.dyn_call(rt, total_args);
                         consumed - pre_args
                     }
                     Err(me) => {
-                        rt.vm.extend_stack(me.preapplied.iter().cloned());
+                        rt.stack.extend(me.preapplied.iter().cloned());
                         let consumed = me.fun.clone().dyn_call(rt, total_args);
                         consumed - pre_args
                     }
@@ -1002,6 +1095,8 @@ impl<F: DynFunction> DynFunction for PartialFn<F> {
 struct AstFn {
     params: Rc<[Pat]>,
     body: Rc<[Stmt]>,
+    /// Parent frame.
+    parent: Rc<Frame>,
 }
 
 impl Function for AstFn {
@@ -1016,42 +1111,43 @@ impl Function for AstFn {
     }
 
     fn call(&self, rt: &mut Runtime, args: usize) {
-        debug_assert!(rt.vm.stack_len() >= args);
+        debug_assert!(rt.stack.len() >= args);
         debug_assert_eq!(args, self.params.len());
 
-        let ret = rt.call_with_local(move |rt| {
-            // first argument is on top of the stack
-            for param in self.params.iter() {
-                let arg = rt.vm.pop_stack();
-                if let Err(e) = rt.bind_pattern(param, &arg) {
-                    rt.set_error(e);
-                    return Any::nil();
-                }
-            }
+        // the body sees this function's module environment, not the caller's
+        let frame = Rc::new(Frame::new().with_parent(self.parent.clone()));
 
-            match rt.exec_block(&self.body) {
-                Ok(Exec::Value(v)) => v,
-                Ok(Exec::Return(v)) => v,
-                Ok(Exec::Break) => {
-                    rt.set_error(RuntimeError::Other(
-                        "break statement outside of loop".to_owned(),
-                    ));
-                    Any::nil()
-                }
-                Ok(Exec::Continue) => {
-                    rt.set_error(RuntimeError::Other(
-                        "continue statement outside of loop".to_owned(),
-                    ));
-                    Any::nil()
-                }
-                Err(e) => {
-                    rt.set_error(e);
-                    Any::nil()
-                }
+        // first argument is on top of the stack
+        for param in self.params.iter() {
+            let arg = rt.stack.pop();
+            if let Err(e) = rt.bind_pattern(param, &arg, &frame) {
+                rt.set_error(e);
+                return;
             }
-        });
+        }
 
-        rt.vm.push_stack(ret);
+        let ret = match rt.exec_block(&self.body, frame.clone()) {
+            Ok(Exec::Value(v)) => v,
+            Ok(Exec::Return(v)) => v,
+            Ok(Exec::Break) => {
+                rt.set_error(RuntimeError::Other(
+                    "break statement outside of loop".into(),
+                ));
+                return;
+            }
+            Ok(Exec::Continue) => {
+                rt.set_error(RuntimeError::Other(
+                    "continue statement outside of loop".into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                rt.set_error(e);
+                return;
+            }
+        };
+
+        rt.stack.push(ret);
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1059,16 +1155,544 @@ impl Function for AstFn {
     }
 }
 
-// Runtime with two scopes: global and optional local
+/// Identified used to index into function-stack slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SlotId(pub u32);
+
+struct SlotTable {
+    table: HashMap<Rc<str>, SlotId>,
+    next: SlotId,
+}
+
+impl SlotTable {
+    fn new() -> Self {
+        SlotTable {
+            table: HashMap::default(),
+            next: SlotId(0),
+        }
+    }
+
+    fn with_params(params: &[Pat]) -> Self {
+        let mut next = 0;
+        let mut table = HashMap::default();
+
+        for param in params.iter().rev() {
+            if let PatKind::Ident(id) = param.kind() {
+                if id.name() != "_" {
+                    table.insert(id.rc_name(), SlotId(next));
+                }
+            }
+            next += 1;
+        }
+
+        let mut me = SlotTable {
+            table,
+            next: SlotId(next),
+        };
+
+        for param in params {
+            if let PatKind::Ident(_) = param.kind() {
+                continue;
+            }
+            me.add_pat(param);
+        }
+
+        me
+    }
+
+    fn add_name(&mut self, name: Rc<str>) {
+        self.table.entry(name).or_insert_with(|| {
+            let next = self.next;
+            self.next = SlotId(next.0 + 1);
+            next
+        });
+    }
+
+    fn add_pat(&mut self, pat: &Pat) {
+        match pat.kind() {
+            PatKind::Ident(id) if id.name() == "_" => {}
+            PatKind::Ident(ident) => self.add_name(ident.rc_name()),
+            PatKind::List(list) => {
+                for p in list.iter() {
+                    self.add_pat(p);
+                }
+            }
+            PatKind::Record(fields) => {
+                for f in fields.iter() {
+                    match f.pattern() {
+                        Some(p) => self.add_pat(p),
+                        None => {
+                            self.add_name(f.key().rc_name());
+                        }
+                    }
+                }
+            }
+            PatKind::Atom(_) | PatKind::Literal(_) => {}
+        }
+    }
+
+    fn add_stmt(&mut self, stmt: &Stmt) {
+        match stmt.kind() {
+            StmtKind::AssignPat { target, .. } => self.add_pat(target),
+            StmtKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.add_stmts(then_branch);
+                if let Some(eb) = else_branch {
+                    self.add_stmts(eb);
+                }
+            }
+            StmtKind::While {
+                body, else_branch, ..
+            } => {
+                self.add_stmts(body);
+                if let Some(eb) = else_branch {
+                    self.add_stmts(eb);
+                }
+            }
+            StmtKind::For {
+                target,
+                body,
+                else_branch,
+                ..
+            } => {
+                self.add_pat(target);
+                self.add_stmts(body);
+                if let Some(eb) = else_branch {
+                    self.add_stmts(eb);
+                }
+            }
+            StmtKind::Fn { name, .. } => {
+                self.add_name(name.rc_name());
+            }
+            StmtKind::Expr(_)
+            | StmtKind::AssignField { .. }
+            | StmtKind::AssignIndex { .. }
+            | StmtKind::Return(_)
+            | StmtKind::Break
+            | StmtKind::Continue => {}
+        }
+    }
+
+    fn add_stmts(&mut self, stmts: &[Stmt]) {
+        for stmt in stmts {
+            self.add_stmt(stmt);
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<SlotId> {
+        self.table.get(name).copied()
+    }
+
+    fn names(&self, rt: &mut Runtime) -> SmallVec<[StringId; 8]> {
+        let mut pairs: SmallVec<[(u32, Rc<str>); 8]> = self
+            .table
+            .iter()
+            .map(|(k, idx)| (idx.0, k.clone()))
+            .collect();
+        pairs.sort_unstable_by_key(|(idx, _)| *idx);
+
+        let mut names = SmallVec::with_capacity(self.next.0 as usize);
+
+        for (idx, name) in pairs {
+            if idx > names.len() as u32 {
+                for _ in 0..idx {
+                    names.push(rt.ctx.string("_"));
+                }
+            }
+            names.push(rt.ctx.string(name));
+        }
+
+        names
+    }
+}
+
+#[derive(Clone)]
+pub struct ModuleCtx {
+    name: StringId,
+    /// The module's environment, shared by all functions defined in the module.
+    frame: Rc<Frame>,
+}
+
+impl ModuleCtx {
+    /// Pre-scan a module block: collect every top-level binding into the slot
+    /// layout, and determine which function names are *final* — bound by
+    /// exactly one unconditional top-level `fn` statement and never reassigned
+    /// anywhere in the module. Function bodies are not entered (their bindings
+    /// are locals).
+    fn new(name: StringId, stmts: &[Stmt], rt: &mut Runtime) -> ModuleCtx {
+        let mut slots = SlotTable::new();
+        slots.add_stmts(stmts);
+
+        let names = slots.names(rt);
+        let slot_count = names.len();
+
+        ModuleCtx {
+            name,
+            frame: Rc::new(Frame {
+                names: RefCell::new(names),
+                slots: RefCell::new(smallvec::smallvec![Val::Uninit; slot_count]),
+                parent: None,
+            }),
+        }
+    }
+
+    fn frame(&self) -> Rc<Frame> {
+        self.frame.clone()
+    }
+}
+
+#[derive(Default)]
+pub struct Stack {
+    array: Vec<Val>,
+}
+
+impl Stack {
+    /// Reserve `n` not-yet-assigned locals on top of the stack.
+    #[inline]
+    pub fn extend_uninit(&mut self, n: usize) {
+        self.array.resize_with(self.array.len() + n, || Val::Uninit);
+    }
+
+    #[inline]
+    pub fn push(&mut self, v: Val) {
+        self.array.push(v);
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.array.is_empty()
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Val {
+        match self.array.pop() {
+            Some(v) => v,
+            None => unreachable!("Attempted to pop from an empty VM stack"),
+        }
+    }
+
+    #[inline]
+    pub fn peek(&self) -> &Val {
+        match self.array.last() {
+            Some(v) => v,
+            None => unreachable!("Attempted to peek from an empty VM stack"),
+        }
+    }
+
+    #[inline]
+    pub fn extend(&mut self, values: impl IntoIterator<Item = Val>) {
+        self.array.extend(values);
+    }
+
+    #[inline]
+    pub fn reverse(&mut self, count: usize) {
+        let at = self.array.len() - count;
+        self.array[at..].reverse();
+    }
+
+    #[inline]
+    pub fn drain_top(&mut self, count: usize) -> impl DoubleEndedIterator<Item = Val> {
+        let at = self.array.len() - count;
+        self.array.drain(at..)
+    }
+
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.array.truncate(len);
+    }
+
+    /// Read frame slot `slot` of the frame based at `base`.
+    #[inline]
+    pub fn get(&self, idx: usize) -> &Val {
+        &self.array[idx]
+    }
+
+    /// Write frame slot `slot` of the frame based at `base`.
+    #[inline]
+    pub fn set(&mut self, idx: usize, v: Val) {
+        self.array[idx] = v;
+    }
+}
+
+#[derive(Default)]
+pub struct Context {
+    /// Interned strings used as identifiers in compiled functions.
+    strings: Vec<Rc<str>>,
+
+    /// Contains all constants used within compiled functions.
+    consts: Vec<Val>,
+
+    /// Contains compiled patterns used by compiled functions.
+    pats: Vec<Rc<CompiledPat>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct StringId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct ConstId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct PatId(pub u32);
+
+pub trait IntoStringId {
+    fn into_id(self, ctx: &mut Context) -> StringId;
+}
+
+impl IntoStringId for StringId {
+    #[inline(always)]
+    fn into_id(self, _ctx: &mut Context) -> StringId {
+        self
+    }
+}
+
+impl<S> IntoStringId for S
+where
+    S: AsRef<str> + Into<Rc<str>>,
+{
+    #[inline(always)]
+    fn into_id(self, ctx: &mut Context) -> StringId {
+        ctx.string(self)
+    }
+}
+
+impl Context {
+    /// Intern a constant. Only immutable scalar values are deduplicated —
+    /// and never across numeric kinds, since `Any`'s equality treats `1`
+    /// and `1.0` as equal but the program must observe distinct values.
+    pub fn const_(&mut self, v: Val) -> ConstId {
+        fn same(a: &Val, b: &Val) -> bool {
+            match (a, b) {
+                (Val::Number(Number::Integer(x)), Val::Number(Number::Integer(y))) => x == y,
+                (Val::Number(Number::Float(x)), Val::Number(Number::Float(y))) => {
+                    x.to_bits() == y.to_bits()
+                }
+                (Val::String(x), Val::String(y)) => x == y,
+                (Val::Char(x), Val::Char(y)) => x == y,
+                (Val::Atom(x), Val::Atom(y)) => x == y,
+                _ => false,
+            }
+        }
+
+        if let Some(i) = self.consts.iter().position(|c| same(c, &v)) {
+            return ConstId(i as u32);
+        }
+        self.consts.push(v);
+        ConstId((self.consts.len() - 1) as u32)
+    }
+
+    pub fn string<S>(&mut self, name: S) -> StringId
+    where
+        S: AsRef<str> + Into<Rc<str>>,
+    {
+        if let Some(i) = self
+            .strings
+            .iter()
+            .position(|s| s.as_ref() == name.as_ref())
+        {
+            return StringId(i as u32);
+        }
+        self.strings.push(name.into());
+        StringId((self.strings.len() - 1) as u32)
+    }
+
+    pub fn pattern(&mut self, p: CompiledPat) -> PatId {
+        self.pats.push(Rc::new(p));
+        PatId((self.pats.len() - 1) as u32)
+    }
+
+    pub fn get_string(&self, id: StringId) -> Rc<str> {
+        self.strings[id.0 as usize].clone()
+    }
+
+    pub fn get_const(&self, id: ConstId) -> Val {
+        self.consts[id.0 as usize].clone()
+    }
+
+    pub fn get_pattern(&self, id: PatId) -> Rc<CompiledPat> {
+        self.pats[id.0 as usize].clone()
+    }
+}
+
+#[derive(Debug)]
+struct ParentFrame {
+    frame: Rc<Frame>,
+    slot_map: SmallVec<[Option<SlotId>; 8]>,
+}
+
+#[derive(Debug)]
+pub struct Frame {
+    names: RefCell<SmallVec<[StringId; 8]>>,
+    slots: RefCell<SmallVec<[Val; 8]>>,
+    parent: Option<ParentFrame>,
+}
+
+impl Frame {
+    pub fn new() -> Self {
+        Frame {
+            names: RefCell::new(SmallVec::new()),
+            slots: RefCell::new(SmallVec::new()),
+            parent: None,
+        }
+    }
+
+    pub fn from_names(names: SmallVec<[StringId; 8]>) -> Self {
+        Frame {
+            slots: RefCell::new(smallvec::smallvec![Val::Uninit; names.len()]),
+            names: RefCell::new(names),
+            parent: None,
+        }
+    }
+
+    pub fn with_parent(mut self, parent: Rc<Frame>) -> Self {
+        let slot_map = self
+            .names
+            .borrow()
+            .iter()
+            .map(|&name| {
+                parent
+                    .names
+                    .borrow()
+                    .iter()
+                    .position(|&n| n == name)
+                    .map(|i| SlotId(i as u32))
+            })
+            .collect();
+        self.parent = Some(ParentFrame {
+            frame: parent,
+            slot_map,
+        });
+        self
+    }
+
+    pub fn set(&self, slot: SlotId, val: Val) {
+        self.slots.borrow_mut()[(slot.0) as usize] = val;
+    }
+
+    pub fn set_var(&self, var: StringId, val: Val) {
+        if let Some(idx) = self.names.borrow().iter().position(|&n| n == var) {
+            self.slots.borrow_mut()[idx] = val;
+        } else {
+            self.names.borrow_mut().push(var);
+            self.slots.borrow_mut().push(val);
+        }
+    }
+
+    pub fn get(&self, slot: SlotId, rt: &mut Runtime) -> Val {
+        let cur = self.slots.borrow();
+        if slot.0 as usize >= cur.len() {
+            return Val::Uninit;
+        }
+        let v = &cur[slot.0 as usize];
+        if !matches!(v, Val::Uninit) {
+            return v.clone();
+        }
+
+        core::hint::cold_path();
+
+        match &self.parent {
+            Some(parent) => {
+                if let Some(slot) = parent.slot_map[slot.0 as usize] {
+                    parent.frame.get(slot, rt)
+                } else {
+                    let name = self.names.borrow()[slot.0 as usize];
+                    rt.get_var(name)
+                }
+            }
+            None => {
+                let name = self.names.borrow()[slot.0 as usize];
+                rt.get_var(name)
+            }
+        }
+    }
+
+    pub fn name(&self, slot: SlotId) -> StringId {
+        self.names.borrow()[slot.0 as usize]
+    }
+
+    pub fn name_slot(&self, name: StringId) -> Option<SlotId> {
+        self.names
+            .borrow()
+            .iter()
+            .position(|&n| n == name)
+            .map(|idx| SlotId(idx as u32))
+    }
+
+    pub fn get_var(&self, var: impl IntoStringId, rt: &mut Runtime) -> Val {
+        let var = var.into_id(&mut rt.ctx);
+        match self.name_slot(var) {
+            Some(slot) => {
+                let cur = self.slots.borrow();
+                let v = &cur[slot.0 as usize];
+                if !matches!(v, Val::Uninit) {
+                    return v.clone();
+                }
+
+                core::hint::cold_path();
+
+                match &self.parent {
+                    Some(parent) => {
+                        if let Some(slot) = parent.slot_map[slot.0 as usize] {
+                            parent.frame.get(slot, rt)
+                        } else {
+                            parent.frame.get_var(var, rt)
+                        }
+                    }
+                    None => rt.get_var(var),
+                }
+            }
+            None => match &self.parent {
+                Some(parent) => parent.frame.get_var(var, rt),
+                None => rt.get_var(var),
+            },
+        }
+    }
+
+    pub fn names(&self) -> SmallVec<[StringId; 8]> {
+        self.names.borrow().clone()
+    }
+
+    pub fn slots(&self) -> SmallVec<[Val; 8]> {
+        self.slots.borrow().clone()
+    }
+}
+
 pub struct Runtime {
-    pub global: HashMap<Rc<str>, Any>,
-    pub local: Option<SmallVec<[(Rc<str>, Any); 16]>>,
-    pub status: Result<(), RuntimeError>,
-    /// Shared bytecode context: interned constant/name/pattern pools that
-    /// all compiled functions index into, plus the operand stack their
-    /// frames execute on (`vm.stack` is public — peek at it from host
-    /// functions for the fun of it).
-    pub vm: vm::VmContext,
+    /// Context holding tables with names, constants, and compiled patterns
+    /// for all compiled functions to use.
+    pub ctx: Context,
+
+    /// The operand stack shared by all compiled-function frames. Public for
+    /// inspection — a host function called from compiled code can watch the
+    /// caller's temporaries live. Each frame works relative to the stack
+    /// height at its entry and restores it on exit; pushing extra values
+    /// from a host function mid-call is at your own peril.
+    pub stack: Stack,
+
+    /// Global variables, keyed by the name's index.
+    global: HashMap<StringId, Val>,
+
+    /// Loaded-module cache, keyed by the name given to [`Runtime::load_module`].
+    modules: HashMap<StringId, Val>,
+
+    /// Contexts of modules currently loading, innermost last (cycle detection).
+    loading: Vec<StringId>,
+
+    /// Error status.
+    status: Result<(), RuntimeError>,
+
     /// When true, `fn` statements are compiled to stack-based bytecode
     /// (see [`vm`]) instead of being closed over as AST. Both kinds of
     /// function are plain `Any::Fn` values and can call each other freely.
@@ -1077,12 +1701,12 @@ pub struct Runtime {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeError {
-    UnboundIdentifier(String),
-    NotAFunction(String),
-    TypeError(String),
-    IndexError(String),
-    FieldError(String),
-    Other(String),
+    UnboundIdentifier(Rc<str>),
+    NotAFunction(Rc<str>),
+    TypeError(Rc<str>),
+    IndexError(Rc<str>),
+    FieldError(Rc<str>),
+    Other(Rc<str>),
 }
 
 impl fmt::Display for RuntimeError {
@@ -1101,9 +1725,9 @@ impl fmt::Display for RuntimeError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Exec {
     /// Stmt executed successfully, no control flow change.
-    Value(Any),
+    Value(Val),
     /// Return statement encountered.
-    Return(Any),
+    Return(Val),
     /// Continue statement encountered.
     Continue,
     /// Break statement encountered.
@@ -1113,10 +1737,12 @@ pub enum Exec {
 impl Runtime {
     pub fn new() -> Self {
         Runtime {
-            global: HashMap::new(),
-            local: None,
+            ctx: Context::default(),
+            stack: Stack::default(),
+            global: HashMap::default(),
+            modules: HashMap::default(),
+            loading: Vec::new(),
             status: Ok(()),
-            vm: vm::VmContext::new(),
             compile_fns: false,
         }
     }
@@ -1149,69 +1775,51 @@ impl Runtime {
         max_args: Option<usize>,
         f: F,
     ) where
-        F: Fn(&mut Runtime, usize) -> Any + 'static,
+        F: Fn(&mut Runtime, usize) -> Val + 'static,
     {
+        let idx = self.ctx.string(name);
         self.global
-            .insert(name.into(), Any::host_function(min_args, max_args, f));
+            .insert(idx, Val::host_function(min_args, max_args, f));
     }
 
     /// Set variable according to scope rules. If local scope exists, set there; otherwise global.
-    pub fn set_var(&mut self, name: impl Into<Rc<str>>, val: Any) {
-        let name = name.into();
-        if let Some(local) = &mut self.local {
-            for (n, v) in local.iter_mut() {
-                if *n == name {
-                    *v = val;
-                    return;
-                }
-            }
-            local.push((name, val));
-        } else {
-            self.global.insert(name, val);
-        }
+    pub fn set_var(&mut self, name: impl IntoStringId, val: Val) {
+        let name = name.into_id(&mut self.ctx);
+        self.global.insert(name, val);
     }
 
     /// Get variable: check local first, then global.
-    pub fn get_var(&self, name: &str) -> Option<Any> {
-        if let Some(local) = &self.local {
-            for (n, v) in local.iter().rev() {
-                if &**n == name {
-                    return Some(v.clone());
-                }
-            }
-        }
-        self.global.get(name).cloned()
+    pub fn get_var(&mut self, name: impl IntoStringId) -> Val {
+        let name = name.into_id(&mut self.ctx);
+        self.global.get(&name).cloned().unwrap_or(Val::Uninit)
     }
 
-    /// Enter local scope for function execution. Returns guard which restores previous local on drop.
-    /// Run closure inside a newly-created local scope. Previous local is restored after closure returns.
-    fn call_with_local<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut Self) -> R,
-    {
-        let prev = self.local.take();
-        self.local = Some(SmallVec::new());
-        let res = f(self);
-        self.local = prev;
-        res
+    pub fn eval(&mut self, expr: &Expr, frame: &Frame) -> Result<Val, RuntimeError> {
+        self.eval_impl(expr, frame, false)
     }
 
-    pub fn eval(&mut self, expr: &Expr) -> Result<Any, RuntimeError> {
-        self.eval_impl(expr, false)
-    }
-
-    fn eval_impl(&mut self, expr: &Expr, call_fn: bool) -> Result<Any, RuntimeError> {
+    fn eval_impl(
+        &mut self,
+        expr: &Expr,
+        frame: &Frame,
+        call_fn: bool,
+    ) -> Result<Val, RuntimeError> {
         match expr.kind() {
             ExprKind::Literal(lit) => literal_value(lit),
-            ExprKind::Atom(a) => Ok(Any::new_atom(a.rc_name())),
+            ExprKind::Atom(a) => Ok(Val::new_atom(a.rc_name())),
             ExprKind::Ident(i) => {
-                let name = i.name();
-                let val = self
-                    .get_var(name)
-                    .ok_or(RuntimeError::UnboundIdentifier(name.to_owned()))?;
+                let name = self.ctx.string(i.rc_name());
+
+                // Get the variable from the current frame first,
+                // then from the global scope if uninitialized.
+                let val = frame
+                    .get_var(name, self)
+                    .init_or_else(|| {
+                        RuntimeError::UnboundIdentifier(i.rc_name())
+                    })?;
 
                 if call_fn {
-                    self.call_bare_ast(val)
+                    self.call_ast(val, 0)
                 } else {
                     Ok(val)
                 }
@@ -1219,98 +1827,116 @@ impl Runtime {
             ExprKind::List(elements) => {
                 let mut vec = Vec::with_capacity(elements.len());
                 for e in elements.iter() {
-                    vec.push(self.eval(e)?);
+                    vec.push(self.eval(e, frame)?);
                 }
-                Ok(Any::new_list(vec))
+                Ok(Val::new_list(vec))
             }
             ExprKind::Record(fields) => {
-                let mut map = BTreeMap::new();
+                let mut map = FixedHashMap::default();
                 for f in fields.iter() {
                     let key = f.key().rc_name();
 
                     let val = match f.value() {
-                        None => self
-                            .get_var(&key[..])
-                            .ok_or(RuntimeError::UnboundIdentifier(key[..].to_owned()))?,
-                        Some(value) => self.eval(value)?,
+                        None => frame
+                            .get_var(key.clone(), self)
+                            .init_or_else(|| {
+                                RuntimeError::UnboundIdentifier(key.clone())
+                            })?,
+                        Some(value) => self.eval(value, frame)?,
                     };
 
                     map.insert(key, val);
                 }
-                Ok(Any::new_record(map))
+                Ok(Val::new_record(map))
             }
             ExprKind::Unary(op, operand) => {
-                let v = self.eval(operand)?;
+                let v = self.eval(operand, frame)?;
                 eval_unary(op.kind(), &v)
             }
             ExprKind::Binary(lhs, op, rhs) => {
-                let a = self.eval(lhs)?;
-                let b = self.eval(rhs)?;
+                let a = self.eval(lhs, frame)?;
+                let b = self.eval(rhs, frame)?;
                 eval_binary(op.kind(), &a, &b)
             }
             ExprKind::Apply(func, args) => {
-                let fval = self.eval(func)?;
+                let fval = self.eval(func, frame)?;
 
-                let base = self.vm.stack_len();
+                let base = self.stack.len();
                 for a in args.iter() {
-                    match self.eval(a) {
-                        Ok(arg) => self.vm.push_stack(arg),
+                    match self.eval(a, frame) {
+                        Ok(arg) => self.stack.push(arg),
                         Err(e) => {
                             // don't strand already-evaluated arguments
-                            self.vm.truncate_stack(base);
+                            self.stack.truncate(base);
                             return Err(e);
                         }
                     }
                 }
                 // calling convention: first argument on top of the stack,
                 // same as the reversal Instr::Call performs
-                self.vm.reverse_stack(args.len());
-                self.vm.push_stack(fval);
+                self.stack.reverse(args.len());
+                self.stack.push(fval);
                 self.apply_value(args.len())?;
-                Ok(self.vm.pop_stack())
+                Ok(self.stack.pop())
             }
             ExprKind::Field(obj, field_ident) => {
-                let v = self.eval(obj)?;
+                let v = self.eval(obj, frame)?;
                 field_of(&v, field_ident.name())
             }
             ExprKind::Index(obj, index_expr) => {
-                let objv = self.eval(obj)?;
-                let idxv = self.eval(index_expr)?;
+                let objv = self.eval(obj, frame)?;
+                let idxv = self.eval(index_expr, frame)?;
                 index_of(&objv, &idxv)
             }
-            ExprKind::Parenthesized(expr) => self.eval_impl(expr, true),
+            ExprKind::Parenthesized(expr) => self.eval_impl(expr, frame, true),
+        }
+    }
+
+    fn call(&mut self, args: usize) -> Result<(), RuntimeError> {
+        if args > 0 {
+            self.apply_value(args)
+        } else {
+            let fval = self.stack.peek();
+            let callee = match callee_ref(fval) {
+                Some(callee) => callee,
+                None => return Ok(()),
+            };
+            self.stack.pop(); // pop the callee
+
+            callee.invoke(self, &mut 0);
+            self.status.clone()
+        }
+    }
+
+    fn call_ast(&mut self, fval: Val, args: usize) -> Result<Val, RuntimeError> {
+        if args > 0 {
+            self.apply_value_ast(fval, args)
+        } else {
+            let callee = match callee(fval) {
+                Ok(callee) => callee,
+                Err(fval) => return Ok(fval),
+            };
+            callee.invoke(self, &mut 0);
+            self.status.clone()?;
+            Ok(self.stack.pop())
         }
     }
 
     /// Call `fval` with already-evaluated arguments, following the language's
     /// application rules: each callee consumes as many arguments as it wants
     /// (possibly returning a partially-applied function), and leftover
-    /// arguments are re-applied to whatever it returned. Shared by the AST
-    /// walker (`ExprKind::Apply`) and the bytecode VM (`vm::Instr::Call`).
-    pub(crate) fn apply_value(&mut self, mut args: usize) -> Result<(), RuntimeError> {
+    /// arguments are re-applied to whatever it returned.
+    fn apply_value(&mut self, mut args: usize) -> Result<(), RuntimeError> {
         while args > 0 {
-            let fval = self.vm.pop_stack();
-            let callee = match fval {
-                Any::Fn(f) => Ok(f),
-                Any::Object(h) => {
-                    // a record is callable if it holds a function under the special key "__call"
-                    let borrowed = h.borrow();
-                    match &borrowed.kind {
-                        ObjectKind::Record(map) => match map.get("__call") {
-                            Some(Any::Fn(f)) => Ok(f.clone()),
-                            _ => Err(RuntimeError::NotAFunction("object not callable".into())),
-                        },
-                        _ => Err(RuntimeError::NotAFunction("list not callable".into())),
-                    }
-                }
-                _ => Err(RuntimeError::NotAFunction("value is not callable".into())),
-            };
-            let callee = match callee {
+            let fval = self.stack.pop();
+            let callee = match callee(fval) {
                 Ok(callee) => callee,
-                Err(e) => {
+                Err(fval) => {
                     // don't strand the unconsumed arguments
-                    drop(self.vm.drain_off_stack(args));
-                    return Err(e);
+                    drop(self.stack.drain_top(args));
+                    return Err(RuntimeError::NotAFunction(
+                        format!("{fval:?} is not callable").into(),
+                    ));
                 }
             };
 
@@ -1318,7 +1944,7 @@ impl Runtime {
             // DynFunction::dyn_call)
             callee.invoke(self, &mut args);
             if self.status.is_err() {
-                drop(self.vm.drain_off_stack(args));
+                drop(self.stack.drain_top(args));
                 self.status.clone()?;
             }
         }
@@ -1326,90 +1952,81 @@ impl Runtime {
         Ok(())
     }
 
-    /// A value referenced in call position with no arguments: zero-argument
-    /// functions are invoked, everything else passes through unchanged.
-    /// Used by AST walker.
-    pub(crate) fn call_bare_ast(&mut self, val: Any) -> Result<Any, RuntimeError> {
-        match val {
-            // only a function that may take zero arguments is invoked; one
-            // that needs more would just evaluate to itself anyway, so the
-            // arity hint lets us skip the call entirely
-            Any::Fn(f) => {
-                // call inside function-local scope
-                f.invoke(self, &mut 0);
-                self.status.clone()?;
-                Ok(self.vm.pop_stack())
-            }
-            val => Ok(val),
-        }
-    }
+    /// Call `fval` with already-evaluated arguments, following the language's
+    /// application rules: each callee consumes as many arguments as it wants
+    /// (possibly returning a partially-applied function), and leftover
+    /// arguments are re-applied to whatever it returned.
+    fn apply_value_ast(&mut self, mut fval: Val, mut args: usize) -> Result<Val, RuntimeError> {
+        while args > 0 {
+            let callee = match callee(fval) {
+                Ok(callee) => callee,
+                Err(fval) => {
+                    // don't strand the unconsumed arguments
+                    drop(self.stack.drain_top(args));
+                    return Err(RuntimeError::NotAFunction(
+                        format!("{fval:?} is not callable").into(),
+                    ));
+                }
+            };
 
-    /// A value referenced in call position with no arguments: zero-argument
-    /// functions are invoked, everything else passes through unchanged.
-    /// Used by the bytecode VM (`vm::Instr::CallBare`).
-    pub(crate) fn call_bare(&mut self, val: Any) -> Result<(), RuntimeError> {
-        match val {
-            // only a function that may take zero arguments is invoked; one
-            // that needs more would just evaluate to itself anyway, so the
-            // arity hint lets us skip the call entirely
-            Any::Fn(f) => {
-                // call inside function-local scope
-                f.invoke(self, &mut 0);
+            // the callee establishes its own function-local scope (see
+            // DynFunction::dyn_call)
+            callee.invoke(self, &mut args);
+            fval = self.stack.pop();
+            if self.status.is_err() {
+                drop(self.stack.drain_top(args));
                 self.status.clone()?;
-                Ok(())
-            }
-            val => {
-                self.vm.push_stack(val);
-                Ok(())
             }
         }
+
+        Ok(fval)
     }
 
-    pub fn exec_stmt(&mut self, statement: &Stmt) -> Result<Exec, RuntimeError> {
-        match statement.kind() {
+    pub fn exec_stmt(&mut self, stmt: &Stmt, frame: Rc<Frame>) -> Result<Exec, RuntimeError> {
+        match stmt.kind() {
             StmtKind::Expr(e) => {
-                let val = self.eval_impl(e, true)?;
+                let val = self.eval_impl(e, &frame, true)?;
                 Ok(Exec::Value(val))
             }
             StmtKind::AssignPat { target, value } => {
-                let val = self.eval(value)?;
-                self.bind_pattern(target, &val)?;
-                Ok(Exec::Value(Any::nil()))
+                let val = self.eval_impl(value, &frame, false)?;
+                self.bind_pattern(target, &val, &frame)?;
+                Ok(Exec::Value(Val::nil()))
             }
             StmtKind::AssignField {
                 target,
                 field,
                 value,
             } => {
-                let objv = self.eval(target)?;
-                let val = self.eval(value)?;
-                assign_field(objv, field.rc_name(), val)?;
-                Ok(Exec::Value(Any::nil()))
+                let objv = self.eval_impl(target, &frame, false)?;
+                let val = self.eval_impl(value, &frame, false)?;
+                assign_field(objv, field.name(), val)?;
+                Ok(Exec::Value(Val::nil()))
             }
             StmtKind::AssignIndex {
                 target,
                 index,
                 value,
             } => {
-                let objv = self.eval(target)?;
-                let idxv = self.eval(index)?;
-                let val = self.eval(value)?;
+                let objv = self.eval_impl(target, &frame, false)?;
+                let idxv = self.eval_impl(index, &frame, false)?;
+                let val = self.eval_impl(value, &frame, false)?;
                 assign_index(objv, idxv, val)?;
-                Ok(Exec::Value(Any::nil()))
+                Ok(Exec::Value(Val::nil()))
             }
             StmtKind::If {
                 cond,
                 then_branch,
                 else_branch,
             } => {
-                let cv = self.eval(cond)?;
+                let cv = self.eval_impl(cond, &frame, false)?;
                 if !is_falsey(&cv) {
-                    self.exec_block(then_branch)
+                    self.exec_block(then_branch, frame.clone())
                 } else {
                     if let Some(eb) = else_branch {
-                        self.exec_block(eb)
+                        self.exec_block(eb, frame)
                     } else {
-                        Ok(Exec::Value(Any::nil()))
+                        Ok(Exec::Value(Val::nil()))
                     }
                 }
             }
@@ -1418,18 +2035,18 @@ impl Runtime {
                 body,
                 else_branch,
             } => loop {
-                let cv = self.eval(cond)?;
+                let cv = self.eval_impl(cond, &frame, false)?;
                 if is_falsey(&cv) {
                     if let Some(eb) = else_branch {
-                        break self.exec_block(eb);
+                        break self.exec_block(eb, frame.clone());
                     }
-                    break Ok(Exec::Value(Any::nil()));
+                    break Ok(Exec::Value(Val::nil()));
                 }
-                match self.exec_block(body)? {
+                match self.exec_block(body, frame.clone())? {
                     Exec::Value(_) => continue,
                     Exec::Return(v) => break Ok(Exec::Return(v)),
                     Exec::Continue => continue,
-                    Exec::Break => break Ok(Exec::Value(Any::nil())),
+                    Exec::Break => break Ok(Exec::Value(Val::nil())),
                 }
             },
             StmtKind::For {
@@ -1438,54 +2055,141 @@ impl Runtime {
                 body,
                 else_branch,
             } => {
-                let iter_val = self.eval(iterable)?;
+                let iter_val = self.eval_impl(iterable, &frame, false)?;
                 let values = iter_val.iter()?;
 
                 for value in values {
-                    self.bind_pattern(target, &value)?;
+                    self.bind_pattern(target, &value, &frame)?;
 
-                    match self.exec_block(body)? {
+                    match self.exec_block(body, frame.clone())? {
                         Exec::Return(v) => return Ok(Exec::Return(v)),
-                        Exec::Break => return Ok(Exec::Value(Any::nil())),
+                        Exec::Break => return Ok(Exec::Value(Val::nil())),
                         Exec::Continue => continue,
                         Exec::Value(_) => continue,
                     }
                 }
 
                 if let Some(else_branch) = else_branch {
-                    self.exec_block(else_branch)
+                    self.exec_block(else_branch, frame.clone())
                 } else {
-                    Ok(Exec::Value(Any::nil()))
+                    Ok(Exec::Value(Val::nil()))
                 }
             }
-            StmtKind::Return(None) => Ok(Exec::Return(Any::nil())),
+            StmtKind::Return(None) => Ok(Exec::Return(Val::nil())),
             StmtKind::Return(Some(expr)) => {
-                let v = self.eval(expr)?;
+                let v = self.eval_impl(expr, &frame, false)?;
                 Ok(Exec::Return(v))
             }
             StmtKind::Break => Ok(Exec::Break),
             StmtKind::Continue => Ok(Exec::Continue),
             StmtKind::Fn { name, params, body } => {
+                let name = self.ctx.string(name.rc_name());
+                frame.set_var(name, Val::nil());
+
                 let fval = if self.compile_fns {
-                    match vm::compile_fn(&mut self.vm, params.clone(), body) {
+                    match vm::compile_fn(self, params.clone(), body, frame.clone()) {
                         Ok(compiled) => compiled.into_function(),
                         // constructs the compiler rejects still run on the AST walker
-                        Err(_) => Any::fn_from_ast(params.clone(), body.clone()),
+                        Err(_) => Val::fn_from_ast(params.clone(), body.clone(), frame.clone()),
                     }
                 } else {
-                    Any::fn_from_ast(params.clone(), body.clone())
+                    Val::fn_from_ast(params.clone(), body.clone(), frame.clone())
                 };
-                self.set_var(name.rc_name(), fval);
-                Ok(Exec::Value(Any::nil()))
+
+                frame.set_var(name, fval);
+                Ok(Exec::Value(Val::nil()))
             }
         }
     }
 
+    /// Parse, execute and cache a module. `source` is a block of Raft code
+    /// whose tail statement must be `export { .. }` (an `if`/`else` whose
+    /// branches all tail-export also qualifies, so a module may export
+    /// conditionally). Returns the immutable module object; loading the
+    /// same name again returns the cached object without re-executing.
+    pub fn load_module(&mut self, name: &str, source: &str) -> Result<Val, RuntimeError> {
+        let name_id = self.ctx.string(name);
+        if let Some(module) = self.modules.get(&name_id) {
+            return Ok(module.clone());
+        }
+        if self.loading.iter().any(|&module| module == name_id) {
+            return Err(RuntimeError::Other(
+                format!("circular import of module '{name}'").into(),
+            ));
+        }
+
+        let tokens =
+            raft_ast::lexer::parse_str(source, &raft_ast::lexer::Options::wss()).map_err(|e| {
+                RuntimeError::Other(format!("module '{name}': lex error: {e:?}").into())
+            })?;
+        let mut stream = raft_ast::parser::TokenStream::new(tokens);
+        let ast = stream.parse_module().map_err(|e| {
+            RuntimeError::Other(format!("module '{name}': parse error: {e:?}").into())
+        })?;
+        let stmts = ast.rc_stmts();
+
+        // the module body runs in a fresh environment: it must not see the
+        // importer's locals, and its own bindings must not leak
+        self.loading.push(name_id);
+
+        let mctx = ModuleCtx::new(name_id, &stmts[..], self);
+
+        let mut result = Ok(());
+        for stmt in stmts.iter() {
+            match self.exec_stmt(stmt, mctx.frame()) {
+                Ok(Exec::Value(_)) => {}
+                Ok(_) => {
+                    result = Err(RuntimeError::Other(
+                        "break/continue/return at module top level".into(),
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+
+        // evaluate the export only if the body succeeded, and never
+        // early-return before the runtime state is restored below
+        let mut export = FixedHashMap::default();
+        if result.is_ok() {
+            'export: for f in ast.export().fields() {
+                let key = f.key().rc_name();
+                let val = match f.value() {
+                    None => mctx
+                        .frame
+                        .get_var(key.clone(), self)
+                        .init_or_else(|| {
+                            RuntimeError::UnboundIdentifier(key.clone())
+                        })?,
+                    Some(value) => match self.eval(value, &mctx.frame) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            result = Err(e);
+                            break 'export;
+                        }
+                    },
+                };
+                export.insert(key, val);
+            }
+        }
+
+        self.loading.pop();
+
+        result?;
+
+        let module = Val::new_module(export);
+        self.modules.insert(name_id, module.clone());
+        Ok(module)
+    }
+
     /// Execute block of statements. Stops and returns Some(value) if a return happens.
-    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Exec, RuntimeError> {
-        let mut last_val = Any::nil();
+    fn exec_block(&mut self, stmts: &[Stmt], frame: Rc<Frame>) -> Result<Exec, RuntimeError> {
+        let mut last_val = Val::nil();
         for s in stmts {
-            match self.exec_stmt(s)? {
+            match self.exec_stmt(s, frame.clone())? {
                 Exec::Value(val) => last_val = val,
                 Exec::Return(val) => return Ok(Exec::Return(val)),
                 Exec::Continue => return Ok(Exec::Continue),
@@ -1495,22 +2199,28 @@ impl Runtime {
         Ok(Exec::Value(last_val))
     }
 
-    fn bind_pattern(&mut self, pattern: &Pat, val: &Any) -> Result<(), RuntimeError> {
+    fn bind_pattern(
+        &mut self,
+        pattern: &Pat,
+        val: &Val,
+        frame: &Frame,
+    ) -> Result<(), RuntimeError> {
         match pattern.kind() {
             PatKind::Ident(id) => {
                 if id.name() != "_" {
-                    self.set_var(id.rc_name(), val.clone());
+                    let name = self.ctx.string(id.rc_name());
+                    frame.set_var(name, val.clone());
                 }
                 Ok(())
             }
             PatKind::Atom(a) => match val {
-                Any::Atom(av) if av == a.name() => Ok(()),
+                Val::Atom(av) if av == a.name() => Ok(()),
                 _ => Err(RuntimeError::Other("pattern match failed".into())),
             },
             PatKind::Literal(lit) => {
                 // compare literal with value
                 match (lit, val) {
-                    (Lit::Num(nlit), Any::Number(actual)) => {
+                    (Lit::Num(nlit), Val::Number(actual)) => {
                         // suffix-aware, exact matching — same rules as the
                         // compiled representation (see vm::NumberPat)
                         if vm::NumberPat::from_literal(nlit).matches(*actual) {
@@ -1519,14 +2229,14 @@ impl Runtime {
                             Err(RuntimeError::Other("pattern match failed".into()))
                         }
                     }
-                    (Lit::Str(slit), Any::String(s)) => {
+                    (Lit::Str(slit), Val::String(s)) => {
                         if slit.unescape() == &**s {
                             Ok(())
                         } else {
                             Err(RuntimeError::Other("pattern match failed".into()))
                         }
                     }
-                    (Lit::Char(clit), Any::Char(c)) => {
+                    (Lit::Char(clit), Val::Char(c)) => {
                         if clit.unescape() == *c {
                             Ok(())
                         } else {
@@ -1537,13 +2247,13 @@ impl Runtime {
                 }
             }
             PatKind::List(items) => match val {
-                Any::Object(o) => match &o.borrow().kind {
+                Val::Object(o) => match &o.borrow().kind {
                     ObjectKind::List(vec) => {
                         if vec.len() != items.len() {
                             return Err(RuntimeError::Other("pattern match failed".into()));
                         }
                         for (p, v) in items.iter().zip(vec.iter()) {
-                            self.bind_pattern(p, v)?;
+                            self.bind_pattern(p, v, frame)?;
                         }
                         Ok(())
                     }
@@ -1552,16 +2262,17 @@ impl Runtime {
                 _ => Err(RuntimeError::Other("pattern match failed".into())),
             },
             PatKind::Record(fields) => match val {
-                Any::Object(o) => match &o.borrow().kind {
-                    ObjectKind::Record(map) => {
+                Val::Object(o) => match &o.borrow().kind {
+                    ObjectKind::Record(map) | ObjectKind::Module(map) => {
                         for f in fields.iter() {
+                            let key_id = self.ctx.string(f.key().rc_name());
                             if let Some(v) = map.get(f.key().name()) {
                                 match f.pattern() {
                                     None => {
-                                        self.set_var(f.key().rc_name(), v.clone());
+                                        frame.set_var(key_id, v.clone());
                                     }
                                     Some(pattern) => {
-                                        self.bind_pattern(pattern, v)?;
+                                        self.bind_pattern(pattern, v, frame)?;
                                     }
                                 }
                             } else {
@@ -1578,14 +2289,14 @@ impl Runtime {
     }
 }
 
-fn is_falsey(v: &Any) -> bool {
+fn is_falsey(v: &Val) -> bool {
     match v {
-        Any::Number(Number::Integer(0)) => true,
-        Any::Number(Number::Float(f)) if *f == 0.0 => true,
-        Any::Atom(a) => a.is_false(),
-        Any::Object(o) => match &o.borrow().kind {
+        Val::Number(Number::Integer(0)) => true,
+        Val::Number(Number::Float(f)) if *f == 0.0 => true,
+        Val::Atom(a) => a.is_false(),
+        Val::Object(o) => match &o.borrow().kind {
             ObjectKind::List(v) => v.is_empty(),
-            ObjectKind::Record(m) => m.is_empty(),
+            ObjectKind::Record(m) | ObjectKind::Module(m) => m.is_empty(),
         },
         _ => false,
     }
@@ -1595,14 +2306,13 @@ fn is_falsey(v: &Any) -> bool {
 /// honoring its suffix (`1i` is an integer, `1f`/`1.0`/`1e3` are floats).
 /// Pat position interprets literals through [`vm::NumberPat`], where
 /// the suffix additionally selects matching strictness.
-pub(crate) fn number_value(n: &LitNum) -> Result<Number, RuntimeError> {
+fn number_value(n: &LitNum) -> Result<Number, RuntimeError> {
     match n.suffix() {
         None | Some("i" | "f") => {}
         Some(suffix) => {
-            return Err(RuntimeError::TypeError(format!(
-                "unsupported number suffix: {}",
-                suffix
-            )));
+            return Err(RuntimeError::TypeError(
+                format!("unsupported number suffix: {}", suffix).into(),
+            ));
         }
     }
 
@@ -1624,45 +2334,46 @@ pub(crate) fn number_value(n: &LitNum) -> Result<Number, RuntimeError> {
 /// Evaluate a literal AST node to a runtime value. Used by the AST walker at
 /// evaluation time and by the bytecode compiler at compile time (literals
 /// become constants).
-pub(crate) fn literal_value(lit: &Lit) -> Result<Any, RuntimeError> {
+fn literal_value(lit: &Lit) -> Result<Val, RuntimeError> {
     match lit {
-        Lit::Num(n) => Ok(Any::Number(number_value(n)?)),
-        Lit::Str(s) => Ok(Any::String(Rc::from(s.unescape()))),
-        Lit::Char(c) => Ok(Any::Char(c.unescape())),
+        Lit::Num(n) => Ok(Val::Number(number_value(n)?)),
+        Lit::Str(s) => Ok(Val::String(Rc::from(s.unescape()))),
+        Lit::Char(c) => Ok(Val::Char(c.unescape())),
     }
 }
 
 /// `value.field` — read a record field.
-pub(crate) fn field_of(v: &Any, name: &str) -> Result<Any, RuntimeError> {
+fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     match v {
-        Any::Object(h) => {
+        Val::Object(h) => {
             let borrowed = h.borrow();
             match &borrowed.kind {
-                ObjectKind::Record(map) => map
-                    .get(name)
+                ObjectKind::Record(map) | ObjectKind::Module(map) => map
+                    .get(field)
                     .cloned()
-                    .ok_or(RuntimeError::FieldError(name.to_owned())),
-                _ => Err(RuntimeError::FieldError(name.to_owned())),
+                    .ok_or(RuntimeError::FieldError(field.into())),
+                _ => Err(RuntimeError::FieldError(field.into())),
             }
         }
-        _ => Err(RuntimeError::FieldError(name.to_owned())),
+        _ => Err(RuntimeError::FieldError(field.into())),
     }
 }
 
 /// `value[index]` — read a list element.
-pub(crate) fn index_of(objv: &Any, idxv: &Any) -> Result<Any, RuntimeError> {
+fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     match (objv, idxv) {
-        (Any::Object(h), Any::Number(Number::Integer(i))) => {
+        (Val::Object(h), Val::Number(Number::Integer(i))) => {
             let borrowed = h.borrow();
             match &borrowed.kind {
                 ObjectKind::List(vec) => match usize::try_from(*i) {
-                    Ok(i) => vec
-                        .get(i)
-                        .cloned()
-                        .ok_or(RuntimeError::IndexError(format!("out of bounds: {}", i))),
-                    Err(_) => Err(RuntimeError::IndexError(format!("negative index: {}", i))),
+                    Ok(i) => vec.get(i).cloned().ok_or(RuntimeError::IndexError(
+                        format!("out of bounds: {}", i).into(),
+                    )),
+                    Err(_) => Err(RuntimeError::IndexError(
+                        format!("negative index: {}", i).into(),
+                    )),
                 },
-                ObjectKind::Record(_) => Err(RuntimeError::IndexError(
+                ObjectKind::Record(_) | ObjectKind::Module(_) => Err(RuntimeError::IndexError(
                     "indexing record with integer unsupported".into(),
                 )),
             }
@@ -1672,9 +2383,9 @@ pub(crate) fn index_of(objv: &Any, idxv: &Any) -> Result<Any, RuntimeError> {
 }
 
 /// `target.field = value` — write a record field.
-pub(crate) fn assign_field(objv: Any, field: Rc<str>, val: Any) -> Result<(), RuntimeError> {
+fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError> {
     match objv {
-        Any::Object(o) => {
+        Val::Object(o) => {
             let mut borrowed = o.borrow_mut();
             if borrowed.frozen {
                 return Err(RuntimeError::Other(
@@ -1683,20 +2394,20 @@ pub(crate) fn assign_field(objv: Any, field: Rc<str>, val: Any) -> Result<(), Ru
             }
             match &mut borrowed.kind {
                 ObjectKind::Record(map) => {
-                    map.insert(field, val);
+                    map.insert(field.into(), val);
                     Ok(())
                 }
-                _ => Err(RuntimeError::FieldError(field[..].to_owned())),
+                _ => Err(RuntimeError::FieldError(field.into())),
             }
         }
-        _ => Err(RuntimeError::FieldError(field[..].to_owned())),
+        _ => Err(RuntimeError::FieldError(field.into())),
     }
 }
 
 /// `target[index] = value` — write a list element.
-pub(crate) fn assign_index(objv: Any, idxv: Any, val: Any) -> Result<(), RuntimeError> {
+fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> {
     match (objv, idxv) {
-        (Any::Object(o), Any::Number(Number::Integer(i))) => {
+        (Val::Object(o), Val::Number(Number::Integer(i))) => {
             let mut borrowed = o.borrow_mut();
             if borrowed.frozen {
                 return Err(RuntimeError::Other(
@@ -1706,12 +2417,17 @@ pub(crate) fn assign_index(objv: Any, idxv: Any, val: Any) -> Result<(), Runtime
             match &mut borrowed.kind {
                 ObjectKind::List(vec) => {
                     if i < 0 {
-                        return Err(RuntimeError::IndexError(format!("negative index: {}", i)));
+                        return Err(RuntimeError::IndexError(
+                            format!("negative index: {}", i).into(),
+                        ));
                     }
-                    let ui = usize::try_from(i)
-                        .map_err(|_| RuntimeError::IndexError(format!("invalid index: {}", i)))?;
+                    let ui = usize::try_from(i).map_err(|_| {
+                        RuntimeError::IndexError(format!("invalid index: {}", i).into())
+                    })?;
                     if ui >= vec.len() {
-                        return Err(RuntimeError::IndexError(format!("out of bounds: {}", ui)));
+                        return Err(RuntimeError::IndexError(
+                            format!("out of bounds: {}", ui).into(),
+                        ));
                     }
                     vec[ui] = val;
                     Ok(())
@@ -1725,7 +2441,7 @@ pub(crate) fn assign_index(objv: Any, idxv: Any, val: Any) -> Result<(), Runtime
     }
 }
 
-pub(crate) fn eval_unary(op: UnOpKind, a: &Any) -> Result<Any, RuntimeError> {
+fn eval_unary(op: UnOpKind, a: &Val) -> Result<Val, RuntimeError> {
     use raft_ast::UnOpKind::*;
     match op {
         Not => Ok(a.not()),
@@ -1735,7 +2451,7 @@ pub(crate) fn eval_unary(op: UnOpKind, a: &Any) -> Result<Any, RuntimeError> {
     }
 }
 
-pub(crate) fn eval_binary(op: BinOpKind, a: &Any, b: &Any) -> Result<Any, RuntimeError> {
+fn eval_binary(op: BinOpKind, a: &Val, b: &Val) -> Result<Val, RuntimeError> {
     use raft_ast::BinOpKind::*;
     match op {
         BitAnd => a.bit_and(b),
@@ -1748,18 +2464,60 @@ pub(crate) fn eval_binary(op: BinOpKind, a: &Any, b: &Any) -> Result<Any, Runtim
         Div => a.div(b),
         Add => a.add(b),
         Sub => a.sub(b),
-        Eq => Ok(Any::bool_(a.cmp(b) == Some(Ordering::Equal))),
-        Ne => Ok(Any::bool_(a.cmp(b) != Some(Ordering::Equal))),
-        Lt => Ok(Any::bool_(a.cmp(b) == Some(Ordering::Less))),
-        Le => Ok(Any::bool_(matches!(
+        Eq => Ok(Val::bool_(a.cmp(b) == Some(Ordering::Equal))),
+        Ne => Ok(Val::bool_(a.cmp(b) != Some(Ordering::Equal))),
+        Lt => Ok(Val::bool_(a.cmp(b) == Some(Ordering::Less))),
+        Le => Ok(Val::bool_(matches!(
             a.cmp(b),
             Some(Ordering::Less | Ordering::Equal)
         ))),
-        Gt => Ok(Any::bool_(a.cmp(b) == Some(Ordering::Greater))),
-        Ge => Ok(Any::bool_(matches!(
+        Gt => Ok(Val::bool_(a.cmp(b) == Some(Ordering::Greater))),
+        Ge => Ok(Val::bool_(matches!(
             a.cmp(b),
             Some(Ordering::Greater | Ordering::Equal)
         ))),
+    }
+}
+
+fn callee(val: Val) -> Result<FnVal, Val> {
+    match val {
+        Val::Fn(f) => Ok(f),
+        Val::Object(ref h) => {
+            let callee = {
+                // a record is callable if it holds a function under the special key "__call"
+                let borrowed = h.borrow();
+                match &borrowed.kind {
+                    ObjectKind::Record(map) => match map.get("__call") {
+                        Some(Val::Fn(f)) => Some(f.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            match callee {
+                Some(f) => Ok(f),
+                None => Err(val),
+            }
+        }
+        _ => Err(val),
+    }
+}
+
+fn callee_ref(val: &Val) -> Option<FnVal> {
+    match val {
+        Val::Fn(f) => Some(f.clone()),
+        Val::Object(h) => {
+            // a record is callable if it holds a function under the special key "__call"
+            let borrowed = h.borrow();
+            match &borrowed.kind {
+                ObjectKind::Record(map) => match map.get("__call") {
+                    Some(Val::Fn(f)) => Some(f.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1767,10 +2525,23 @@ pub(crate) fn eval_binary(op: BinOpKind, a: &Any, b: &Any) -> Result<Any, Runtim
 mod tests {
     use super::*;
 
-    fn ast_from_str(s: &str) -> raft_ast::Module {
+    /// Test sources are plain statement blocks, not modules — no export.
+    struct TestBlock {
+        stmts: Vec<Stmt>,
+    }
+
+    impl TestBlock {
+        fn stmts(&self) -> &[Stmt] {
+            &self.stmts
+        }
+    }
+
+    fn ast_from_str(s: &str) -> TestBlock {
         let tokens = raft_ast::lexer::parse_str(s, &raft_ast::lexer::Options::wss()).unwrap();
         let mut stream = raft_ast::parser::TokenStream::new(tokens);
-        stream.parse_module().unwrap()
+        TestBlock {
+            stmts: Stmt::parse_many(&mut stream).unwrap(),
+        }
     }
 
     #[test]
@@ -1778,13 +2549,14 @@ mod tests {
         let src = "x = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(module.stmts(), frame.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
-        let v = rt.get_var("x").expect("x bound");
+        let v = frame.get_var("x", &mut rt);
         match v {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 1),
             _ => panic!("expected integer"),
         }
     }
@@ -1792,20 +2564,21 @@ mod tests {
     #[test]
     fn assign_pattern_list_binds_vars() {
         let src = "[a, b] = [1, 2]";
-        let module = ast_from_str(src);
+        let block = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(block.stmts(), frame.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
-        let va = rt.get_var("a").expect("a bound");
-        let vb = rt.get_var("b").expect("b bound");
+        let va = frame.get_var("a", &mut rt);
+        let vb = frame.get_var("b", &mut rt);
         match va {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 1),
             _ => panic!("expected integer for a"),
         }
         match vb {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 2),
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 2),
             _ => panic!("expected integer for b"),
         }
     }
@@ -1815,15 +2588,17 @@ mod tests {
         let ok_src = "'a' = 'a'";
         let ok_module = ast_from_str(ok_src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(ok_module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(ok_module.stmts(), frame).unwrap(),
+            Exec::Value(Val::nil())
         );
 
         let bad_src = "'a' = 'b'";
         let bad_module = ast_from_str(bad_src);
         let mut rt2 = Runtime::new();
-        assert!(rt2.exec_block(bad_module.stmts()).is_err());
+        let frame = Rc::new(Frame::new());
+        assert!(rt2.exec_block(bad_module.stmts(), frame).is_err());
     }
 
     #[test]
@@ -1831,21 +2606,22 @@ mod tests {
         let src = "obj = { x: 1 }\nobj.x = 5\narr = [0, 1]\narr[0] = 7";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(module.stmts(), frame.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
 
         // check obj.x
-        let objv = rt.get_var("obj").expect("obj bound");
+        let objv = frame.get_var("obj", &mut rt);
         match objv {
-            Any::Object(o) => {
+            Val::Object(o) => {
                 let b = o.borrow();
                 match &b.kind {
                     ObjectKind::Record(map) => {
                         let vx = map.get("x").expect("field x present");
                         match vx {
-                            Any::Number(Number::Integer(i)) => assert_eq!(*i, 5),
+                            Val::Number(Number::Integer(i)) => assert_eq!(*i, 5),
                             _ => panic!("expected integer in obj.x"),
                         }
                     }
@@ -1856,13 +2632,13 @@ mod tests {
         }
 
         // check arr[0]
-        let arrv = rt.get_var("arr").expect("arr bound");
+        let arrv = frame.get_var("arr", &mut rt);
         match arrv {
-            Any::Object(o) => {
+            Val::Object(o) => {
                 let b = o.borrow();
                 match &b.kind {
                     ObjectKind::List(vec) => match &vec[0] {
-                        Any::Number(Number::Integer(i)) => assert_eq!(*i, 7),
+                        Val::Number(Number::Integer(i)) => assert_eq!(*i, 7),
                         _ => panic!("expected integer in arr[0]"),
                     },
                     _ => panic!("arr not list"),
@@ -1877,12 +2653,14 @@ mod tests {
         let src = "return 5\nx = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        let res = rt.exec_block(module.stmts()).unwrap();
+        let frame = Rc::new(Frame::new());
+        let res = rt.exec_block(module.stmts(), frame.clone()).unwrap();
         match res {
-            Exec::Return(Any::Number(Number::Integer(i))) => assert_eq!(i, 5),
+            Exec::Return(Val::Number(Number::Integer(i))) => assert_eq!(i, 5),
             _ => panic!("expected return value"),
         }
-        assert!(rt.get_var("x").is_none());
+
+        assert!(!frame.get_var("x", &mut rt).is_init());
     }
 
     #[test]
@@ -1890,24 +2668,26 @@ mod tests {
         let src = "if True:\n    x = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(module.stmts(), frame.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
-        match rt.get_var("x").expect("x bound") {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 1),
+        match frame.get_var("x", &mut rt) {
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 1),
             _ => panic!("expected integer"),
         }
 
         let src2 = "if False:\n    x = 1\nelse:\n    x = 2";
         let module2 = ast_from_str(src2);
         let mut rt2 = Runtime::new();
+        let frame2 = Rc::new(Frame::new());
         assert_eq!(
-            rt2.exec_block(module2.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt2.exec_block(module2.stmts(), frame2.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
-        match rt2.get_var("x").expect("x bound") {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 2),
+        match frame2.get_var("x", &mut rt2) {
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 2),
             _ => panic!("expected integer"),
         }
     }
@@ -1917,14 +2697,15 @@ mod tests {
         let src = "r = { x: 1 }";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
         assert_eq!(
-            rt.exec_block(module.stmts()).unwrap(),
-            Exec::Value(Any::nil())
+            rt.exec_block(module.stmts(), frame.clone()).unwrap(),
+            Exec::Value(Val::nil())
         );
         // freeze object
-        let rv = rt.get_var("r").expect("r bound");
+        let rv = frame.get_var("r", &mut rt);
         match rv {
-            Any::Object(o) => {
+            Val::Object(o) => {
                 o.borrow_mut().freeze();
             }
             _ => panic!("r not object"),
@@ -1933,7 +2714,7 @@ mod tests {
         let mut rt2 = rt; // move ownership
         let bad_src = "r.x = 2";
         let bad_module = ast_from_str(bad_src);
-        assert!(rt2.exec_block(bad_module.stmts()).is_err());
+        assert!(rt2.exec_block(bad_module.stmts(), frame.clone()).is_err());
     }
 
     // Loop/else semantics tests (runtime implementation pending). Marked #[ignore]
@@ -1942,13 +2723,14 @@ mod tests {
         let src = "i = 0\nwhile i < 3:\n    i = i + 1\nelse:\n    flag = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        let res = rt.exec_block(module.stmts()).unwrap();
-        assert_eq!(res, Exec::Value(Any::nil()));
-        match rt.get_var("i").expect("i bound") {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 3),
+        let frame = Rc::new(Frame::new());
+        let res = rt.exec_block(module.stmts(), frame.clone()).unwrap();
+        assert_eq!(res, Exec::Value(Val::nil()));
+        match frame.get_var("i", &mut rt) {
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 3),
             _ => panic!("expected integer"),
         }
-        assert!(rt.get_var("flag").is_some());
+        assert!(frame.get_var("flag", &mut rt).is_init());
     }
 
     #[test]
@@ -1956,9 +2738,10 @@ mod tests {
         let src = "i = 0\nwhile i < 3:\n    if i == 1:\n        break\n    i = i + 1\nelse:\n    flag = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        let _ = rt.exec_block(module.stmts()).unwrap();
+        let frame = Rc::new(Frame::new());
+        let _ = rt.exec_block(module.stmts(), frame.clone()).unwrap();
         // loop should exit via break and else should NOT execute
-        assert!(rt.get_var("flag").is_none());
+        assert!(!frame.get_var("flag", &mut rt).is_init());
     }
 
     #[test]
@@ -1966,13 +2749,14 @@ mod tests {
         let src = "sum = 0\narr = [1, 2]\nfor a in arr:\n    sum = sum + a\nelse:\n    done = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        let _ = rt.exec_block(module.stmts()).unwrap();
-        match rt.get_var("sum").expect("sum bound") {
-            Any::Number(Number::Integer(i)) => assert_eq!(i, 3),
-            Any::Number(Number::Float(_)) => panic!("unexpected float"),
+        let frame = Rc::new(Frame::new());
+        let _ = rt.exec_block(module.stmts(), frame.clone()).unwrap();
+        match frame.get_var("sum", &mut rt) {
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 3),
+            Val::Number(Number::Float(_)) => panic!("unexpected float"),
             _ => panic!("expected numeric sum"),
         }
-        assert!(rt.get_var("done").is_some());
+        assert!(frame.get_var("done", &mut rt).is_init());
     }
 
     #[test]
@@ -1980,20 +2764,21 @@ mod tests {
         let src = "fn add3 a b c:\n    return a + b + c\nadd1 = add3 1 2\n";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        rt.exec_block(module.stmts()).unwrap();
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(module.stmts(), frame.clone()).unwrap();
 
-        let Some(Any::Fn(_full)) = rt.get_var("add3") else {
+        let Val::Fn(_full) = frame.get_var("add3", &mut rt) else {
             panic!("add3 not a function");
         };
 
         // two arguments preapplied: one left to go
-        let Some(Any::Fn(_partial)) = rt.get_var("add1") else {
+        let Val::Fn(_partial) = frame.get_var("add1", &mut rt) else {
             panic!("add1 not a function");
         };
 
         // host registrations: default hint is "takes anything"
-        rt.register_function("anything", 0, None, |_rt, _args| Any::nil());
-        let Some(Any::Fn(_host)) = rt.get_var("anything") else {
+        rt.register_function("anything", 0, None, |_rt, _args| Val::nil());
+        let Val::Fn(_host) = rt.get_var("anything") else {
             panic!("anything not a function");
         };
     }
@@ -2017,21 +2802,21 @@ mod tests {
             fn call(&self, rt: &mut Runtime, args: usize) {
                 debug_assert_eq!(args, 1);
                 self.shared_calls.set(self.shared_calls.get() + 1);
-                rt.vm.push_stack(Any::nil());
+                rt.stack.push(Val::nil());
             }
 
             // `self` by value: the hidden bridge already proved uniqueness
             fn call_once(self, rt: &mut Runtime, args: usize) {
                 debug_assert_eq!(args, 1);
                 self.once_calls.set(self.once_calls.get() + 1);
-                rt.vm.push_stack(Any::nil());
+                rt.stack.push(Val::nil());
             }
         }
 
         let shared_calls = Rc::new(core::cell::Cell::new(0));
         let once_calls = Rc::new(core::cell::Cell::new(0));
         let probe = || {
-            Any::Fn(FnValue::new(Probe {
+            Val::Fn(FnVal::new(Probe {
                 shared_calls: shared_calls.clone(),
                 once_calls: once_calls.clone(),
             }))
@@ -2042,16 +2827,17 @@ mod tests {
         // stored in a variable: the global scope keeps a reference alive
         // through the call, so the shared flavor runs
         rt.set_var("probe", probe());
-        let module = ast_from_str("probe 1\n");
-        for statement in module.stmts() {
-            rt.exec_stmt(statement).unwrap();
+        let block = ast_from_str("probe 1\n");
+        let frame = Rc::new(Frame::new());
+        for statement in block.stmts() {
+            rt.exec_stmt(statement, frame.clone()).unwrap();
         }
         assert_eq!((shared_calls.get(), once_calls.get()), (1, 0));
 
         // a temporary function value: the argument list holds the last
         // reference, so the consuming flavor runs
-        rt.vm.push_stack(Any::nil());
-        rt.vm.push_stack(probe());
+        rt.stack.push(Val::nil());
+        rt.stack.push(probe());
         rt.apply_value(1).unwrap();
         assert_eq!((shared_calls.get(), once_calls.get()), (1, 1));
     }
@@ -2061,11 +2847,12 @@ mod tests {
         // statement-position reference to a fn needing arguments must not
         // invoke it; `(f)` evaluates to the function value itself
         let src = "fn inc x:\n    return x + 1\ng = (inc)\nr = g 41\n";
-        let module = ast_from_str(src);
+        let block = ast_from_str(src);
         let mut rt = Runtime::new();
-        rt.exec_block(module.stmts()).unwrap();
-        match rt.get_var("r") {
-            Some(Any::Number(Number::Integer(i))) => assert_eq!(i, 42),
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+        match frame.get_var("r", &mut rt) {
+            Val::Number(Number::Integer(i)) => assert_eq!(i, 42),
             other => panic!("expected 42, got {other:?}"),
         }
     }
@@ -2075,8 +2862,9 @@ mod tests {
         let src = "arr = [1, 2, 3]\nfor a in arr:\n    if a == 2:\n        break\nelse:\n    finished = 1";
         let module = ast_from_str(src);
         let mut rt = Runtime::new();
-        let _ = rt.exec_block(module.stmts()).unwrap();
+        let frame = Rc::new(Frame::new());
+        let _ = rt.exec_block(module.stmts(), frame.clone()).unwrap();
         // break inside loop should prevent else from running
-        assert!(rt.get_var("finished").is_none());
+        assert!(!frame.get_var("finished", &mut rt).is_init());
     }
 }

@@ -394,13 +394,40 @@ impl Stmt {
     }
 }
 
+pub struct Export {
+    span: Span,
+    fields: Rc<[ExprRecordField]>,
+}
+
+impl Export {
+    pub fn new(fields: Rc<[ExprRecordField]>, span: Span) -> Self {
+        Export { fields, span }
+    }
+
+    pub fn fields(&self) -> &[ExprRecordField] {
+        &self.fields
+    }
+
+    pub fn rc_fields(&self) -> Rc<[ExprRecordField]> {
+        self.fields.clone()
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+}
+
 pub struct Module {
     stmts: Rc<[Stmt]>,
+
+    /// `export { .. }` — the mandatory tail statement of a module,
+    /// declaring its public bindings with record syntax.
+    export: Export,
 }
 
 impl Module {
-    pub fn new(stmts: Rc<[Stmt]>) -> Self {
-        Self { stmts }
+    pub fn new(stmts: Rc<[Stmt]>, export: Export) -> Self {
+        Module { stmts, export }
     }
 
     pub fn stmts(&self) -> &[Stmt] {
@@ -409,5 +436,9 @@ impl Module {
 
     pub fn rc_stmts(&self) -> Rc<[Stmt]> {
         self.stmts.clone()
+    }
+
+    pub fn export(&self) -> &Export {
+        &self.export
     }
 }

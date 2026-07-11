@@ -3,7 +3,7 @@ use core::fmt;
 
 use crate::{
     Atom, BinOp, BinOpKind, Expr, ExprKind, ExprRecordField, Ident, Lit, Module, Pat, PatKind,
-    PatRecordField, Span, Stmt, StmtKind, UnOp, UnOpKind,
+    PatRecordField, Span, Stmt, StmtKind, UnOp, UnOpKind, Export,
 };
 
 use raft_lexer::{Spacing, SpannedSource, Token};
@@ -81,6 +81,7 @@ pub enum Keyword {
     For,
     In,
     Fn,
+    Export,
 }
 
 impl Keyword {
@@ -95,6 +96,7 @@ impl Keyword {
             "for" => Some(Keyword::For),
             "in" => Some(Keyword::In),
             "fn" => Some(Keyword::Fn),
+            "export" => Some(Keyword::Export),
             _ => None,
         }
     }
@@ -919,10 +921,7 @@ impl Expr {
                 while group_stream.peek().is_some() {
                     let key = Ident::parse(&mut group_stream)?;
                     if key.name() == "_" {
-                        return Err(ParseError::new(
-                            ParseErrorKind::UnexpectedToken,
-                            key.span(),
-                        ));
+                        return Err(ParseError::new(ParseErrorKind::UnexpectedToken, key.span()));
                     }
 
                     group_stream.skip_comments_and_newlines();
@@ -1145,10 +1144,7 @@ impl Pat {
                 while group_stream.peek().is_some() {
                     let key = Ident::parse(&mut group_stream)?;
                     if key.name() == "_" {
-                        return Err(ParseError::new(
-                            ParseErrorKind::UnexpectedToken,
-                            key.span(),
-                        ));
+                        return Err(ParseError::new(ParseErrorKind::UnexpectedToken, key.span()));
                     }
 
                     group_stream.skip_comments_and_newlines();
@@ -1598,13 +1594,37 @@ impl Module {
         let mut stmts = Vec::new();
         stream.skip_comments_and_newlines();
         while !stream.is_empty() {
+            match Keyword::peek(stream) {
+                Some((Keyword::Export, kw_span)) => {
+                    stream.advance();
+                    // the exported bindings use record syntax
+                    let record = Expr::parse(stream)?;
+                    let span = kw_span.join(record.span());
+                    let ExprKind::Record(fields) = record.kind() else {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            record.span(),
+                        ));
+                    };
+                    // the export is the module's terminator: nothing may follow
+                    stream.skip_comments_and_newlines();
+                    stream.expect_end()?;
+                    return Ok(Module {
+                        stmts: Rc::from(stmts),
+                        export: Export::new(fields.clone(), span),
+                    });
+                }
+                _ => {}
+            }
+
             let statement = Stmt::parse(stream)?;
             stmts.push(statement);
             stream.skip_comments_and_newlines();
         }
-        Ok(Self {
-            stmts: Rc::from(stmts),
-        })
+
+        Err(ParseError::new(
+            ParseErrorKind::UnexpectedEndOfInput,
+            stream.end_span(),
+        ))
     }
 }
-
