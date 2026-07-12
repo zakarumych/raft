@@ -7,9 +7,10 @@ and easy to reason about.
 
 > **Status: early / work in progress.** The lexer, parser, tree-walking
 > runtime and REPL are functional, including user-defined functions with
-> currying. The language is still missing pieces you'd expect from a
-> "complete" language (a standard library, real closures — see
-> [Roadmap](#roadmap)). APIs and syntax may change without notice.
+> currying, partial application and lexical closures. The language is
+> still missing pieces you'd expect from a "complete" language (a standard
+> library — see [Roadmap](#roadmap)). APIs and syntax may change without
+> notice.
 
 ## Project layout
 
@@ -214,10 +215,31 @@ fn dist { x, y }:
     x * x + y * y
 ```
 
-Calling a function evaluates its body in a fresh local scope; it does not
-close over the caller's local variables (see [Roadmap](#roadmap)) — only
-globals are visible inside. See [Function application](#function-application)
-for how currying and partial application work when calling.
+Calling a function evaluates its body in a fresh local scope. A nested `fn`
+can additionally close over the locals of the `fn` (or module — see
+[Modules](#modules)) it's defined in, at any depth:
+
+```raft
+fn make_adder n:
+    fn add x:
+        return x + n
+    return add
+
+add5 = make_adder 5
+add10 = make_adder 10
+add5 3      // 8
+add10 3     // 13
+```
+
+Each call to `make_adder` produces an independent capture, so `add5` and
+`add10` don't share state. Assignment always writes to the current
+function's own scope, even for a name also bound in an enclosing scope —
+`n = n + 1` reads the outer `n` on the right-hand side but binds the result
+as a new local, it never mutates the outer variable. This means a captured
+name works as a read-only snapshot from the closure's perspective; there is
+no way for a closure to mutate a variable back in its defining scope. See
+[Function application](#function-application) for how currying and partial
+application work when calling.
 
 ### Pat matching & destructuring
 
@@ -411,8 +433,6 @@ pattern-binding micro-benchmarks (`runtime/benches/vm.rs`).
 
 Raft is under active development. Notable gaps today:
 
-- Functions don't close over the caller's local scope — only globals are
-  visible inside a function body, so there are no true lexical closures yet.
 - No pattern-matched function overloads yet — declaring multiple variants of
   a function, dispatched by matching each call's arguments against a
   different parameter pattern, is planned (see
