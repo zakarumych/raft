@@ -40,7 +40,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::fmt;
+use core::{cell::RefCell, fmt};
 use smallvec::SmallVec;
 
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
@@ -50,6 +50,14 @@ use crate::{
     SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary,
     field_of, index_of, is_falsey, literal_value,
 };
+
+/// Index into a *defining function's own* `consts`/`templates` arrays
+/// (never a global pool — a nested `fn` is only ever referenced from the
+/// one `Instr::MakeClosure` site that defines it). Flattened: `0..consts.len()`
+/// addresses `consts`, `consts.len()..` addresses `templates`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FnId(pub u32);
 
 type HashSet<T> = hashbrown::HashSet<T, foldhash::fast::RandomState>;
 type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
@@ -141,6 +149,26 @@ pub enum Instr {
     /// [`SMALL_INTS`], `BitAnd`/`BitOr`/`BitXor` from [`TINY_MASKS`], and
     /// the six comparisons from [`TINY_INTS`].
     BinaryInt(BinOpKind, i16),
+    /// `→ v` — push a copy of own-frame slot `slot` (a local some nested
+    /// `fn` captures). Falls back to the enclosing scope, same as
+    /// [`Instr::LoadSlot`], when not yet assigned.
+    LoadCap(SlotId),
+    /// `v →` — pop and store into own-frame slot `slot`.
+    StoreCap(SlotId),
+    /// `→ v` — push nested `fn` `i` from the *defining function's own*
+    /// `consts`/`templates` arrays (flattened: `i < consts.len()` clones a
+    /// ready value, otherwise instantiates `templates[i - consts.len()]`,
+    /// attaching the current function's captured-frame — or, if it has
+    /// none, its own parent — as the new closure's parent scope). A
+    /// nested `fn` is only ever read from the one site that defines it,
+    /// so it lives on the defining function rather than a shared pool.
+    MakeClosure(FnId),
+    /// `→ v` — push `names[i]` read by name from the function's parent
+    /// scope, walking as many further ancestors as needed. Used when a
+    /// outer name doesn't live in the *immediate* parent's own schema (so
+    /// no fixed [`SlotId`] can be resolved at compile time) — [`Instr::LoadParent`]
+    /// stays the fast path for the common one-hop case.
+    LoadParentByName(StringId),
 }
 
 /// One byte per instruction, with the operand width — or the operand
@@ -168,7 +196,15 @@ mod opcode {
     pub const INC_SLOT_END: u8 = INC_SLOT + 10;
     pub const DEC_SLOT: u8 = INC_SLOT_END;
     pub const DEC_SLOT_END: u8 = DEC_SLOT + 10;
-    pub const MAKE_LIST: u8 = DEC_SLOT_END;
+    /// Own-frame equivalents of LOAD_SLOT/STORE_SLOT, for locals a nested
+    /// `fn` captures — same inline/u8/u16/u32 operand shape, just reading
+    /// and writing the function's reified [`crate::Frame`] instead of the
+    /// shared operand stack.
+    pub const LOAD_CAP: u8 = DEC_SLOT_END;
+    pub const LOAD_CAP_END: u8 = LOAD_CAP + 10;
+    pub const STORE_CAP: u8 = LOAD_CAP_END;
+    pub const STORE_CAP_END: u8 = STORE_CAP + 10;
+    pub const MAKE_LIST: u8 = STORE_CAP_END;
     pub const MAKE_LIST_END: u8 = MAKE_LIST + 10;
     pub const MAKE_RECORD: u8 = MAKE_LIST_END;
     pub const MAKE_RECORD_END: u8 = MAKE_RECORD + 10;
@@ -188,9 +224,17 @@ mod opcode {
     pub const GET_FIELD_END: u8 = GET_FIELD + 3;
     pub const SET_FIELD: u8 = GET_FIELD_END;
     pub const SET_FIELD_END: u8 = SET_FIELD + 3;
+    /// `→ closure` — instantiate a `fn` template from the const pool,
+    /// attaching the executing function's own captured-frame (or, if it
+    /// has none, passing its own parent straight through) as the new
+    /// closure's parent scope.
+    pub const MAKE_CLOSURE: u8 = SET_FIELD_END;
+    pub const MAKE_CLOSURE_END: u8 = MAKE_CLOSURE + 3;
+    pub const LOAD_PARENT_BY_NAME: u8 = MAKE_CLOSURE_END;
+    pub const LOAD_PARENT_BY_NAME_END: u8 = LOAD_PARENT_BY_NAME + 3;
 
     /// One opcode per operator kind — no operand bytes at all.
-    pub const UNARY: u8 = SET_FIELD_END; // + unop_to_byte(kind), 4 kinds
+    pub const UNARY: u8 = LOAD_PARENT_BY_NAME_END; // + unop_to_byte(kind), 4 kinds
     pub const UNARY_END: u8 = UNARY + 4;
     pub const BINARY: u8 = UNARY_END; // + binop_to_byte(kind), 16 kinds
     pub const BINARY_END: u8 = BINARY + 16;
@@ -511,13 +555,17 @@ fn instr_len(i: &Instr) -> usize {
         | Instr::MakeRecord(v)
         | Instr::Call(v)
         | Instr::IncSlot(SlotId(v))
-        | Instr::DecSlot(SlotId(v)) => operand_len(*v),
+        | Instr::DecSlot(SlotId(v))
+        | Instr::LoadCap(SlotId(v))
+        | Instr::StoreCap(SlotId(v)) => operand_len(*v),
 
         Instr::Const(ConstId(v))
         | Instr::LoadGlobal(StringId(v))
         | Instr::Bind(PatId(v))
         | Instr::GetField(StringId(v))
-        | Instr::SetField(StringId(v)) => width_len(*v),
+        | Instr::SetField(StringId(v))
+        | Instr::MakeClosure(FnId(v))
+        | Instr::LoadParentByName(StringId(v)) => width_len(*v),
 
         Instr::Unary(_) | Instr::Binary(_) | Instr::BinaryInt(..) => 0,
 
@@ -539,8 +587,9 @@ fn instr_len(i: &Instr) -> usize {
 /// Jump operands inside are byte offsets into this array. Decode back to
 /// [`Instr`] with [`Code::disassemble`] (the `Debug` impl prints a
 /// listing).
+#[derive(Clone)]
 pub struct Code {
-    bytes: Box<[u8]>,
+    bytes: Rc<[u8]>,
 }
 
 /// Encode instructions into bytes. Jump operands come in as instruction
@@ -626,11 +675,17 @@ pub fn encode(instrs: &[Instr]) -> Code {
             }
             Instr::IterPop => bytes.push(opcode::ITER_POP),
             Instr::Return => bytes.push(opcode::RETURN),
+            Instr::LoadCap(slot) => push_op(&mut bytes, opcode::LOAD_CAP, slot.0),
+            Instr::StoreCap(slot) => push_op(&mut bytes, opcode::STORE_CAP, slot.0),
+            Instr::MakeClosure(t) => push_wop(&mut bytes, opcode::MAKE_CLOSURE, t.0),
+            Instr::LoadParentByName(v) => {
+                push_wop(&mut bytes, opcode::LOAD_PARENT_BY_NAME, v.0)
+            }
         }
     }
 
     Code {
-        bytes: bytes.into_boxed_slice(),
+        bytes: Rc::from(bytes),
     }
 }
 
@@ -764,6 +819,24 @@ impl Code {
                 opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
                 opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
                 opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
+                opcode::LOAD_CAP..opcode::LOAD_CAP_END => Instr::LoadCap(SlotId(decode_operand(
+                    op - opcode::LOAD_CAP,
+                    code,
+                    &mut pc,
+                )?)),
+                opcode::STORE_CAP..opcode::STORE_CAP_END => Instr::StoreCap(SlotId(
+                    decode_operand(op - opcode::STORE_CAP, code, &mut pc)?,
+                )),
+                opcode::MAKE_CLOSURE..opcode::MAKE_CLOSURE_END => Instr::MakeClosure(FnId(
+                    decode_wop(op - opcode::MAKE_CLOSURE, code, &mut pc)?,
+                )),
+                opcode::LOAD_PARENT_BY_NAME..opcode::LOAD_PARENT_BY_NAME_END => {
+                    Instr::LoadParentByName(StringId(decode_wop(
+                        op - opcode::LOAD_PARENT_BY_NAME,
+                        code,
+                        &mut pc,
+                    )?))
+                }
                 _ => return Err(RuntimeError::Other("vm: unknown opcode".into())),
             };
         Ok((instr, pc))
@@ -995,6 +1068,119 @@ impl CompiledPat {
     }
 }
 
+/// Runtime storage for a compiled scope's reified captured locals. Chains
+/// to whatever *its own* nearest used ancestor is (`outer`) — set once,
+/// at materialization time, from whichever `CompiledFn`/`CompiledFrame`
+/// created it — so a multi-level lookup keeps walking past this frame if
+/// the slot it lands on here was itself never assigned. A scope that
+/// captures nothing (and whose descendants read nothing from it) never
+/// gets one of these at all: `Instr::MakeClosure` skips straight past it,
+/// so no hop — nor allocation — is ever spent on a transparent level.
+#[derive(Debug)]
+pub struct CompiledFrame {
+    names: SmallVec<[StringId; 8]>,
+    slots: RefCell<SmallVec<[Val; 8]>>,
+    /// Per-own-slot fallback for a read-before-assignment: `Some(offset)`
+    /// is a flat offset to keep walking from `outer`; `None` falls to
+    /// `outer_named` by name, then the global scope.
+    fallback: Rc<[Option<u32>]>,
+    outer: Option<Rc<CompiledFrame>>,
+    outer_named: Option<Rc<Frame>>,
+}
+
+impl CompiledFrame {
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(crate) fn get_local(&self, slot: SlotId) -> Val {
+        self.slots.borrow()[slot.0 as usize].clone()
+    }
+
+    fn set(&self, slot: SlotId, val: Val) {
+        self.slots.borrow_mut()[slot.0 as usize] = val;
+    }
+
+    /// Read `slot`, falling back through `outer`/`outer_named`/globals if
+    /// it was never assigned.
+    fn get(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        let val = self.get_local(slot);
+        if !matches!(val, Val::Uninit) {
+            return Ok(val);
+        }
+        core::hint::cold_path();
+        self.resolve_outer(slot, rt)
+    }
+
+    fn resolve_outer(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        let val = match self.fallback[slot.0 as usize] {
+            Some(offset) => match &self.outer {
+                Some(o) => o.get_flat(offset, rt)?,
+                None => Val::Uninit,
+            },
+            None => {
+                let name = self.names[slot.0 as usize];
+                match &self.outer_named {
+                    Some(f) => f.get_var(name, rt),
+                    None => rt.get_var(name),
+                }
+            }
+        };
+        val.init_or_else(|| {
+            RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.names[slot.0 as usize]))
+        })
+    }
+
+    /// Walk a flat offset starting at `self`, subtracting each frame's own
+    /// slot count until it lands within one, then reads (with fallback)
+    /// there. `Instr::MakeClosure` only ever chains together frames that
+    /// actually own something, so every hop here is real work, never a
+    /// wasted step through a transparent level.
+    fn get_flat(&self, mut offset: u32, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        let mut frame = self;
+        loop {
+            let size = frame.len() as u32;
+            if offset < size {
+                return frame.get(SlotId(offset), rt);
+            }
+            offset -= size;
+            match &frame.outer {
+                Some(next) => frame = next,
+                None => {
+                    return Err(RuntimeError::Other(
+                        "vm: flat outer slot out of range".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// A function's own name schema, fixed at compile time — never holds slot
+/// values. Ancestor schemas are threaded separately during compilation as
+/// a flat list (see `Compiler::ancestors`/`CompileParent`) rather than a
+/// chain living on `Schema` itself — a schema only ever needs to describe
+/// its own scope.
+#[derive(Debug)]
+pub struct Schema {
+    names: SmallVec<[StringId; 8]>,
+    /// Whether this specific scope actually reifies captured locals into
+    /// live storage at runtime (occupies a slot in the flat address space,
+    /// and gets a real [`CompiledFrame`] at `Instr::MakeClosure` time) or
+    /// is a transparent pass-through (skipped by both the compile-time
+    /// walk and the runtime attachment).
+    owns_frame: bool,
+}
+
+impl Schema {
+    fn name_slot(&self, name: StringId) -> Option<SlotId> {
+        self.names
+            .iter()
+            .position(|&n| n == name)
+            .map(|i| SlotId(i as u32))
+    }
+}
+
 /// A function lowered to instructions. Its operands index the pools of the
 /// [`VmContext`] it was compiled against — running it on a different
 /// runtime's context yields wrong constants or errors.
@@ -1013,10 +1199,71 @@ pub struct CompiledFn {
 
     /// Variable-length-encoded instructions (see [`Code`]).
     pub code: Code,
-    /// Environment of the module this function was defined in, if any;
-    /// installed as the current module for the duration of a call so free
-    /// names resolve module-first.
-    pub frame: Rc<Frame>,
+    /// This function's own local names, indexed by [`SlotId`] — the
+    /// by-name fallback source for a stack/captured slot read before
+    /// assignment when [`CompiledFn::fallback`] has no flat answer. Also
+    /// what a fresh [`CompiledFrame`] is built from when this function
+    /// owns one.
+    pub(crate) own_names: SmallVec<[StringId; 8]>,
+    /// Per-own-slot precomputed fallback target for a read-before-assignment:
+    /// `Some(offset)` is a flat offset into `outer`; `None` falls to
+    /// `outer_named` by name, then the global scope.
+    fallback: Rc<[Option<u32>]>,
+    /// Whether this function has locals some nested `fn` captures — if so,
+    /// each call reifies a fresh [`CompiledFrame`] for just those slots
+    /// (`Instr::LoadCap`/`Instr::StoreCap`); otherwise every local stays a
+    /// zero-allocation stack slot, exactly like a function with no nested
+    /// closures at all.
+    pub owns_frame: bool,
+    /// The nearest ancestor [`CompiledFrame`] this function (or something
+    /// it calls through `Instr::MakeClosure`) actually reads from — using
+    /// it by way of a nested closure counts as using it. `None` for a
+    /// plain (non-instantiated) compiled function: only ever populated
+    /// when `Instr::MakeClosure` builds a real closure over a live
+    /// enclosing scope.
+    outer: Option<Rc<CompiledFrame>>,
+    /// Nearest AST-walking ancestor, if this function (or its compiled
+    /// lineage) was ultimately defined inside walked code. `None` inside a
+    /// module, which has no walked ancestor by construction.
+    outer_named: Option<Rc<Frame>>,
+    /// Nested `fn`s defined directly in this function's own body that
+    /// don't capture anything — ready `Val::Fn` values, indexed
+    /// `0..consts.len()` by `Instr::MakeClosure`. Never referenced from
+    /// anywhere but this function's own bytecode, so they live here
+    /// instead of a runtime-shared pool.
+    consts: Rc<[Val]>,
+    /// Nested `fn`s defined directly in this function's own body that DO
+    /// capture something — indexed `consts.len()..` by `Instr::MakeClosure`.
+    templates: Rc<[Rc<FnTemplate>]>,
+}
+
+/// A `fn` compiled once as a reusable template — no ancestor frame
+/// attached yet. Instantiated into a real [`CompiledFn`] by
+/// `Instr::MakeClosure` each time its defining statement executes, so a
+/// function called multiple times produces independent closures over that
+/// call's own captured locals. Functions that don't capture anything from
+/// an enclosing scope skip this entirely and compile straight to a
+/// [`CompiledFn`] constant.
+#[derive(Debug)]
+pub struct FnTemplate {
+    pub arity: u32,
+    pub frame_size: u32,
+    pub code: Code,
+    own_names: SmallVec<[StringId; 8]>,
+    fallback: Rc<[Option<u32>]>,
+    owns_frame: bool,
+    /// Whether this template actually reads something from its defining
+    /// function's own reified frame (as opposed to only reading further
+    /// out, or nothing at all) — decides whether `Instr::MakeClosure`
+    /// attaches that frame directly or skips straight past it to whatever
+    /// the defining function's own `outer` already is.
+    needs_own_frame: bool,
+    /// This function's own nested `fn`s, carried through so the
+    /// instantiated [`CompiledFn`] has them too (see `CompiledFn::consts`/
+    /// `CompiledFn::templates`) — shared, not copied, across every
+    /// instantiation of this template.
+    consts: Rc<[Val]>,
+    templates: Rc<[Rc<FnTemplate>]>,
 }
 
 impl CompiledFn {
@@ -1033,6 +1280,28 @@ impl CompiledFn {
         Val::Fn(FnVal::new_dyn(self))
     }
 
+    /// Resolve slot `slot` against this function's own enclosing scope —
+    /// used when a stack slot or captured slot is read before assignment.
+    fn resolve_outer(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        let val = match self.fallback[slot.0 as usize] {
+            Some(offset) => match &self.outer {
+                Some(o) => o.get_flat(offset, rt)?,
+                None => Val::Uninit,
+            },
+            None => {
+                let name = self.own_names[slot.0 as usize];
+                match &self.outer_named {
+                    Some(f) => f.get_var(name, rt),
+                    None => rt.get_var(name),
+                }
+            }
+        };
+
+        val.init_or_else(|| {
+            RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.own_names[slot.0 as usize]))
+        })
+    }
+
     fn get_slot(&self, base: usize, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
         let val = rt.stack.get(base + slot.0 as usize).clone();
         if !matches!(val, Val::Uninit) {
@@ -1040,39 +1309,27 @@ impl CompiledFn {
         }
 
         core::hint::cold_path();
-
-        // self.frame.get(slot, rt).init_or_else(|| {
-        //     RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.frame.name(slot)))
-        // })
-
-        let val = match &self.frame.parent {
-            Some(parent) => {
-                if let Some(slot) = parent.slot_map[slot.0 as usize] {
-                    parent.frame.get(slot, rt)
-                } else {
-                    let name = self.frame.names.borrow()[slot.0 as usize];
-                    rt.get_var(name)
-                }
-            }
-            None => {
-                let name = self.frame.names.borrow()[slot.0 as usize];
-                rt.get_var(name)
-            }
-        };
-
-        val.init_or_else(|| {
-            RuntimeError::UnboundIdentifier(rt.ctx.get_string(self.frame.name(slot)))
-        })
+        self.resolve_outer(slot, rt)
     }
 
-    fn get_parent(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
-        match &self.frame.parent {
+    fn get_cap(
+        &self,
+        own: &CompiledFrame,
+        slot: SlotId,
+        rt: &mut Runtime,
+    ) -> Result<Val, RuntimeError> {
+        own.get(slot, rt)
+    }
+
+    /// Walk a flat offset from this function's own nearest used ancestor —
+    /// no per-instruction list lookup, just a chain of frames that
+    /// actually own something.
+    fn get_parent(&self, flat: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
+        match &self.outer {
+            Some(o) => o.get_flat(flat.0, rt),
             None => Err(RuntimeError::Other(
                 "vm: load parent from function with no parent scope".into(),
             )),
-            Some(parent) => parent.frame.get(slot, rt).init_or_else(|| {
-                RuntimeError::UnboundIdentifier(rt.ctx.get_string(parent.frame.name(slot)))
-            }),
         }
     }
 }
@@ -1165,34 +1422,131 @@ impl fmt::Display for CompileError {
 /// outside a loop, malformed literals). Callers are expected to fall back to
 /// the AST walker on error, which reproduces the interpreter's runtime
 /// behavior for those cases.
+pub enum CompileParent {
+    /// Nested inside another compiled function — the flat, nearest-first
+    /// list of ancestor schemas visible from here (built by the caller:
+    /// the immediately enclosing function's own schema prepended if it
+    /// owns a frame, otherwise its own list passed straight through), plus
+    /// whether there's a walked boundary somewhere beyond that list.
+    Nested {
+        schemas: Rc<[Rc<Schema>]>,
+        walked_tail: bool,
+    },
+    /// Compiled directly under AST-walked code (module/REPL root, or an
+    /// `AstFn`'s frame) — the live frame to attach to the *returned*
+    /// `CompiledFn` directly, since (unlike a nested closure, instantiated
+    /// fresh by `Instr::MakeClosure`) it's never re-materialized later.
+    /// No compile-time schema list at all — anything not found locally
+    /// resolves by name at runtime instead.
+    Walked(Rc<Frame>),
+}
+
 pub fn compile_fn(
     rt: &mut Runtime,
     params: Rc<[Pat]>,
     body: &[Stmt],
-    parent: Rc<Frame>,
-) -> Result<CompiledFn, CompileError> {
+    parent: CompileParent,
+    force_captured: &[Rc<str>],
+) -> Result<(CompiledFn, Rc<Schema>), CompileError> {
     let arity = params.len() as u32;
     let mut slots = SlotTable::with_params(&params);
     slots.add_stmts(body);
+
+    // which of this function's own slots some nested `fn` reads — those
+    // need a per-call reified Frame instead of a stack slot. `force_captured`
+    // additionally pins specific names to the reified frame regardless of
+    // whether anything nested reads them — used by modules to keep
+    // exported bindings alive past the compiled body's own `Return`, which
+    // otherwise truncates the stack region ordinary locals live in.
+    let mut captured = slots.mark_captured(body);
+    for name in force_captured {
+        if let Some(slot) = slots.get(name) {
+            captured[slot.0 as usize] = true;
+        }
+    }
+    let owns_frame = captured.iter().any(|&c| c);
+
+    if owns_frame && body_has_destructuring(&params, body) {
+        // a captured local bound through list/record destructuring would
+        // need `Instr::Bind` to write a frame slot instead of a stack
+        // slot, which isn't supported yet — fall back to the AST walker
+        // for the whole function rather than risk it landing on the stack
+        let span = params
+            .first()
+            .map(|p| p.span())
+            .or_else(|| body.first().map(|s| s.span()))
+            .unwrap_or(Span::point(0));
+        return Err(CompileError::new(
+            span,
+            "captured locals bound through destructuring aren't supported yet",
+        ));
+    }
+
+    // this function's own name schema — used both to compile nested `fn`
+    // statements (so a grandchild resolves through *this* function's own
+    // scope, not straight past it) and as this function's own by-name
+    // fallback source
+    let names = slots.names(rt);
+    let schema = Rc::new(Schema {
+        names: names.clone(),
+        owns_frame,
+    });
+
+    let (ancestors, walked_tail, outer_named): (Rc<[Rc<Schema>]>, bool, Option<Rc<Frame>>) =
+        match &parent {
+            CompileParent::Nested {
+                schemas,
+                walked_tail,
+            } => (schemas.clone(), *walked_tail, None),
+            CompileParent::Walked(f) => (Rc::from([]), true, Some(f.clone())),
+        };
+
+    // precompute, for each of this function's own slots, where a
+    // read-before-assignment resolves — `Instr::LoadSlot`/`Instr::LoadCap`
+    // consult this at runtime instead of re-walking anything
+    let fallback: Rc<[Option<u32>]> = names
+        .iter()
+        .map(|&n| match resolve_outer_name(&ancestors, n) {
+            OuterResolution::Flat(offset) => Some(offset),
+            OuterResolution::ByName => None,
+        })
+        .collect::<Vec<_>>()
+        .into();
 
     let mut c = Compiler {
         rt,
         slots,
         code: Vec::new(),
         loops: Vec::new(),
-        parent: parent.clone(),
+        ancestors,
+        walked_tail,
+        own_schema: schema.clone(),
+        captured,
+        nested_consts: Vec::new(),
+        nested_templates: Vec::new(),
+        template_refs: Vec::new(),
     };
 
     // prologue: unpack destructuring parameters out of their argument
     // slots into the named slots they bind (plain-ident parameters simply
-    // stay where their argument landed)
+    // stay where their argument landed), and copy captured plain-ident
+    // parameters into the own-frame slot their reads/writes will target
     for (i, p) in params.iter().enumerate() {
-        if !matches!(p.kind(), PatKind::Ident(_)) {
-            let arg_slot = arity - 1 - i as u32;
-            c.emit(Instr::LoadSlot(SlotId(arg_slot)));
-            let pattern = compile_pat(p, &c.slots, &mut c.rt.ctx);
-            let pattern = c.rt.ctx.pattern(pattern);
-            c.emit(Instr::Bind(pattern));
+        let arg_slot = SlotId(arity - 1 - i as u32);
+        match p.kind() {
+            PatKind::Ident(id) if id.name() == "_" => {}
+            PatKind::Ident(_) => {
+                if c.captured[arg_slot.0 as usize] {
+                    c.emit(Instr::LoadSlot(arg_slot));
+                    c.emit(Instr::StoreCap(arg_slot));
+                }
+            }
+            _ => {
+                c.emit(Instr::LoadSlot(arg_slot));
+                let pattern = compile_pat(p, &c.slots, &mut c.rt.ctx);
+                let pattern = c.rt.ctx.pattern(pattern);
+                c.emit(Instr::Bind(pattern));
+            }
         }
     }
 
@@ -1201,17 +1555,40 @@ pub fn compile_fn(
     c.compile_block(body, true)?;
     c.emit(Instr::Return);
 
-    let names = c.slots.names(c.rt);
     let frame_size = c.slots.next.0 - arity;
 
-    let frame = Frame::from_names(names).with_parent(parent);
+    // `nested_templates` occupy the flat range starting right after
+    // `nested_consts` — final only now that no more consts can be added —
+    // so every `MakeClosure` site recorded against a template gets its
+    // local (templates-only) index shifted up by the final consts count
+    let consts_len = c.nested_consts.len() as u32;
+    for &site in &c.template_refs {
+        if let Instr::MakeClosure(FnId(idx)) = &mut c.code[site] {
+            *idx += consts_len;
+        } else {
+            unreachable!("template_refs must only record Instr::MakeClosure sites");
+        }
+    }
 
-    Ok(CompiledFn {
-        arity: arity,
-        frame_size,
-        code: encode(&c.code),
-        frame: Rc::new(frame),
-    })
+    Ok((
+        CompiledFn {
+            arity,
+            frame_size,
+            code: encode(&c.code),
+            own_names: names,
+            fallback,
+            owns_frame,
+            // a plain compile_fn result is only ever used directly (never
+            // re-instantiated): a top-level walked/module fn, or a nested
+            // fn that doesn't capture anything. Either way nothing reads
+            // through `outer`.
+            outer: None,
+            outer_named,
+            consts: c.nested_consts.into(),
+            templates: c.nested_templates.into(),
+        },
+        schema,
+    ))
 }
 
 struct LoopCtx {
@@ -1227,6 +1604,80 @@ struct LoopCtx {
     /// out of it must then push the loop's value (nil) for the function
     /// result.
     tail: bool,
+}
+
+/// Whether `params`/`body` bind any name through a destructuring pattern
+/// (list/record pattern, or a non-plain-ident `for` target) rather than a
+/// plain identifier. Doesn't recurse into nested `fn` bodies — their own
+/// destructuring is their own concern. Captured *destructured* names aren't
+/// supported yet (`Instr::Bind` always writes to a stack slot); a function
+/// that both owns a captured-frame and destructures anywhere falls back to
+/// the AST walker rather than risk a captured local silently living on the
+/// stack.
+fn body_has_destructuring(params: &[Pat], body: &[Stmt]) -> bool {
+    fn is_destructuring(p: &Pat) -> bool {
+        !matches!(p.kind(), PatKind::Ident(_))
+    }
+    fn stmts_have(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s.kind() {
+            StmtKind::AssignPat { target, .. } => is_destructuring(target),
+            StmtKind::For {
+                target,
+                body,
+                else_branch,
+                ..
+            } => {
+                is_destructuring(target)
+                    || stmts_have(body)
+                    || else_branch.as_deref().is_some_and(stmts_have)
+            }
+            StmtKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => stmts_have(then_branch) || else_branch.as_deref().is_some_and(stmts_have),
+            StmtKind::While {
+                body, else_branch, ..
+            } => stmts_have(body) || else_branch.as_deref().is_some_and(stmts_have),
+            _ => false,
+        })
+    }
+    params.iter().any(is_destructuring) || stmts_have(body)
+}
+
+/// Whether `name_id` resolves anywhere in `schema`'s compile-time-known
+/// ancestor chain (`schema` itself counts as depth 0). Used to decide
+/// between the fast [`Instr::LoadParent`] (a flat offset, however many
+/// materialized ancestors it spans) and the by-name [`Instr::LoadParentByName`].
+enum OuterResolution {
+    /// Found at a flat offset spanning every materialized ancestor nearer
+    /// than the one that owns it — matches `Instr::MakeClosure`'s runtime
+    /// chain, which only ever links frames that actually own something, so
+    /// walking it and subtracting slot counts lands in the same place.
+    Flat(u32),
+    /// Not resolvable to a fixed slot at compile time — not in the
+    /// ancestor list, either because it's genuinely free or because it
+    /// lives in a walked ancestor beyond the compiled list (a `Schema`
+    /// never represents one, so there's no way to tell which at compile
+    /// time). Resolve by name at runtime instead — `Frame::get_var`'s
+    /// recursive chain-walk finds it either way, or the true global scope.
+    ByName,
+}
+
+/// Resolve `name_id` against the flat, nearest-first list of ancestor
+/// schemas visible from here, computing the cumulative slot offset across
+/// however many of them sit between here and the one that owns it (every
+/// entry in `ancestors` owns a frame by construction, so all of them
+/// contribute).
+fn resolve_outer_name(ancestors: &[Rc<Schema>], name_id: StringId) -> OuterResolution {
+    let mut offset = 0u32;
+    for schema in ancestors {
+        if let Some(slot) = schema.name_slot(name_id) {
+            return OuterResolution::Flat(offset + slot.0);
+        }
+        offset += schema.names.len() as u32;
+    }
+    OuterResolution::ByName
 }
 
 /// If `expr` is an integer literal (possibly under unary minus), return
@@ -1253,7 +1704,43 @@ struct Compiler<'a> {
     slots: SlotTable,
     code: Vec<Instr>,
     loops: Vec<LoopCtx>,
-    parent: Rc<Frame>,
+    /// Flat, nearest-first list of ancestor schemas visible from here —
+    /// used to resolve this function's *own* outer names
+    /// (`emit_load_name`). Empty when nested directly under AST-walked
+    /// code (module/REPL root, an `AstFn`'s frame): anything not locally
+    /// bound resolves by name at runtime instead.
+    ancestors: Rc<[Rc<Schema>]>,
+    /// Whether there's a walked ancestor somewhere beyond `ancestors` —
+    /// decides `Instr::LoadParentByName` vs `Instr::LoadGlobal` when a free
+    /// name isn't found in `ancestors`.
+    walked_tail: bool,
+    /// This function's own schema — used to build the ancestor list when
+    /// compiling a *nested* `fn` statement, so a grandchild resolves
+    /// through this function's own captured slots (previously nested fns
+    /// skipped straight to `parent`, missing this function's own scope
+    /// entirely).
+    own_schema: Rc<Schema>,
+    /// Which of this function's own slots (by [`SlotId`]) are captured by
+    /// some nested `fn` — those live in a per-call [`CompiledFrame`]
+    /// instead of a stack slot.
+    captured: Vec<bool>,
+    /// Nested `fn`s defined directly in this function's body that don't
+    /// capture anything — becomes this `CompiledFn`'s own `consts`.
+    /// `Instr::MakeClosure` operands referencing these are final as soon
+    /// as they're emitted (they occupy the flat range `0..consts.len()`).
+    nested_consts: Vec<Val>,
+    /// Nested `fn`s that DO capture something — becomes this `CompiledFn`'s
+    /// own `templates`. These occupy the flat range starting at
+    /// `nested_consts.len()`, which isn't final until compilation finishes
+    /// (more consts can still be added afterward), so `Instr::MakeClosure`
+    /// operands emitted for these start as a *local* templates-only index
+    /// and get `nested_consts.len()` added on once it's known — see
+    /// `template_refs`.
+    nested_templates: Vec<Rc<FnTemplate>>,
+    /// `c.code` indices of `Instr::MakeClosure` sites referencing
+    /// `nested_templates` by local (unshifted) index, patched to the final
+    /// flat index once `nested_consts` stops growing.
+    template_refs: Vec<usize>,
 }
 
 impl Compiler<'_> {
@@ -1299,6 +1786,12 @@ impl Compiler<'_> {
         let Some(slot) = self.slots.get(id.name()) else {
             return false;
         };
+        if self.captured[slot.0 as usize] {
+            // IncSlot/DecSlot only ever touch the stack; a captured slot
+            // lives in the own-frame instead, so fall through to the
+            // general load/add/store path
+            return false;
+        }
 
         self.emit(if op.kind() == BinOpKind::Add {
             Instr::IncSlot(slot)
@@ -1322,7 +1815,11 @@ impl Compiler<'_> {
                     .slots
                     .get(id.name())
                     .expect("collect_slots missed an assignment target");
-                self.emit(Instr::StoreSlot(slot));
+                self.emit(if self.captured[slot.0 as usize] {
+                    Instr::StoreCap(slot)
+                } else {
+                    Instr::StoreSlot(slot)
+                });
             }
             _ => {
                 let p = compile_pat(target, &self.slots, &mut self.rt.ctx);
@@ -1360,17 +1857,21 @@ impl Compiler<'_> {
     fn emit_load_name(&mut self, name: Rc<str>) {
         match self.slots.get(&name) {
             Some(index) => {
-                self.emit(Instr::LoadSlot(index));
+                self.emit(if self.captured[index.0 as usize] {
+                    Instr::LoadCap(index)
+                } else {
+                    Instr::LoadSlot(index)
+                });
             }
             None => {
                 let name_id = self.rt.ctx.string(name);
 
-                match self.parent.name_slot(name_id) {
-                    Some(parent_slot) => {
-                        self.emit(Instr::LoadParent(parent_slot));
+                match resolve_outer_name(&self.ancestors, name_id) {
+                    OuterResolution::Flat(offset) => {
+                        self.emit(Instr::LoadParent(SlotId(offset)));
                     }
-                    None => {
-                        self.emit(Instr::LoadGlobal(name_id));
+                    OuterResolution::ByName => {
+                        self.emit(Instr::LoadParentByName(name_id));
                     }
                 }
             }
@@ -1601,15 +2102,92 @@ impl Compiler<'_> {
                 self.emit(Instr::Jump(continue_to));
             }
             StmtKind::Fn { name, params, body } => {
-                // nested definitions are compiled too, becoming constants
-                let compiled = compile_fn(self.rt, params.clone(), body, self.parent.clone())?;
-                let i = self.rt.ctx.const_(compiled.into_function());
-                self.emit(Instr::Const(i));
+                // does the nested fn (or something nested *inside* it,
+                // transitively — `fn_outer_names` already recurses)
+                // actually read one of *this* function's own names? Owning
+                // a frame at all doesn't mean every nested fn needs it —
+                // only ones that reference it should pay for the hop, so
+                // this is decided per-child, not from `self.own_schema.owns_frame`
+                // (which only says *something* nested in this function
+                // needs it, not that *this particular* one does).
+                let free = crate::fn_outer_names(params, body);
+                let needs_own_schema = free.iter().any(|n| self.slots.get(n).is_some());
+                // invariant: this function's own prepass (`mark_captured`)
+                // scans every direct nested fn's outer names the same way
+                // — if this specific child needs the schema, that pass
+                // must already have flagged the function as owning a frame
+                debug_assert!(
+                    !needs_own_schema || self.own_schema.owns_frame,
+                    "child needs own schema but mark_captured didn't mark this function as owning a frame"
+                );
+
+                let child_ancestors: Rc<[Rc<Schema>]> = if needs_own_schema {
+                    let mut v = Vec::with_capacity(self.ancestors.len() + 1);
+                    v.push(self.own_schema.clone());
+                    v.extend(self.ancestors.iter().cloned());
+                    Rc::from(v)
+                } else {
+                    self.ancestors.clone()
+                };
+
+                let (compiled, _schema) = compile_fn(
+                    self.rt,
+                    params.clone(),
+                    body,
+                    CompileParent::Nested {
+                        schemas: child_ancestors,
+                        walked_tail: self.walked_tail,
+                    },
+                    &[],
+                )?;
+
+                // does the nested fn read anything not bound within
+                // itself? If not, it's fully self-contained and can
+                // compile to one shared constant, exactly as before.
+                // Otherwise (this also conservatively covers reading a
+                // genuine global — a `Schema` list can't tell "nothing
+                // out there" from "something in a walked ancestor" apart
+                // at compile time, see `resolve_outer_name`) each
+                // execution of this statement must produce its own
+                // closure over the live enclosing scope.
+                let captures_outer = !free.is_empty();
+
+                if captures_outer {
+                    let template = FnTemplate {
+                        arity: compiled.arity,
+                        frame_size: compiled.frame_size,
+                        code: compiled.code,
+                        own_names: compiled.own_names,
+                        fallback: compiled.fallback,
+                        owns_frame: compiled.owns_frame,
+                        needs_own_frame: needs_own_schema,
+                        consts: compiled.consts,
+                        templates: compiled.templates,
+                    };
+                    // local (templates-only) index for now — shifted to
+                    // the final flat index once `nested_consts` stops
+                    // growing (see the patch pass at the end of compile_fn)
+                    let local = self.nested_templates.len() as u32;
+                    self.nested_templates.push(Rc::new(template));
+                    let site = self.emit(Instr::MakeClosure(FnId(local)));
+                    self.template_refs.push(site);
+                } else {
+                    // consts occupy the flat range 0..consts.len() and
+                    // never move, so this index is final immediately
+                    let idx = self.nested_consts.len() as u32;
+                    self.nested_consts.push(compiled.into_function());
+                    self.emit(Instr::MakeClosure(FnId(idx)));
+                }
+
                 let slot = self
                     .slots
                     .get(name.name())
                     .expect("collect_slots missed a fn name");
-                self.emit(Instr::StoreSlot(slot));
+                self.emit(if self.captured[slot.0 as usize] {
+                    Instr::StoreCap(slot)
+                } else {
+                    Instr::StoreSlot(slot)
+                });
                 if tail {
                     self.emit(Instr::Nil); // definitions yield nil
                 }
@@ -1770,6 +2348,20 @@ impl Compiler<'_> {
 /// restores it on the way out, whether it returns a value or an error, so
 /// nested and recursive frames (including mixed-mode reentry through host
 /// or AST functions) compose without per-call stack allocations.
+/// Build a fresh, all-`Uninit` reified frame for `f`'s own captured
+/// locals, sharing `f`'s own fallback/outer/outer_named metadata directly
+/// (a captured slot's read-before-assignment behavior is identical to a
+/// stack slot's).
+fn make_own_frame(f: &CompiledFn) -> Rc<CompiledFrame> {
+    Rc::new(CompiledFrame {
+        names: f.own_names.clone(),
+        slots: RefCell::new(smallvec::smallvec![Val::Uninit; f.own_names.len()]),
+        fallback: f.fallback.clone(),
+        outer: f.outer.clone(),
+        outer_named: f.outer_named.clone(),
+    })
+}
+
 pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     // the caller's arguments are already on the stack and become the
     // frame's first slots; reserve the rest for body-introduced locals
@@ -1778,9 +2370,32 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
 
     rt.stack.extend_uninit(f.frame_size as usize);
 
-    let result = run_frame(rt, &f.code.bytes, base, f);
+    // a fresh reified frame per call, for locals some nested `fn` captures
+    // — none of this function's calls share captured state with another
+    let own = f.owns_frame.then(|| make_own_frame(f));
+
+    let result = run_frame(rt, &f.code.bytes, base, f, own.as_ref());
     debug_assert!(rt.stack.len() >= base);
     result
+}
+
+/// Run a compiled module body (a zero-arg [`CompiledFn`] whose `export`
+/// field names were force-captured by [`compile_fn`]) and hand back its
+/// reified frame, if it has one, so the caller can read exported values out
+/// of it. The body's own tail value (ordinarily `Nil`, since a module's
+/// last statement is rarely meaningful on its own) is discarded — `export`
+/// is structural, not part of the statement list `f` was compiled from.
+pub fn run_module(rt: &mut Runtime, f: &CompiledFn) -> Result<Option<Rc<CompiledFrame>>, RuntimeError> {
+    debug_assert_eq!(f.arity(), 0);
+    let base = rt.stack.len();
+    rt.stack.extend_uninit(f.frame_size as usize);
+
+    let own = f.owns_frame.then(|| make_own_frame(f));
+
+    run_frame(rt, &f.code.bytes, base, f, own.as_ref())?;
+    rt.stack.pop();
+    debug_assert_eq!(rt.stack.len(), base);
+    Ok(own)
 }
 
 /// Execute a compiled function's code. Parameters are expected to already be
@@ -1797,10 +2412,11 @@ pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<()
     // frame's first slots; reserve the rest for body-introduced locals
     debug_assert!(rt.stack.len() >= f.arity());
     let base = rt.stack.len() - f.arity();
-    rt.stack
-        .extend_uninit((f.frame.slots.borrow().len() as u32 - f.arity) as usize);
+    rt.stack.extend_uninit(f.frame_size as usize);
 
-    let result = run_frame(rt, code, base, f);
+    let own = f.owns_frame.then(|| make_own_frame(f));
+
+    let result = run_frame(rt, code, base, f, own.as_ref());
     debug_assert!(rt.stack.len() >= base);
     result
 }
@@ -1810,6 +2426,7 @@ fn run_frame(
     code: &[u8],
     base: usize,
     f: &CompiledFn,
+    own: Option<&Rc<CompiledFrame>>,
 ) -> Result<(), RuntimeError> {
     let mut iters = SmallVec::<[_; 4]>::new();
     let mut pc: usize = 0;
@@ -1865,6 +2482,19 @@ fn run_frame(
                 let v = f.get_parent(SlotId(slot), rt)?;
                 rt.stack.push(v);
             }
+            opcode::LOAD_PARENT_BY_NAME..opcode::LOAD_PARENT_BY_NAME_END => {
+                let i = decode_wop(op - opcode::LOAD_PARENT_BY_NAME, code, &mut pc)?;
+                let name = StringId(i);
+                let val = match &f.outer_named {
+                    Some(named) => named.get_var(name, rt),
+                    None => rt.get_var(name),
+                };
+                let v = val.init_or_else(|| {
+                    core::hint::cold_path();
+                    RuntimeError::UnboundIdentifier(rt.ctx.get_string(name))
+                })?;
+                rt.stack.push(v);
+            }
             opcode::LOAD_GLOBAL..opcode::LOAD_GLOBAL_END => {
                 let i = decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?;
                 let name = StringId(i);
@@ -1878,6 +2508,64 @@ fn run_frame(
                 let slot = decode_operand(op - opcode::STORE_SLOT, code, &mut pc)?;
                 let v = rt.stack.pop();
                 rt.stack.set(base + slot as usize, v);
+            }
+            opcode::LOAD_CAP..opcode::LOAD_CAP_END => {
+                let slot = decode_operand(op - opcode::LOAD_CAP, code, &mut pc)?;
+                let frame = own.expect("vm: LOAD_CAP in a function with no own frame");
+                let val = f.get_cap(frame, SlotId(slot), rt)?;
+                rt.stack.push(val);
+            }
+            opcode::STORE_CAP..opcode::STORE_CAP_END => {
+                let slot = decode_operand(op - opcode::STORE_CAP, code, &mut pc)?;
+                let v = rt.stack.pop();
+                let frame = own.expect("vm: STORE_CAP in a function with no own frame");
+                frame.set(SlotId(slot), v);
+            }
+            opcode::MAKE_CLOSURE..opcode::MAKE_CLOSURE_END => {
+                let i = decode_wop(op - opcode::MAKE_CLOSURE, code, &mut pc)? as usize;
+                // flattened: below f.consts.len() is a ready value (no
+                // parent to attach, just clone and push); at or above it
+                // indexes f.templates (offset back down) and needs a real
+                // closure built over the live enclosing scope
+                if i < f.consts.len() {
+                    rt.stack.push(f.consts[i].clone());
+                } else {
+                    let template = &f.templates[i - f.consts.len()];
+                    // attach this function's own captured-frame as the
+                    // child's nearest used ancestor only if the child
+                    // actually reads something from it (`needs_own_frame`,
+                    // decided per-child at compile time — owning a frame
+                    // at all doesn't mean every nested fn needs it);
+                    // otherwise skip straight past it to whatever this
+                    // function's own `outer` already is — resolved the
+                    // same way when this function was itself instantiated,
+                    // so by induction it's already the nearest ancestor
+                    // any of *this* function's compiled descendants could
+                    // need, and a chain of skipped levels collapses to a
+                    // single hop at runtime instead of one dead layer per
+                    // level
+                    let outer = if template.needs_own_frame {
+                        match own {
+                            Some(o) => Some(o.clone()),
+                            None => f.outer.clone(),
+                        }
+                    } else {
+                        f.outer.clone()
+                    };
+                    let child = CompiledFn {
+                        arity: template.arity,
+                        frame_size: template.frame_size,
+                        code: template.code.clone(),
+                        own_names: template.own_names.clone(),
+                        fallback: template.fallback.clone(),
+                        owns_frame: template.owns_frame,
+                        outer,
+                        outer_named: f.outer_named.clone(),
+                        consts: template.consts.clone(),
+                        templates: template.templates.clone(),
+                    };
+                    rt.stack.push(child.into_function());
+                }
             }
             opcode::BIND..opcode::BIND_END => {
                 let i = decode_wop(op - opcode::BIND, code, &mut pc)?;
@@ -2128,8 +2816,21 @@ fn run_frame(
 
                 let fval = rt.stack.peek();
                 match fval {
-                    Val::Fn(fval) if core::ptr::eq(&*fval.0, f) && f.arity == n => {
-                        // Calls self.
+                    // compare data addresses only (not the `dyn DynFn` fat
+                    // pointer): the callee's Rc<CompiledFn> and `f` may have
+                    // been unsize-coerced to `dyn DynFn` at different call
+                    // sites, which isn't guaranteed to produce the same
+                    // vtable pointer, so comparing the wide pointers
+                    // directly is unreliable
+                    Val::Fn(fval)
+                        if (Rc::as_ptr(&fval.0) as *const ())
+                            == (f as *const CompiledFn as *const ())
+                            && f.arity == n =>
+                    {
+                        // Calls self: discard the callee we just peeked (we
+                        // already know what it is) so the stack holds only
+                        // the arguments run_recursive's floor expects.
+                        rt.stack.pop();
                         run_recursive(rt, code, f)?;
                     }
                     _ => {
@@ -2211,24 +2912,23 @@ mod tests {
         let (walked_rt, walked_frame) = run_mode(src, false).expect("AST walker failed");
         let (mut vmed_rt, vmed_frame) = run_mode(src, true).expect("VM failed");
 
-        let mut walked_keys: Vec<_> = walked_frame
-            .names()
-            .into_iter()
-            .map(|k| walked_rt.ctx.get_string(k))
+        let walked_entries = walked_frame.own_entries();
+        let vmed_entries = vmed_frame.own_entries();
+
+        let mut walked_keys: Vec<_> = walked_entries
+            .iter()
+            .map(|&(k, _)| walked_rt.ctx.get_string(k))
             .collect();
-        let mut vmed_keys: Vec<_> = vmed_frame
-            .names()
-            .into_iter()
-            .map(|k| vmed_rt.ctx.get_string(k))
+        let mut vmed_keys: Vec<_> = vmed_entries
+            .iter()
+            .map(|&(k, _)| vmed_rt.ctx.get_string(k))
             .collect();
         walked_keys.sort();
         vmed_keys.sort();
         assert_eq!(walked_keys, vmed_keys, "modes bound different globals");
 
-        for (idx, walked_val) in walked_frame.slots().into_iter().enumerate() {
-            let name = walked_rt
-                .ctx
-                .get_string(walked_frame.name(SlotId(idx as u32)));
+        for (name_id, walked_val) in walked_entries.iter() {
+            let name = walked_rt.ctx.get_string(*name_id);
             let vmed_val = &vmed_frame.get_var(vmed_rt.ctx.string(name.clone()), &mut vmed_rt);
             assert_eq!(
                 format!("{walked_val}"),
@@ -2407,6 +3107,33 @@ export { x }
     }
 
     #[test]
+    fn module_level_self_recursion_takes_the_fast_path_correctly() {
+        // a module-captured function calling itself resolves the callee
+        // via LoadParent every time, so the self-recursive fast path in
+        // run_frame's CALL handling actually fires here (unlike a plain
+        // global-resolved recursive function) — regression test for a
+        // stack-imbalance bug in that path (the peeked callee wasn't
+        // popped before computing the recursive call's stack floor)
+        let mut rt = module_runtime(true);
+        let m = rt
+            .load_module(
+                "fibonly",
+                "fn fib n:
+  if n < 2: return n
+  (fib (n - 1)) + (fib (n - 2))
+export { fib }
+",
+            )
+            .unwrap();
+        rt.set_var("m", m);
+        let frame = Rc::new(Frame::new());
+        for st in &ast_from_str("r = m.fib 10\n") {
+            rt.exec_stmt(st, frame.clone()).unwrap();
+        }
+        assert_eq!(int_var(&mut rt, &frame, "r"), 55);
+    }
+
+    #[test]
     fn module_static_call_resolution_respects_reassignment() {
         for compiled in [false, true] {
             let mut rt = module_runtime(compiled);
@@ -2527,7 +3254,8 @@ export { f }
         };
         let mut rt = Runtime::new();
         let frame = Rc::new(Frame::new());
-        let compiled = compile_fn(&mut rt, params.clone(), body, frame).unwrap();
+        let (compiled, _) =
+            compile_fn(&mut rt, params.clone(), body, CompileParent::Walked(frame), &[]).unwrap();
         let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
         assert!(matches!(instrs.last(), Some(Instr::Return)));
         assert_eq!(compiled.arity(), 2);
@@ -2796,6 +3524,153 @@ export { f }
         assert_eq!(format!("{}", frame.get_var("r1", &mut rt)), "Pos");
         assert_eq!(format!("{}", frame.get_var("r2", &mut rt)), "Neg");
         assert_eq!(format!("{}", frame.get_var("r3", &mut rt)), "Zero");
+    }
+
+    #[test]
+    fn closure_captures_enclosing_function_local() {
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make_adder n:\n    fn add x:\n        x + n\n    return add\n\
+             f = make_adder 10\nr = f 5\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 15);
+    }
+
+    #[test]
+    fn closure_sees_captured_local_mutated_before_it_reads_it() {
+        // `n` is captured by `get`, so `n`'s two increments inside
+        // `make_thing` must land in the live per-call frame `get` reads
+        // from, not a stack slot `get` can't see
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make_thing base:\n    n = base\n    n = n + 1\n    n = n + 1\n    fn get:\n        return n\n    return get\n\
+             g1 = make_thing 10\nr1 = (g1)\n\
+             g2 = make_thing 100\nr2 = (g2)\n\
+             r1b = (g1)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 12);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), 102);
+        // g1's captured frame is independent of g2's — reading it again is
+        // unaffected by the second call of make_thing
+        assert_eq!(int_var(&mut rt, &frame, "r1b"), 12);
+    }
+
+    #[test]
+    fn closure_captures_through_non_capturing_middle_function() {
+        // `middle` doesn't itself reference `g` — only `inner` does — so
+        // `middle` must own no captured frame of its own and pass outer's
+        // live frame straight through
+        let (mut rt, frame) = assert_modes_agree(
+            "fn outer g:\n    fn middle:\n        fn inner:\n            return g + 1\n        return inner\n    return middle\n\
+             f = outer 100\nmid = (f)\nr = (mid)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 101);
+    }
+
+    #[test]
+    fn sibling_closure_unrelated_to_capture_still_works() {
+        // `outer` owns a frame because `user` captures `x` — `skip` is a
+        // sibling nested fn that reads nothing from `outer` at all, so it
+        // must not get `outer`'s frame attached, yet still has to work
+        // correctly (it's still a captures_outer fn, since global-vs-outer
+        // isn't distinguished at compile time — see `fn_outer_names`)
+        let (mut rt, frame) = assert_modes_agree(
+            "fn outer g:\n    x = g + 1\n    fn user:\n        return x\n    fn skip n:\n        return n + 1\n    return [user, skip]\n\
+             fns = outer 5\nu = fns[0]\ns = fns[1]\nr1 = (u)\nr2 = s 10\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 6);
+        assert_eq!(int_var(&mut rt, &frame, "r2"), 11);
+    }
+
+    #[test]
+    fn three_level_capture_with_siblings_at_every_depth() {
+        // level1 owns a frame for `a`,`b` (level3 needs both, transitively
+        // through level2). level2 owns a frame for `c`,`d` (level3 needs
+        // both). Three siblings at the bottom, each with a different
+        // capture shape:
+        //   level3         — reads a,b (level1) AND c,d (level2): a
+        //                    two-hop chain, level2's frame -> level1's
+        //   level3_sibling — reads only c (level2's own): must NOT carry
+        //                    level1's frame at all
+        //   level3_pure    — reads nothing: plain Const, no MakeClosure
+        // Two separate calls of level1/level2 must produce fully
+        // independent closures (no cross-talk), and re-reading the same
+        // closure twice must be stable.
+        let (mut rt, frame) = assert_modes_agree(
+            "fn level1 a:\n    b = a + 1\n    fn level2 c:\n        d = b + c\n        fn level3 e:\n            return a + b + c + d + e\n        fn level3_sibling:\n            return c * 2\n        fn level3_pure:\n            return 999\n        return [level3, level3_sibling, level3_pure]\n    return level2\n\
+             l2a = level1 10\nl2b = level1 100\n\
+             inner1 = l2a 5\ninner2 = l2b 50\n\
+             three1 = inner1[0]\nsib1 = inner1[1]\npure1 = inner1[2]\n\
+             three2 = inner2[0]\nsib2 = inner2[1]\npure2 = inner2[2]\n\
+             r1 = three1 20\nr1_sib = (sib1)\nr1_pure = (pure1)\n\
+             r2 = three2 200\nr2_sib = (sib2)\nr2_pure = (pure2)\n\
+             r1_again = three1 21\n",
+        );
+        // inner1: a=10, b=11, c=5, d=16
+        assert_eq!(int_var(&mut rt, &frame, "r1"), 62); // 10+11+5+16+20
+        assert_eq!(int_var(&mut rt, &frame, "r1_sib"), 10); // c*2
+        assert_eq!(int_var(&mut rt, &frame, "r1_pure"), 999);
+        // inner2: a=100, b=101, c=50, d=151 — must not see inner1's values
+        assert_eq!(int_var(&mut rt, &frame, "r2"), 602); // 100+101+50+151+200
+        assert_eq!(int_var(&mut rt, &frame, "r2_sib"), 100); // c*2
+        assert_eq!(int_var(&mut rt, &frame, "r2_pure"), 999);
+        // re-reading inner1's level3 again is stable, unaffected by inner2
+        assert_eq!(int_var(&mut rt, &frame, "r1_again"), 63); // 10+11+5+16+21
+    }
+
+    #[test]
+    fn recursive_nested_fn_also_captures_outer_local() {
+        // `fact` both self-recurses (its own name resolves as a free name,
+        // one level out, exercising the same self-recursive fast path as
+        // module-level recursion) and captures `base` from `make_fact` at
+        // the same time. Two separate `make_fact` calls must stay
+        // independent, and calling the same closure with different
+        // arguments must not corrupt it.
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make_fact base:\n    fn fact n:\n        if n < 2:\n            return base\n        return n * (fact (n - 1))\n    return fact\n\
+             f5 = make_fact 100\nf1 = make_fact 1\n\
+             r_a = f5 5\nr_b = f1 5\nr_a_again = f5 3\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r_a"), 12000); // 5*4*3*2*100
+        assert_eq!(int_var(&mut rt, &frame, "r_b"), 120); // plain 5!
+        assert_eq!(int_var(&mut rt, &frame, "r_a_again"), 600); // 3*2*100
+    }
+
+    #[test]
+    fn nested_fn_sees_module_x_then_shadowing_fn_local_x() {
+        // `inner` lexically reads `x` from `middle` (middle also assigns
+        // `x`, so `x` resolves to middle's own captured slot, never
+        // module's, by static scoping) — but the FIRST call happens
+        // before middle's own assignment runs, so it must fall through
+        // middle's still-Uninit captured slot to the module's live `x`.
+        // The SECOND call, after middle assigns its own `x`, must see
+        // middle's value instead.
+        for compiled in [false, true] {
+            let mut rt = module_runtime(compiled);
+            let m = rt
+                .load_module(
+                    "shadowx",
+                    "x = 1
+fn middle:
+    fn inner:
+        return x
+    r1 = (inner)
+    x = 2
+    r2 = (inner)
+    return [r1, r2]
+export { middle }
+",
+                )
+                .unwrap();
+            rt.set_var("m", m);
+            let frame = Rc::new(Frame::new());
+            for st in &ast_from_str("mid = m.middle\nr = (mid)\n") {
+                rt.exec_stmt(st, frame.clone()).unwrap();
+            }
+            assert_eq!(
+                format!("{}", frame.get_var("r", &mut rt)),
+                "[1, 2]",
+                "mode {compiled}"
+            );
+        }
     }
 
     #[test]

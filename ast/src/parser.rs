@@ -1606,6 +1606,20 @@ impl Module {
                             record.span(),
                         ));
                     };
+                    // export fields must be bare names (shorthand `{ key }` or
+                    // `{ key: name }`), never arbitrary expressions: the
+                    // compiled module has no way to compute a value that
+                    // isn't already sitting in a known slot
+                    for field in fields.iter() {
+                        if let Some(value) = field.value() {
+                            if !matches!(value.kind(), ExprKind::Ident(_)) {
+                                return Err(ParseError::new(
+                                    ParseErrorKind::UnexpectedToken,
+                                    value.span(),
+                                ));
+                            }
+                        }
+                    }
                     // the export is the module's terminator: nothing may follow
                     stream.skip_comments_and_newlines();
                     stream.expect_end()?;

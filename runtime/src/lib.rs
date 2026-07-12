@@ -1160,19 +1160,153 @@ impl Function for AstFn {
 #[repr(transparent)]
 pub struct SlotId(pub u32);
 
+/// Collect every identifier *read* reachable from an expression (record
+/// shorthand `{ key }` counts as a read of `key`) into `out`. Doesn't
+/// distinguish bound from outer — callers filter against a `SlotTable`.
+fn collect_reads_expr(expr: &Expr, out: &mut Vec<Rc<str>>) {
+    match expr.kind() {
+        ExprKind::Ident(id) => out.push(id.rc_name()),
+        ExprKind::Atom(_) | ExprKind::Literal(_) => {}
+        ExprKind::List(items) => {
+            for e in items.iter() {
+                collect_reads_expr(e, out);
+            }
+        }
+        ExprKind::Record(fields) => {
+            for f in fields.iter() {
+                match f.value() {
+                    Some(v) => collect_reads_expr(v, out),
+                    None => out.push(f.key().rc_name()),
+                }
+            }
+        }
+        ExprKind::Unary(_, e) => collect_reads_expr(e, out),
+        ExprKind::Binary(a, _, b) => {
+            collect_reads_expr(a, out);
+            collect_reads_expr(b, out);
+        }
+        ExprKind::Apply(callee, args) => {
+            collect_reads_expr(callee, out);
+            for a in args.iter() {
+                collect_reads_expr(a, out);
+            }
+        }
+        ExprKind::Field(obj, _) => collect_reads_expr(obj, out),
+        ExprKind::Index(obj, idx) => {
+            collect_reads_expr(obj, out);
+            collect_reads_expr(idx, out);
+        }
+        ExprKind::Parenthesized(e) => collect_reads_expr(e, out),
+    }
+}
+
+/// Same, but over a statement — nested `fn` statements contribute their own
+/// outer names (recursively computed by [`fn_outer_names`]) as reads at this
+/// level, so a name that's only outer several levels deep still propagates
+/// outward.
+fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<Rc<str>>) {
+    match stmt.kind() {
+        StmtKind::Expr(e) => collect_reads_expr(e, out),
+        StmtKind::AssignPat { value, .. } => collect_reads_expr(value, out),
+        StmtKind::AssignField {
+            target,
+            field: _,
+            value,
+        } => {
+            collect_reads_expr(target, out);
+            collect_reads_expr(value, out);
+        }
+        StmtKind::AssignIndex {
+            target,
+            index,
+            value,
+        } => {
+            collect_reads_expr(target, out);
+            collect_reads_expr(index, out);
+            collect_reads_expr(value, out);
+        }
+        StmtKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_reads_expr(cond, out);
+            for s in then_branch.iter() {
+                collect_reads_stmt(s, out);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb.iter() {
+                    collect_reads_stmt(s, out);
+                }
+            }
+        }
+        StmtKind::While {
+            cond,
+            body,
+            else_branch,
+        } => {
+            collect_reads_expr(cond, out);
+            for s in body.iter() {
+                collect_reads_stmt(s, out);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb.iter() {
+                    collect_reads_stmt(s, out);
+                }
+            }
+        }
+        StmtKind::For {
+            target: _,
+            iterable,
+            body,
+            else_branch,
+        } => {
+            collect_reads_expr(iterable, out);
+            for s in body.iter() {
+                collect_reads_stmt(s, out);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb.iter() {
+                    collect_reads_stmt(s, out);
+                }
+            }
+        }
+        StmtKind::Return(Some(e)) => collect_reads_expr(e, out),
+        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Fn { params, body, .. } => {
+            out.extend(fn_outer_names(params, body));
+        }
+    }
+}
+
+/// Names read inside `body` (params included as bound) that aren't bound
+/// anywhere within it — i.e. must resolve to an enclosing scope. Recurses
+/// into nested `fn` bodies, so a name only referenced by a grandchild `fn`
+/// still shows up here (propagated up through [`collect_reads_stmt`]'s
+/// `StmtKind::Fn` arm).
+fn fn_outer_names(params: &[Pat], body: &[Stmt]) -> Vec<Rc<str>> {
+    // only params are unconditionally initialized before any possible
+    // read — a body-assigned name may still read through to an enclosing
+    // scope on its first (pre-assignment) access under the language's
+    // shadow-with-fallback rule (`x = x + 1` reads the outer `x`), so it
+    // must NOT be excluded here just because it's also assigned locally
+    let bound = SlotTable::with_params(params);
+
+    let mut reads = Vec::new();
+    for s in body.iter() {
+        collect_reads_stmt(s, &mut reads);
+    }
+
+    reads.retain(|n| bound.get(n).is_none());
+    reads
+}
+
 struct SlotTable {
     table: HashMap<Rc<str>, SlotId>,
     next: SlotId,
 }
 
 impl SlotTable {
-    fn new() -> Self {
-        SlotTable {
-            table: HashMap::default(),
-            next: SlotId(0),
-        }
-    }
-
     fn with_params(params: &[Pat]) -> Self {
         let mut next = 0;
         let mut table = HashMap::default();
@@ -1287,6 +1421,62 @@ impl SlotTable {
         self.table.get(name).copied()
     }
 
+    /// Which of this function's own slots are read by some `fn` nested
+    /// (at any depth) inside `body` — those need to live in a per-call
+    /// [`Frame`] instead of a stack slot, since a closure escaping this
+    /// call must still see them. Everything else stays a stack slot.
+    fn mark_captured(&self, body: &[Stmt]) -> Vec<bool> {
+        fn collect_nested_fns<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
+            for stmt in stmts {
+                match stmt.kind() {
+                    StmtKind::Fn { .. } => out.push(stmt),
+                    StmtKind::If {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        collect_nested_fns(then_branch, out);
+                        if let Some(eb) = else_branch {
+                            collect_nested_fns(eb, out);
+                        }
+                    }
+                    StmtKind::While {
+                        body, else_branch, ..
+                    } => {
+                        collect_nested_fns(body, out);
+                        if let Some(eb) = else_branch {
+                            collect_nested_fns(eb, out);
+                        }
+                    }
+                    StmtKind::For {
+                        body, else_branch, ..
+                    } => {
+                        collect_nested_fns(body, out);
+                        if let Some(eb) = else_branch {
+                            collect_nested_fns(eb, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut captured = alloc::vec![false; self.next.0 as usize];
+        let mut nested = Vec::new();
+        collect_nested_fns(body, &mut nested);
+        for stmt in nested {
+            let StmtKind::Fn { params, body, .. } = stmt.kind() else {
+                unreachable!()
+            };
+            for name in fn_outer_names(params, body) {
+                if let Some(slot) = self.get(&name) {
+                    captured[slot.0 as usize] = true;
+                }
+            }
+        }
+        captured
+    }
+
     fn names(&self, rt: &mut Runtime) -> SmallVec<[StringId; 8]> {
         let mut pairs: SmallVec<[(u32, Rc<str>); 8]> = self
             .table
@@ -1307,41 +1497,6 @@ impl SlotTable {
         }
 
         names
-    }
-}
-
-#[derive(Clone)]
-pub struct ModuleCtx {
-    name: StringId,
-    /// The module's environment, shared by all functions defined in the module.
-    frame: Rc<Frame>,
-}
-
-impl ModuleCtx {
-    /// Pre-scan a module block: collect every top-level binding into the slot
-    /// layout, and determine which function names are *final* — bound by
-    /// exactly one unconditional top-level `fn` statement and never reassigned
-    /// anywhere in the module. Function bodies are not entered (their bindings
-    /// are locals).
-    fn new(name: StringId, stmts: &[Stmt], rt: &mut Runtime) -> ModuleCtx {
-        let mut slots = SlotTable::new();
-        slots.add_stmts(stmts);
-
-        let names = slots.names(rt);
-        let slot_count = names.len();
-
-        ModuleCtx {
-            name,
-            frame: Rc::new(Frame {
-                names: RefCell::new(names),
-                slots: RefCell::new(smallvec::smallvec![Val::Uninit; slot_count]),
-                parent: None,
-            }),
-        }
-    }
-
-    fn frame(&self) -> Rc<Frame> {
-        self.frame.clone()
     }
 }
 
@@ -1526,145 +1681,55 @@ impl Context {
     }
 }
 
-#[derive(Debug)]
-struct ParentFrame {
-    frame: Rc<Frame>,
-    slot_map: SmallVec<[Option<SlotId>; 8]>,
-}
-
+/// The AST walker's dynamic scope. Grows as statements assign new names
+/// (no fixed layout — unlike [`vm::CompiledFrame`], which compiled code
+/// uses instead), resolved purely by name, chained to whatever frame was
+/// live when the enclosing `fn`/module/REPL root started executing.
 #[derive(Debug)]
 pub struct Frame {
-    names: RefCell<SmallVec<[StringId; 8]>>,
-    slots: RefCell<SmallVec<[Val; 8]>>,
-    parent: Option<ParentFrame>,
+    slots: RefCell<SmallVec<[(StringId, Val); 8]>>,
+    parent: Option<Rc<Frame>>,
 }
 
 impl Frame {
     pub fn new() -> Self {
         Frame {
-            names: RefCell::new(SmallVec::new()),
             slots: RefCell::new(SmallVec::new()),
             parent: None,
         }
     }
 
-    pub fn from_names(names: SmallVec<[StringId; 8]>) -> Self {
-        Frame {
-            slots: RefCell::new(smallvec::smallvec![Val::Uninit; names.len()]),
-            names: RefCell::new(names),
-            parent: None,
-        }
-    }
-
     pub fn with_parent(mut self, parent: Rc<Frame>) -> Self {
-        let slot_map = self
-            .names
-            .borrow()
-            .iter()
-            .map(|&name| {
-                parent
-                    .names
-                    .borrow()
-                    .iter()
-                    .position(|&n| n == name)
-                    .map(|i| SlotId(i as u32))
-            })
-            .collect();
-        self.parent = Some(ParentFrame {
-            frame: parent,
-            slot_map,
-        });
+        self.parent = Some(parent);
         self
     }
 
-    pub fn set(&self, slot: SlotId, val: Val) {
-        self.slots.borrow_mut()[(slot.0) as usize] = val;
-    }
-
     pub fn set_var(&self, var: StringId, val: Val) {
-        if let Some(idx) = self.names.borrow().iter().position(|&n| n == var) {
-            self.slots.borrow_mut()[idx] = val;
+        let mut slots = self.slots.borrow_mut();
+        if let Some(entry) = slots.iter_mut().find(|(n, _)| *n == var) {
+            entry.1 = val;
         } else {
-            self.names.borrow_mut().push(var);
-            self.slots.borrow_mut().push(val);
+            slots.push((var, val));
         }
-    }
-
-    pub fn get(&self, slot: SlotId, rt: &mut Runtime) -> Val {
-        let cur = self.slots.borrow();
-        if slot.0 as usize >= cur.len() {
-            return Val::Uninit;
-        }
-        let v = &cur[slot.0 as usize];
-        if !matches!(v, Val::Uninit) {
-            return v.clone();
-        }
-
-        core::hint::cold_path();
-
-        match &self.parent {
-            Some(parent) => {
-                if let Some(slot) = parent.slot_map[slot.0 as usize] {
-                    parent.frame.get(slot, rt)
-                } else {
-                    let name = self.names.borrow()[slot.0 as usize];
-                    rt.get_var(name)
-                }
-            }
-            None => {
-                let name = self.names.borrow()[slot.0 as usize];
-                rt.get_var(name)
-            }
-        }
-    }
-
-    pub fn name(&self, slot: SlotId) -> StringId {
-        self.names.borrow()[slot.0 as usize]
-    }
-
-    pub fn name_slot(&self, name: StringId) -> Option<SlotId> {
-        self.names
-            .borrow()
-            .iter()
-            .position(|&n| n == name)
-            .map(|idx| SlotId(idx as u32))
     }
 
     pub fn get_var(&self, var: impl IntoStringId, rt: &mut Runtime) -> Val {
         let var = var.into_id(&mut rt.ctx);
-        match self.name_slot(var) {
-            Some(slot) => {
-                let cur = self.slots.borrow();
-                let v = &cur[slot.0 as usize];
-                if !matches!(v, Val::Uninit) {
-                    return v.clone();
-                }
-
-                core::hint::cold_path();
-
-                match &self.parent {
-                    Some(parent) => {
-                        if let Some(slot) = parent.slot_map[slot.0 as usize] {
-                            parent.frame.get(slot, rt)
-                        } else {
-                            parent.frame.get_var(var, rt)
-                        }
-                    }
-                    None => rt.get_var(var),
-                }
+        if let Some((_, v)) = self.slots.borrow().iter().find(|(n, _)| *n == var) {
+            if !matches!(v, Val::Uninit) {
+                return v.clone();
             }
-            None => match &self.parent {
-                Some(parent) => parent.frame.get_var(var, rt),
-                None => rt.get_var(var),
-            },
+        }
+        core::hint::cold_path();
+        match &self.parent {
+            Some(parent) => parent.get_var(var, rt),
+            None => rt.get_var(var),
         }
     }
 
-    pub fn names(&self) -> SmallVec<[StringId; 8]> {
-        self.names.borrow().clone()
-    }
-
-    pub fn slots(&self) -> SmallVec<[Val; 8]> {
+    /// This frame's own bindings (not the parent chain) — for inspection
+    /// (e.g. comparing walker/VM globals in tests), not used by evaluation.
+    pub fn own_entries(&self) -> SmallVec<[(StringId, Val); 8]> {
         self.slots.borrow().clone()
     }
 }
@@ -2087,8 +2152,14 @@ impl Runtime {
                 frame.set_var(name, Val::nil());
 
                 let fval = if self.compile_fns {
-                    match vm::compile_fn(self, params.clone(), body, frame.clone()) {
-                        Ok(compiled) => compiled.into_function(),
+                    match vm::compile_fn(
+                        self,
+                        params.clone(),
+                        body,
+                        vm::CompileParent::Walked(frame.clone()),
+                        &[],
+                    ) {
+                        Ok((compiled, _schema)) => compiled.into_function(),
                         // constructs the compiler rejects still run on the AST walker
                         Err(_) => Val::fn_from_ast(params.clone(), body.clone(), frame.clone()),
                     }
@@ -2128,57 +2199,100 @@ impl Runtime {
         })?;
         let stmts = ast.rc_stmts();
 
+        // export values are parse-restricted to bare names (shorthand or
+        // `key: name`) — this doubles as the set of names the compiled
+        // body must keep alive past its own `Return`, which otherwise
+        // truncates the stack region ordinary locals live in
+        let export_names: Vec<Rc<str>> = ast
+            .export()
+            .fields()
+            .iter()
+            .map(|f| match f.value() {
+                Some(v) => {
+                    let ExprKind::Ident(id) = v.kind() else {
+                        unreachable!("export values are parse-restricted to bare identifiers")
+                    };
+                    id.rc_name()
+                }
+                None => f.key().rc_name(),
+            })
+            .collect();
+
         // the module body runs in a fresh environment: it must not see the
-        // importer's locals, and its own bindings must not leak
+        // importer's locals, and its own bindings must not leak. A module
+        // is otherwise an ordinary zero-arg function — no bespoke
+        // environment type, just the same compile/walk pipeline every
+        // other `fn` goes through.
         self.loading.push(name_id);
+        let root = Rc::new(Frame::new());
 
-        let mctx = ModuleCtx::new(name_id, &stmts[..], self);
-
-        let mut result = Ok(());
-        for stmt in stmts.iter() {
-            match self.exec_stmt(stmt, mctx.frame()) {
-                Ok(Exec::Value(_)) => {}
-                Ok(_) => {
-                    result = Err(RuntimeError::Other(
-                        "break/continue/return at module top level".into(),
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
-
-        // evaluate the export only if the body succeeded, and never
-        // early-return before the runtime state is restored below
-        let mut export = FixedHashMap::default();
-        if result.is_ok() {
-            'export: for f in ast.export().fields() {
-                let key = f.key().rc_name();
-                let val = match f.value() {
-                    None => mctx
-                        .frame
-                        .get_var(key.clone(), self)
-                        .init_or_else(|| {
-                            RuntimeError::UnboundIdentifier(key.clone())
-                        })?,
-                    Some(value) => match self.eval(value, &mctx.frame) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            result = Err(e);
-                            break 'export;
+        let result: Result<FixedHashMap<Rc<str>, Val>, RuntimeError> = 'run: {
+            if self.compile_fns {
+                if let Ok((compiled, _schema)) = vm::compile_fn(
+                    self,
+                    Rc::from([]),
+                    &stmts[..],
+                    vm::CompileParent::Walked(root.clone()),
+                    &export_names,
+                ) {
+                    let own = match vm::run_module(self, &compiled) {
+                        Ok(own) => own,
+                        Err(e) => break 'run Err(e),
+                    };
+                    let mut export = FixedHashMap::default();
+                    for (f, source) in ast.export().fields().iter().zip(export_names.iter()) {
+                        let key = f.key().rc_name();
+                        let source_id = self.ctx.string(source.clone());
+                        // a name never bound anywhere in the module (a
+                        // genuinely unbound export) has no slot at all —
+                        // that's an UnboundIdentifier, not a bug
+                        let val = compiled
+                            .own_names
+                            .iter()
+                            .position(|&n| n == source_id)
+                            .and_then(|slot| own.as_ref().map(|o| o.get_local(SlotId(slot as u32))))
+                            .unwrap_or(Val::Uninit);
+                        match val.init_or_else(|| RuntimeError::UnboundIdentifier(key.clone())) {
+                            Ok(v) => {
+                                export.insert(key, v);
+                            }
+                            Err(e) => break 'run Err(e),
                         }
-                    },
-                };
-                export.insert(key, val);
+                    }
+                    break 'run Ok(export);
+                }
+                // compile error: fall back to the AST walker below
             }
-        }
+
+            for stmt in stmts.iter() {
+                match self.exec_stmt(stmt, root.clone()) {
+                    Ok(Exec::Value(_)) => {}
+                    Ok(_) => {
+                        break 'run Err(RuntimeError::Other(
+                            "break/continue/return at module top level".into(),
+                        ));
+                    }
+                    Err(e) => break 'run Err(e),
+                }
+            }
+
+            let mut export = FixedHashMap::default();
+            for (f, source) in ast.export().fields().iter().zip(export_names.iter()) {
+                let key = f.key().rc_name();
+                let val = root.get_var(source.clone(), self);
+                match val.init_or_else(|| RuntimeError::UnboundIdentifier(key.clone())) {
+                    Ok(v) => {
+                        export.insert(key, v);
+                    }
+                    Err(e) => break 'run Err(e),
+                }
+            }
+            Ok(export)
+        };
 
         self.loading.pop();
 
-        result?;
+        let export = result?;
 
         let module = Val::new_module(export);
         self.modules.insert(name_id, module.clone());

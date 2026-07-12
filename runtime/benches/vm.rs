@@ -462,7 +462,16 @@ fn compile(c: &mut Criterion) {
                     rt: Runtime::new(),
                     frame: Rc::new(Frame::new()),
                 },
-                |mut cx| vm::compile_fn(&mut cx.rt, params.clone(), body, cx.frame.clone()).unwrap(),
+                |mut cx| {
+                    vm::compile_fn(
+                        &mut cx.rt,
+                        params.clone(),
+                        body,
+                        vm::CompileParent::Walked(cx.frame.clone()),
+                        &[],
+                    )
+                    .unwrap()
+                },
                 BatchSize::SmallInput,
             )
         });
