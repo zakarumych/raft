@@ -46,9 +46,7 @@ use smallvec::SmallVec;
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
 
 use crate::{
-    Atom, ConstId, Context, DynFn, FnVal, Frame, Number, ObjectKind, PatId, Runtime, RuntimeError,
-    SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary,
-    field_of, index_of, is_falsey, literal_value,
+    Atom, ConstId, Context, DynFn, FixedHashMap, FnVal, Frame, Number, ObjectKind, PatId, Runtime, RuntimeError, SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
 };
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
@@ -58,10 +56,6 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct FnId(pub u32);
-
-type HashSet<T> = hashbrown::HashSet<T, foldhash::fast::RandomState>;
-type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
-type FixedHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;
 
 /// One virtual-machine instruction.
 ///

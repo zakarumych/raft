@@ -19,9 +19,28 @@ use crate::vm::CompiledPat;
 
 pub mod vm;
 
-type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
+// ZST for fixed-state hash maps.
+// This allows codegen to see
+// that constant hashing see it used
+// unlike storing a `foldhash::fast::FixedState` directly, which may have
+// different internal state.
+// 
+// This should optimize away hashing of constant keys at compile time.
+// See assembly output of https://play.rust-lang.org/?version=stable&mode=release&edition=2024&gist=96867b416d6d26191223f2a7af37e320
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FixedHashState;
 
-type FixedHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;
+impl core::hash::BuildHasher for FixedHashState {
+    type Hasher = foldhash::fast::FoldHasher<'static>;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> Self::Hasher {
+        foldhash::fast::FixedState::default().build_hasher()
+    }
+}
+
+type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
+pub type FixedHashMap<K, V> = hashbrown::HashMap<K, V, FixedHashState>;
 
 #[derive(Copy, Clone)]
 pub enum Number {
