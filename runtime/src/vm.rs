@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
 
 use crate::{
-    Atom, ConstId, Context, DynFn, FixedHashMap, FnVal, Frame, Number, ObjectKind, PatId, Runtime, RuntimeError, SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
+    Atom, ConstId, Context, DynFn, FixedHashMap, FnVal, Frame, Host, Number, ObjectKind, PatId, Runtime, RuntimeError, SlotId, SlotTable, StringId, Val, assign_field, assign_index, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
 };
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
@@ -1339,17 +1339,26 @@ impl DynFn for CompiledFn {
         Some(self.arity())
     }
 
-    fn dyn_call(self: Rc<Self>, rt: &mut Runtime, args: usize) -> usize {
+    fn dyn_call(self: Rc<Self>, rt: &mut dyn Host, args: usize) -> usize {
         let arity = self.arity();
+
+        // args < arity may still return a partial value without touching
+        // any CompiledFn/Runtime machinery beyond the stack, so only
+        // downcast once we know we're actually running compiled code.
         if args < arity {
             if args == 0 {
-                rt.stack.push(Val::Fn(FnVal(self.clone())));
+                rt.stack_push(Val::Fn(FnVal::from_rc(self.clone())));
                 return 0;
             }
             let partial = FnVal::partial_dyn(self.clone(), rt, args);
-            rt.stack.push(Val::Fn(partial));
+            rt.stack_push(Val::Fn(partial));
             return args;
         }
+
+        let rt = rt
+            .as_any_mut()
+            .downcast_mut::<Runtime>()
+            .expect("CompiledFn only runs under raft_runtime::Runtime");
 
         match run(rt, &self) {
             Ok(v) => v,
@@ -2817,7 +2826,7 @@ fn run_frame(
                     // vtable pointer, so comparing the wide pointers
                     // directly is unreliable
                     Val::Fn(fval)
-                        if (Rc::as_ptr(&fval.0) as *const ())
+                        if fval.as_ptr()
                             == (f as *const CompiledFn as *const ())
                             && f.arity == n =>
                     {

@@ -1,7 +1,7 @@
 use std::{io::Write, rc::Rc};
 
 use raft_ast::{lexer::LexErrorKind, parser::ParseErrorKind};
-use raft_runtime::{Val, Exec};
+use raft_runtime::{Exec, Val};
 
 fn main() {
     std::io::stdout().write_all(b"Raft REPL\n").unwrap();
@@ -17,42 +17,36 @@ fn main() {
     let quit_flag = Rc::new(std::cell::Cell::new(false));
 
     // print takes any number of arguments, quit takes exactly none
-    rt.set_var(
-        "print",
-        Val::host_function(0, None, |rt, args| {
-            for arg in rt.stack.drain_top(args).rev() {
-                println!("{}", arg);
-            }
-            Val::nil()
-        }),
-    );
+    rt.register_function("print", 0, None, |rt, args| {
+        for arg in rt.stack.drain_top(args).rev() {
+            println!("{}", arg);
+        }
+        Val::nil()
+    });
 
     // print takes any number of arguments, quit takes exactly none
-    rt.set_var(
-        "debugfmt",
-        Val::host_function(0, None, |rt, args| {
-            for arg in rt.stack.drain_top(args).rev() {
-                println!("{:#?}", arg);
-            }
-            Val::nil()
-        }),
-    );
+    rt.register_function("debugfmt", 0, None, |rt, args| {
+        for arg in rt.stack.drain_top(args).rev() {
+            println!("{:#?}", arg);
+        }
+        Val::nil()
+    });
 
     let quit_flag_clone = quit_flag.clone();
-    rt.set_var(
+    rt.register_function(
         "quit",
-        Val::host_function(0, Some(0), move |_rt, _args| {
+        0, Some(0), move |_rt, _args| {
             quit_flag_clone.set(true);
             Val::nil()
-        }),
+        },
     );
 
     // import "name" loads ./name.raft (or ./name) as a module: the file is
     // executed once, its `export { .. }` becomes the module object, and
     // repeated imports return the cached module
-    rt.set_var(
+    rt.register_function(
         "import",
-        Val::host_function(1, Some(1), |rt, args| {
+        1, Some(1), |rt, args| {
             let mut popped = rt.stack.drain_top(args);
             let name = popped.next();
             drop(popped);
@@ -83,7 +77,7 @@ fn main() {
                     Val::nil()
                 }
             }
-        }),
+        }
     );
 
     let mut lines = String::new();

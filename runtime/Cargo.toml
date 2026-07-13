@@ -8,6 +8,7 @@ std = ["raft-ast/std"]
 default = ["std"]
 
 [dependencies]
+raft-core = { path = "../core" }
 raft-ast = { path = "../ast", default-features = false }
 smallvec = { version = "1.0", default-features = false }
 hashbrown = { version = "0.12", default-features = false }
