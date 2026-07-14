@@ -18,7 +18,7 @@ fn main() {
 
     // print takes any number of arguments, quit takes exactly none
     rt.register_function("print", 0, None, |rt, args| {
-        for arg in rt.stack.drain_top(args).rev() {
+        for arg in rt.stack().drain_top(args).rev() {
             println!("{}", arg);
         }
         Val::nil()
@@ -26,7 +26,7 @@ fn main() {
 
     // print takes any number of arguments, quit takes exactly none
     rt.register_function("debugfmt", 0, None, |rt, args| {
-        for arg in rt.stack.drain_top(args).rev() {
+        for arg in rt.stack().drain_top(args).rev() {
             println!("{:#?}", arg);
         }
         Val::nil()
@@ -47,10 +47,15 @@ fn main() {
     rt.register_function(
         "import",
         1, Some(1), |rt, args| {
-            let mut popped = rt.stack.drain_top(args);
+            let mut stack = rt.stack();
+            let mut popped = stack.drain_top(args);
             let name = popped.next();
             drop(popped);
-            let Some(Val::String(name)) = name else {
+            drop(stack);
+            let Some(name) = name.and_then(|v| match v.unpack() {
+                raft_runtime::ValEnum::String(name) => Some(name),
+                _ => None,
+            }) else {
                 rt.set_error(raft_runtime::RuntimeError::TypeError(
                     "import expects a module name string".into(),
                 ));

@@ -450,9 +450,8 @@ dependencies = [
 name = "raft-core"
 version = "0.1.0"
 dependencies = [
- "foldhash",
- "hashbrown",
  "libm",
+ "raft-ffi",
  "smallvec",
 ]
 

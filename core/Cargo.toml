@@ -1,11 +1,10 @@
 [package]
 name = "raft-core"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 description = "Core Raft object model"
 
 [dependencies]
+raft-ffi = { path = "../ffi" }
 smallvec = { version = "1.0", default-features = false }
-hashbrown = { version = "0.12", default-features = false }
-foldhash = { version = "0.2", default-features = false }
 libm = "0.2"
