@@ -9,7 +9,7 @@
 //! name into the host and exposes the loaded modules as a record `RawVal`.
 //!
 //! Transpiled code uses ordinary Rust frames: each Raft binding is either
-//! a plain Rust local or — when some nested `fn` reads it — a field of
+//! a plain Rust local or - when some nested `fn` reads it - a field of
 //! that scope's single per-call `Rc<CaptureN>` structure; nested `fn`s are
 //! Rust `move` closures capturing the enclosing capture handles. Values
 //! are `raft_core::Val`s throughout; conversion to and from `RawVal`

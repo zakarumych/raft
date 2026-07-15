@@ -392,8 +392,8 @@ impl Lit {
 
 /// Convert a lexer literal into an AST literal, validating what the lexer
 /// is agnostic about: number suffixes (only `i` and `f` are part of the
-/// language). All literal parsing — expressions, patterns, `Literal::parse`
-/// — funnels through here.
+/// language). All literal parsing - expressions, patterns, `Literal::parse`
+/// - funnels through here.
 fn literal_from_lexer(lit: raft_lexer::Lit) -> ParseResult<Lit> {
     match lit {
         raft_lexer::Lit::Num(n) => match n.suffix() {

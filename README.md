@@ -1,8 +1,8 @@
-# Raft — a simplicity-first programming language
+# Raft - a simplicity-first programming language
 
 Raft is a small, dynamically-typed scripting language implemented in Rust.
 It favors a minimal syntax and a small set of orthogonal features over a large
-surface area — the goal is a language that is easy to read, easy to embed,
+surface area - the goal is a language that is easy to read, easy to embed,
 and easy to reason about.
 
 > **Status: early / work in progress.** The lexer, parser, tree-walking
@@ -11,7 +11,7 @@ and easy to reason about.
 > ahead-of-time Raft → Rust transpiler provide two further execution modes
 > (see [Execution modes](#execution-modes-ast-walking-bytecode-and-transpiled-rust)).
 > The language is still missing pieces you'd expect from a "complete"
-> language (a standard library — see [Roadmap](#roadmap)). APIs and syntax
+> language (a standard library - see [Roadmap](#roadmap)). APIs and syntax
 > may change without notice.
 
 ## Project layout
@@ -23,7 +23,7 @@ This is a Cargo workspace made up of seven crates:
 | `raft-lexer`        | `lexer/`    | `no_std`-friendly tokenizer: idents, atoms, numbers, chars, strings, comments, punctuation and delimiter groups (including indentation-based blocks). |
 | `raft-ast`          | `ast/`      | AST types plus a recursive-descent parser built on top of the token stream. |
 | `raft-ffi`          | `ffi/`      | Strictly `no_std`, zero-dependency ABI: the raw, `#[repr(C)]` tagged-pointer/vtable shapes the object model is built from. Declares the calling convention dynamically-loaded/transpiled Raft modules speak. |
-| `raft-core`         | `core/`     | The object model (`Val`) built safely on top of `raft-ffi`'s raw shapes — a real, compact tagged pointer, not a Rust enum. `no_std`+`alloc` only, host-agnostic, shared unchanged by every execution mode. |
+| `raft-core`         | `core/`     | The object model (`Val`) built safely on top of `raft-ffi`'s raw shapes - a real, compact tagged pointer, not a Rust enum. `no_std`+`alloc` only, host-agnostic, shared unchanged by every execution mode. |
 | `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. Builds and links transpiled bundles (feature `bundle`). Implements the host-specific pieces `raft-core` deliberately doesn't know about (globals, modules, atom names). |
 | `raft-rust`         | `rust/`     | The Raft → Rust transpiler: turns parsed Raft modules into a standalone cdylib crate (a *bundle*) that depends only on `raft-core` and speaks `raft-ffi`'s ABI. |
 | `raft-repl`         | `repl/`     | Line-by-line REPL wiring the lexer, parser and runtime together.           |
@@ -39,15 +39,15 @@ feature (enabled by default) so the front-end can, in principle, run in
 scalar kinds (numbers, chars, atoms) are packed inline; heap kinds
 (strings, lists, records, functions, host-opaque values) are handles
 dispatched through a per-kind vtable. This is what lets the same,
-unmodified `raft-core` crate back every execution mode — the AST walker,
-the bytecode VM, and transpiled-to-Rust bundles loaded as `cdylib`s —
+unmodified `raft-core` crate back every execution mode - the AST walker,
+the bytecode VM, and transpiled-to-Rust bundles loaded as `cdylib`s -
 without `raft-core` needing to know anything about a particular host's
 `Runtime`.
 
 `Val::unpack()`/`ValEnum` is the ergonomic, `match`-able view (heap kinds
 bump a refcount; scalars are free); `Val::kind()` is a cheap, clone-free
 discriminant for callers that only need to branch on shape. Nothing about
-this is unsafe from the outside — `raft-core`'s job is to be a genuinely
+this is unsafe from the outside - `raft-core`'s job is to be a genuinely
 *safe* wrapper over `raft-ffi`'s raw ABI, not just an ergonomic one.
 
 ## Building & testing
@@ -98,7 +98,7 @@ parser and runtime.
 ### Identifiers vs. atoms
 
 Identifiers starting with a lowercase letter or `_` are ordinary variable
-names. Identifiers starting with an uppercase letter are **atoms** — inert,
+names. Identifiers starting with an uppercase letter are **atoms** - inert,
 self-contained symbols equal only to themselves.
 The atoms `True`, `False` and `Nil` are used as the language's booleans and
 "no value" marker.
@@ -161,7 +161,7 @@ Host-registered functions and user-defined functions (see
 [Functions](#functions)) are both first-class `Fn` values and are called the
 same way.
 
-A function called with fewer arguments than it takes is not an error —
+A function called with fewer arguments than it takes is not an error -
 it returns a new function that captures the arguments seen so far and waits for the rest;
 supplying more than one function's arity consumes what it needs and re-applies the
 leftover arguments to whatever it returned:
@@ -176,14 +176,14 @@ add 1 2        // 3, same as above
 ```
 
 A function that takes zero arguments can't appear in a juxtaposition (there
-are no arguments to juxtapose), so referencing it bare — as a whole
-statement, or written in parentheses — calls it instead of yielding the
+are no arguments to juxtapose), so referencing it bare - as a whole
+statement, or written in parentheses - calls it instead of yielding the
 function value itself:
 
 ```raft
 quit           // calls quit with no arguments
 (quit)         // same
-f = quit       // does NOT call quit — plain juxtaposition/assignment RHS
+f = quit       // does NOT call quit - plain juxtaposition/assignment RHS
                //   position doesn't trigger the call
 ```
 
@@ -229,7 +229,7 @@ fn greet name:
     print "hello" name
 ```
 
-`return` is optional — a function with no explicit `return` yields the
+`return` is optional - a function with no explicit `return` yields the
 value of its last executed statement (nil if the body has none). Parameters
 are patterns, so they can destructure their argument directly:
 
@@ -239,7 +239,7 @@ fn dist { x, y }:
 ```
 
 Calling a function evaluates its body in a fresh local scope. A nested `fn`
-can additionally close over the locals of the `fn` (or module — see
+can additionally close over the locals of the `fn` (or module - see
 [Modules](#modules)) it's defined in, at any depth:
 
 ```raft
@@ -256,7 +256,7 @@ add10 3     // 13
 
 Each call to `make_adder` produces an independent capture, so `add5` and
 `add10` don't share state. Assignment always writes to the current
-function's own scope, even for a name also bound in an enclosing scope —
+function's own scope, even for a name also bound in an enclosing scope -
 `n = n + 1` reads the outer `n` on the right-hand side but binds the result
 as a new local, it never mutates the outer variable. This means a captured
 name works as a read-only snapshot from the closure's perspective; there is
@@ -277,7 +277,7 @@ lists and records:
 Patterns can also match literal values and atoms, which is used to
 accept/reject values during pattern-matching assignment.
 
-The identifier `_` is a wildcard: it matches anything and binds nothing —
+The identifier `_` is a wildcard: it matches anything and binds nothing -
 in parameters, destructuring positions, `for` targets, and as a plain
 assignment target to discard a value. (It is not a valid record key, in
 either expressions or patterns.)
@@ -303,7 +303,7 @@ double as type discriminators:
 
 ### No user-defined types
 
-Raft has no `class`/`struct`/`enum` declarations, by design — records
+Raft has no `class`/`struct`/`enum` declarations, by design - records
 tagged with an atom field stand in for both product and sum types:
 
 ```raft
@@ -316,7 +316,7 @@ chain, or a pattern-matching assignment against `kind`). Declaring multiple
 variants of the same function with different parameter patterns/bodies
 (pattern-matched overloads, as in Elixir/Erlang or ML-family languages) is
 not yet implemented, but is a planned mechanism for this kind of
-tag-directed control flow — see [Roadmap](#roadmap).
+tag-directed control flow - see [Roadmap](#roadmap).
 
 ### Mutability
 
@@ -329,7 +329,7 @@ A module is a file of Raft code whose **tail statement must be
 `export { .. }`** (using record syntax, shorthand included). Importing a
 module executes its code once in a fresh environment and turns the export
 into a record-shaped module object; repeated imports return the cached
-object. Functions defined in a module capture its environment — they keep
+object. Functions defined in a module capture its environment - they keep
 seeing the module's values and helper functions wherever they are called.
 Module bindings are meant to be treated as fixed after load, even though
 this isn't enforced (see [Mutability](#mutability)):
@@ -362,8 +362,8 @@ lookup and call `Runtime::load_module(name, source)`.
 
 ### Embedding host functions
 
-Every callable — `fn`-defined (AST-walked or bytecode-compiled), partially
-applied, or host-provided — is a `Val` of kind `Fn`, backed by
+Every callable - `fn`-defined (AST-walked or bytecode-compiled), partially
+applied, or host-provided - is a `Val` of kind `Fn`, backed by
 `raft-core`'s `Function` trait:
 
 ```rust
@@ -377,11 +377,11 @@ pub trait Function: Sized + 'static {
 
 A full application takes at least `min_args` and at most `max_args`
 arguments; the runtime checks this *before* calling, building a
-partial-application value instead if fewer are supplied — implementations
+partial-application value instead if fewer are supplied - implementations
 never see an underfull argument list. `call` reads its arguments off
 `host`'s operand stack (`host.pop()`/`host.drain_top_into(..)`) and pushes
 exactly one result back (`host.push(..)`); `host: &mut rc::Host` is a
-narrow, safe view over the call stack — implementing `Function` never
+narrow, safe view over the call stack - implementing `Function` never
 requires unsafe code.
 
 The easiest way to expose a Rust closure is `Runtime::register_function`,
@@ -401,7 +401,7 @@ rt.register_function("print", 0, None, |rt, args| {
     Val::nil()
 });
 
-// takes exactly two arguments — calls with fewer partially apply
+// takes exactly two arguments - calls with fewer partially apply
 rt.register_function("add2", 2, Some(2), |rt, _args| {
     // two arguments are already guaranteed to be on the stack here
     let b = rt.stack().pop();
@@ -422,9 +422,9 @@ The runtime has three interchangeable execution modes. By default
 everything is interpreted by walking the AST. Alternatively, `fn`
 definitions can be compiled to a stack-based instruction set
 (`raft_runtime::vm::Instr`) that
-is encoded into a flat byte array: operand widths — and the most common
+is encoded into a flat byte array: operand widths - and the most common
 operand values, like small slot indices, small integers, `True`/`False`
-and operator kinds — are packed into the opcode byte itself; larger
+and operator kinds - are packed into the opcode byte itself; larger
 integers follow as compact immediates instead of const-pool entries; jump
 targets are fixed 4-byte byte offsets. A small virtual machine executes
 the bytes directly (`vm::Code::disassemble` decodes them back for
@@ -454,7 +454,7 @@ walker.
 ### Transpiled bundles: Raft compiled to Rust
 
 The third mode compiles Raft ahead of time. `raft-rust` transpiles parsed
-Raft modules into an ordinary Rust crate — a **bundle** — built as a
+Raft modules into an ordinary Rust crate - a **bundle** - built as a
 `cdylib` that depends only on `raft-core` and talks to its host purely
 through `raft-ffi`'s versioned ABI. `raft-runtime` (feature `bundle`,
 enabled by default) drives the whole cycle:
@@ -473,7 +473,7 @@ rt.build_bundle(
 
 `Runtime::build_bundle` transpiles the sources, writes the crate, invokes
 `cargo build` (in the same profile the runtime itself was built in, unless
-overridden), and hands the artifact to `Runtime::link_bundle` — which
+overridden), and hands the artifact to `Runtime::link_bundle` - which
 loads the library, checks its `raft-ffi` version against the host's,
 initializes it, registers every module it exposes, and holds the library
 for the runtime's lifetime. An already-built bundle can be linked
@@ -484,7 +484,7 @@ bundle crate from `.raft` files without building it.
 Transpiled code is plain safe Rust over `Val`: Raft control flow becomes
 native Rust control flow, locals become Rust locals, and a binding that a
 nested `fn` captures becomes a field of that scope's per-call
-`Rc<Capture>` structure — nested functions are Rust closures capturing
+`Rc<Capture>` structure - nested functions are Rust closures capturing
 those handles, so closures, currying and partial application behave
 exactly as in the other two modes. At bundle init, every name the bundle
 can reach the host with is interned once into exactly-sized static id
@@ -508,7 +508,7 @@ and a hand-written native Rust translation as reference points):
 | Benchmark | ast-walk | bytecode | oxidized | CPython 3.14 | native Rust |
 | ----------------------------------- | -------: | -------: | -------: | -----------: | ----------: |
 | `fib-15` (recursion, call-heavy)    |   311 µs |   117 µs |    65 µs |        53 µs |     1.06 µs |
-| `loop-1000` (tight arithmetic loop) |   170 µs |    85 µs |    26 µs |        39 µs |         — * |
+| `loop-1000` (tight arithmetic loop) |   170 µs |    85 µs |    26 µs |        39 µs |         - * |
 | `collatz-27` (branch-heavy loop)    |  22.2 µs |   8.3 µs |   3.4 µs |       9.4 µs |       62 ns |
 | `pipeline-10` (~100-line workload: records, lists, atoms, destructuring) | 514 µs | 207 µs | 118 µs | 88 µs | |
 | `call-direct` (one 3-ary call)      |   162 ns |    85 ns |    72 ns |              | |
@@ -519,7 +519,7 @@ and a hand-written native Rust translation as reference points):
 Transpiled code currently runs ~1.2–3× faster than the bytecode VM and
 ~4–7× faster than the walker. Dynamic dispatch still dominates: every
 value is a tagged `Val`, every call crosses the `Fn` vtable, and calls
-into a bundle additionally cross the cdylib boundary — which is why the
+into a bundle additionally cross the cdylib boundary - which is why the
 gap to native Rust remains large and call-dominated workloads (`fib`,
 `pipeline`) gain less than loop-dominated ones.
 
@@ -527,7 +527,7 @@ gap to native Rust remains large and call-dominated workloads (`fib`,
 
 Raft is under active development. Notable gaps today:
 
-- No pattern-matched function overloads yet — declaring multiple variants of
+- No pattern-matched function overloads yet - declaring multiple variants of
   a function, dispatched by matching each call's arguments against a
   different parameter pattern, is planned (see
   [No user-defined types](#no-user-defined-types)).
@@ -536,7 +536,7 @@ Raft is under active development. Notable gaps today:
   [Mutability](#mutability)).
 - A custom atom's printed form (`Display`/`Debug`) doesn't resolve back to
   its source name (`Pos`, `Done`, ...) outside of `raft-runtime`, which
-  keeps its own name table for this — `raft-core`'s `Val` is host-agnostic
+  keeps its own name table for this - `raft-core`'s `Val` is host-agnostic
   and has no such table built in.
 - Transpiled bundles only build as `cdylib`s; bundling transpiled modules
   straight into the host binary (via proc-macro or build script) is

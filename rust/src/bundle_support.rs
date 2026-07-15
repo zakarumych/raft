@@ -9,7 +9,7 @@
 
 struct BundleState {
     /// The host's callback table. Only the *function pointers* are ever
-    /// used after init — `RaftFFIHost::raw` is valid during the init call
+    /// used after init - `RaftFFIHost::raw` is valid during the init call
     /// only (the host `Runtime` may move afterwards); every later callback
     /// takes the live raw pointer from the `&mut Host` it is handed.
     host: Cell<Option<ffi::RaftFFIHost>>,
@@ -20,7 +20,7 @@ struct BundleState {
 }
 
 // SAFETY: a bundle is loaded into a single-threaded host (the whole object
-// model — `Rc`, `Cell` refcounts — is single-threaded already); this static
+// model - `Rc`, `Cell` refcounts - is single-threaded already); this static
 // is never actually shared across threads.
 unsafe impl Sync for BundleState {}
 
@@ -80,7 +80,7 @@ pub fn global_get(host_view: &mut Host<'_>, idx: u32) -> Val {
     }
 }
 
-/// Report a runtime error to the host — the transpiled equivalent of the
+/// Report a runtime error to the host - the transpiled equivalent of the
 /// walker's `Runtime::set_error`. Called at a `Function::call` boundary
 /// when a transpiled body fails (the failing call pushes no result; the
 /// caller detects the pending error via `check_host_error`).
@@ -93,7 +93,7 @@ pub fn report_error(host_view: &mut Host<'_>, e: &RuntimeError) {
 }
 
 /// Did the last dispatched call leave the host in an error state? Takes
-/// (clears) the pending error — the propagating `Err` re-reports it at the
+/// (clears) the pending error - the propagating `Err` re-reports it at the
 /// next `Function::call` boundary, so nothing is lost.
 fn check_host_error(host_view: &mut Host<'_>) -> Result<(), RuntimeError> {
     let h = host();
@@ -140,7 +140,7 @@ where
         debug_assert_eq!(args, self.arity);
         match (self.body)(host) {
             Ok(v) => host.stack().push(v),
-            // no result pushed — the caller's post-call error check
+            // no result pushed - the caller's post-call error check
             // (`check_host_error`, or the host's own status check) sees this
             Err(e) => report_error(host, &e),
         }
@@ -156,7 +156,7 @@ where
 }
 
 // ---------------------------------------------------------------------
-// Application — the walker's `apply_value_ast`/`call_ast`, with the
+// Application - the walker's `apply_value_ast`/`call_ast`, with the
 // host-status check replaced by the FFI `take_error` round trip.
 // ---------------------------------------------------------------------
 
@@ -214,7 +214,7 @@ pub fn apply(host: &mut Host, mut fval: Val, mut args: usize) -> Result<Val, Run
 
 /// Statement-position bare reference: invoke a zero-argument callable, or
 /// yield the value itself (a positive-arity function referenced bare is
-/// not called — the dispatch returns it unchanged).
+/// not called - the dispatch returns it unchanged).
 pub fn call_bare(host: &mut Host, fval: Val) -> Result<Val, RuntimeError> {
     if fval.call_as_fn(host, 0).is_none() {
         match callee(&fval) {
@@ -229,7 +229,7 @@ pub fn call_bare(host: &mut Host, fval: Val) -> Result<Val, RuntimeError> {
 }
 
 // ---------------------------------------------------------------------
-// Shared semantics helpers — verbatim ports of the walker's private
+// Shared semantics helpers - verbatim ports of the walker's private
 // `field_of`/`index_of`/`assign_field`/`assign_index` and its comparison
 // operators.
 // ---------------------------------------------------------------------
@@ -270,7 +270,7 @@ pub fn ge(a: &Val, b: &Val) -> Val {
     ))
 }
 
-/// `value.field` — read a record field.
+/// `value.field` - read a record field.
 pub fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     match v.unpack() {
         ValEnum::Record(record) => record
@@ -280,7 +280,7 @@ pub fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     }
 }
 
-/// `value[index]` — read a list element.
+/// `value[index]` - read a list element.
 pub fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => match usize::try_from(i) {
@@ -298,7 +298,7 @@ pub fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     }
 }
 
-/// `target.field = value` — write a record field.
+/// `target.field = value` - write a record field.
 pub fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError> {
     match objv.unpack() {
         ValEnum::Record(record) => {
@@ -309,7 +309,7 @@ pub fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError
     }
 }
 
-/// `target[index] = value` — write a list element.
+/// `target[index] = value` - write a list element.
 pub fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => {
@@ -336,16 +336,16 @@ pub fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> 
 }
 
 // ---------------------------------------------------------------------
-// Number-literal patterns — the walker/VM's `NumberPat`, generated at
+// Number-literal patterns - the walker/VM's `NumberPat`, generated at
 // transpile time from the literal's spelling.
 // ---------------------------------------------------------------------
 
 pub enum NumberPat {
-    /// `1i` — matches the integer `1` only, never a float.
+    /// `1i` - matches the integer `1` only, never a float.
     Integer(i64),
-    /// `1f`, `1.0`, `1e3` — matches exactly this float. Never an integer.
+    /// `1f`, `1.0`, `1e3` - matches exactly this float. Never an integer.
     Float(f64),
-    /// `1` — matches the integer `1`, or a float that *is* that integer.
+    /// `1` - matches the integer `1`, or a float that *is* that integer.
     Numeric(i64),
     /// An out-of-range literal: matches nothing at all.
     Never,

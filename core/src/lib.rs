@@ -1,11 +1,11 @@
 //! Core Raft object model: `Val` and everything it is built from.
 //!
 //! Strictly `no_std` (`alloc` only) so it can be shared, unmodified, by
-//! every execution mode — the tree-walking/bytecode `raft-runtime`, and
+//! every execution mode - the tree-walking/bytecode `raft-runtime`, and
 //! eventually transpiled-to-Rust modules (compiled into a `cdylib` or
 //! bundled straight into the host binary via proc-macro).
 //!
-//! `Val` is `#[repr(transparent)]` over `raft_ffi::RawVal` — a real,
+//! `Val` is `#[repr(transparent)]` over `raft_ffi::RawVal` - a real,
 //! compact (2-word) tagged pointer, not a Rust enum. This crate's job is
 //! to make that representation *safe* to use (under the assumption any
 //! vtable a handle carries honors ffi's contract) and ergonomic, not just
@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 use crate::rc::{Callable, DynRc, Rc, erase, erase_fn};
 
 /// Projects any concrete vtable down to the common `clone`/`drop`-shaped
-/// [`ffi::AnyVTable`] prefix every vtable embeds — what [`DynRc`] needs to
+/// [`ffi::AnyVTable`] prefix every vtable embeds - what [`DynRc`] needs to
 /// tear a value down without knowing its richer, kind-specific shape.
 pub trait AnyVTable: 'static {
     fn any(&self) -> &raft_ffi::AnyVTable;
@@ -283,7 +283,7 @@ impl Val {
         self.raw.tag.tag_ptr.as_ptr()
     }
 
-    /// A pure integer read for the `match` in `unpack`/`Drop` — never
+    /// A pure integer read for the `match` in `unpack`/`Drop` - never
     /// round-tripped back into a pointer, so no provenance concern here.
     #[inline]
     fn tag_bits(&self) -> usize {
@@ -293,7 +293,7 @@ impl Val {
     #[inline]
     fn vtable_ptr<V>(&self) -> *const V {
         // Masking through `map_addr` (not a `usize` round-trip) keeps
-        // this pointer's original provenance — the `&'static V` it was
+        // this pointer's original provenance - the `&'static V` it was
         // built from in `pack_heap`.
         self.tag_ptr().map_addr(|a| a & !ffi::MASK_BITS).cast::<V>()
     }
@@ -317,17 +317,17 @@ impl Val {
     /// Clone this handle's heap payload into an owned, independently-
     /// refcounted `DynRc`. The momentary, non-owning peek needed to reach
     /// `.clone()` is entirely local to this function and can never
-    /// outlive `self`'s borrow — unlike a hypothetical `&self ->
+    /// outlive `self`'s borrow - unlike a hypothetical `&self ->
     /// ManuallyDrop<DynRc<..>>` helper returning the peek itself would
-    /// allow (nothing would then stop `self` from being dropped — and
+    /// allow (nothing would then stop `self` from being dropped - and
     /// the reference it (uniquely, if this was the last one) owned freed
-    /// — while that returned peek was still around, unrelated to
+    /// - while that returned peek was still around, unrelated to
     /// anything `.clone()` itself does).
     #[inline]
     fn clone_heap<V: AnyVTable, T>(&self) -> DynRc<V, T> {
         // SAFETY: `heap_ptr`/`vtable_ref`'s contracts (heap tag, correct
-        // `T`/`V`). Constructing/using a `ManuallyDrop` is always safe —
-        // only dropping the inner value early or twice isn't — and nothing
+        // `T`/`V`). Constructing/using a `ManuallyDrop` is always safe -
+        // only dropping the inner value early or twice isn't - and nothing
         // here drops it: `.clone()` is a real, independent refcount bump,
         // and the `ManuallyDrop` peek itself is simply discarded after.
         let peek =
@@ -335,7 +335,7 @@ impl Val {
         (*peek).clone()
     }
 
-    /// Tear down this handle's heap payload — reconstructs the exact same
+    /// Tear down this handle's heap payload - reconstructs the exact same
     /// owning reference `self` already represented (not an extra one) and
     /// actually drops it, running real teardown exactly once. Only called
     /// from `Drop for Val`, once, on `self`'s own way out.
@@ -343,7 +343,7 @@ impl Val {
     fn drop_heap<V: AnyVTable, T>(&mut self) {
         // SAFETY: as `clone_heap`'s, but this one genuinely owns the
         // reference (it's `self`'s own, being torn down), so actually
-        // dropping it here — instead of peeking — is correct.
+        // dropping it here - instead of peeking - is correct.
         drop(unsafe { DynRc::<V, T>::new(self.heap_ptr::<T>(), self.vtable_ref::<V>()) });
     }
 
@@ -383,8 +383,8 @@ impl Val {
         let data_ptr = DynRc::data_ptr(&dyn_rc);
         core::mem::forget(dyn_rc);
         // OR-ing the tag into the (nonzero, 16-byte-aligned) vtable
-        // pointer's low bits through `map_addr` — not a `usize` round-trip
-        // — keeps its provenance; `vtable_ref` recovers it the same way.
+        // pointer's low bits through `map_addr` - not a `usize` round-trip
+        // - keeps its provenance; `vtable_ref` recovers it the same way.
         let tagged = vtable_ptr.cast::<ffi::Void>().map_addr(|a| a | tag);
         Val {
             raw: ffi::RawVal {
@@ -401,12 +401,12 @@ impl Val {
         }
     }
 
-    /// Move `self`'s raw bits out without running `Drop` — for handing
+    /// Move `self`'s raw bits out without running `Drop` - for handing
     /// ownership across a `RawVal`-returning boundary (the receiver
     /// becomes the new owner of whatever heap reference this held).
     #[inline(always)]
     fn into_raw(self) -> ffi::RawVal {
-        // SAFETY: copying the bits out is fine — `mem::forget` below means
+        // SAFETY: copying the bits out is fine - `mem::forget` below means
         // `self`'s own `Drop` never runs, so this isn't a double-owned copy.
         let raw = unsafe { core::ptr::read(&self.raw) };
         core::mem::forget(self);
@@ -433,7 +433,7 @@ impl Val {
         // SAFETY: bitwise-copying the tag/data union doesn't touch any
         // refcount; wrapping in `ManuallyDrop` means only the `.clone()`
         // below (a real, correct refcount bump for heap kinds) has any
-        // effect — dropping the `ManuallyDrop` peek is a no-op.
+        // effect - dropping the `ManuallyDrop` peek is a no-op.
         let peek = ManuallyDrop::new(Val { raw: unsafe { core::ptr::read(raw) } });
         (*peek).clone()
     }
@@ -479,10 +479,10 @@ impl Val {
         }
     }
 
-    /// Which variant this is, without touching a heap kind's refcount —
+    /// Which variant this is, without touching a heap kind's refcount -
     /// unlike [`unpack`](Val::unpack), which always builds an owned
     /// [`ValEnum`] (a real `clone()` for heap kinds). Callers that only
-    /// need to branch on shape — not read or hold the payload — should
+    /// need to branch on shape - not read or hold the payload - should
     /// use this instead: `if val.kind() == ValKind::Fn { ... }` costs one
     /// masked pointer read, no `Cell` bump, no matching drop.
     #[inline(always)]
@@ -506,9 +506,9 @@ impl Val {
 
     /// Raft truthiness, without cloning a heap kind just to check it.
     /// `0`/`0.0`/`False`/an empty list or record are falsey; everything
-    /// else (including `Nil` — matching this crate's existing `is_falsey`
+    /// else (including `Nil` - matching this crate's existing `is_falsey`
     /// free function) is truthy. List/Record only need their length,
-    /// read directly off the heap header — no [`clone_heap`](Val::clone_heap).
+    /// read directly off the heap header - no [`clone_heap`](Val::clone_heap).
     #[inline]
     pub fn is_falsey(&self) -> bool {
         match self.tag_bits() {
@@ -531,7 +531,7 @@ impl Val {
     }
 
     /// If this is a `Fn`, dispatch a call directly off `self`'s own
-    /// borrow — no [`clone_heap`](Val::clone_heap)/[`RcFn`] built and torn
+    /// borrow - no [`clone_heap`](Val::clone_heap)/[`RcFn`] built and torn
     /// down around it. Sound because the call is synchronous and `self`
     /// (which already owns a live reference) outlives it; equivalent to,
     /// but skips the refcount bump+drop pair that `unpack()` matching
@@ -544,20 +544,20 @@ impl Val {
         let vtable = self.vtable_ref::<raft_ffi::FnVTable>();
         // SAFETY: tag confirmed `Fn`; `heap_ptr` is a live `RcInner<Void>`
         // box for this exact tag. Raw place projection (never a reference)
-        // keeps whole-box provenance on `data` — `rc::call_shim` walks it
+        // keeps whole-box provenance on `data` - `rc::call_shim` walks it
         // back to the box header to reach the strong count.
         let data = unsafe {
             raft_ffi::VoidPtr::new_unchecked(&raw mut (*self.heap_ptr::<Void>().as_ptr()).value)
         };
         // SAFETY: crossing into the `extern "C"` `CallFn` ABI, same as
-        // `RcFn::call` — `host.as_raw()` is the exact valid, exclusively
+        // `RcFn::call` - `host.as_raw()` is the exact valid, exclusively
         // borrowed `RawHost` `host` wraps.
         Some(unsafe { (vtable.call)(data, args, host.as_raw()) })
     }
 
     /// Hand ownership of this value across an FFI boundary as its raw
     /// 2-word representation. The receiver becomes the owner of whatever
-    /// heap reference this held — pair with [`Val::from_ffi`] on the other
+    /// heap reference this held - pair with [`Val::from_ffi`] on the other
     /// side, or leak it.
     #[inline(always)]
     pub fn into_ffi(self) -> ffi::RawVal {
@@ -649,11 +649,11 @@ impl From<ValEnum> for Val {
 
 impl Clone for Val {
     /// Bumps a heap kind's refcount directly and bit-copies the raw
-    /// tag/data — *not* `Val::from(self.unpack())`. That round trip would
+    /// tag/data - *not* `Val::from(self.unpack())`. That round trip would
     /// build a full `ValEnum` (a `RcStr`/`RcList`/.../`RcFn` wrapper) and
     /// then immediately re-pack it (`pack_heap`: re-fetch the vtable,
     /// re-derive the tagged pointer via `map_addr`, `NonNull` construction)
-    /// — all to end up with the exact same bits this already has, since a
+    /// - all to end up with the exact same bits this already has, since a
     /// clone never changes which allocation a `Val` points at. `unpack()`
     /// is for callers that actually want the ergonomic, kind-matched view;
     /// a clone doesn't.
@@ -666,7 +666,7 @@ impl Clone for Val {
             | ffi::MASK_TAG_FN
             | ffi::MASK_TAG_OPAQUE => {
                 // SAFETY: heap tag confirmed; `RcInner<T>::strong` is
-                // `#[repr(C)]`'s first field regardless of `T` — the same
+                // `#[repr(C)]`'s first field regardless of `T` - the same
                 // invariant `rc::erase`/`rc::erase_fn` already rely on when
                 // they cast `RcPtr<T>` down to `RcPtr<Void>` and read
                 // `.strong` through it. Bumping it here in place is exactly
@@ -677,7 +677,7 @@ impl Clone for Val {
             _ => {}
         }
         // SAFETY: bitwise-copying the tag/data union never touches a
-        // refcount by itself — for heap kinds, the bump above already made
+        // refcount by itself - for heap kinds, the bump above already made
         // this an independent, correctly-counted owning reference; for
         // scalars there was never a count to touch.
         Val { raw: unsafe { core::ptr::read(&self.raw) } }
@@ -1096,7 +1096,7 @@ impl Val {
     }
 
     /// Wrap a host closure into a function value with the given
-    /// argument-count hint. `(0, None)` means "takes anything" — the
+    /// argument-count hint. `(0, None)` means "takes anything" - the
     /// closure then decides how many arguments to consume.
     #[inline]
     pub fn host_function<F>(min_args: usize, max_args: Option<usize>, f: F) -> Val
@@ -1117,7 +1117,7 @@ pub fn is_falsey(v: &Val) -> bool {
 
 // ---------------------------------------------------------------------
 // RcStr: Val::String's backing. Immutable once built (`LenVal`'s inline
-// flexible-array shape suits this fine — no growth needed).
+// flexible-array shape suits this fine - no growth needed).
 // ---------------------------------------------------------------------
 
 unsafe extern "C" fn string_destroy(ptr: raft_ffi::RcPtr<Void>) {
@@ -1280,7 +1280,7 @@ impl fmt::Display for RcStr {
 }
 
 // ---------------------------------------------------------------------
-// RcList: Val::List's backing. `ffi::ListVal` is a `RawVec<RawVal>` —
+// RcList: Val::List's backing. `ffi::ListVal` is a `RawVec<RawVal>` -
 // growable, via `Vec<Val>`'s own realloc, in place, behind a stable
 // outer `RcInner` (only the *inner* buffer moves on push).
 // ---------------------------------------------------------------------
@@ -1288,7 +1288,7 @@ impl fmt::Display for RcStr {
 unsafe extern "C" fn list_destroy(ptr: raft_ffi::RcPtr<Void>) {
     let ptr = ptr.cast::<RcInner<UnsafeCell<ffi::ListVal>>>();
     // SAFETY: strong count just hit zero (`DynRc::drop`, the only
-    // caller) — this is the sole reference. Turning it into a reference
+    // caller) - this is the sole reference. Turning it into a reference
     // immediately confines everything after to safe slice/Vec ops.
     let inner: &mut RcInner<UnsafeCell<ffi::ListVal>> = unsafe { &mut *ptr.as_ptr() };
     let header = inner.value.get_mut();
@@ -1415,7 +1415,7 @@ impl RcList {
         unsafe { raft_ffi::VoidPtr::new_unchecked(self.ptr.rc_box().value.get() as *mut Void) }
     }
 
-    /// `target[index] = value` — in place, no length change.
+    /// `target[index] = value` - in place, no length change.
     pub fn set(&self, index: usize, val: Val) {
         let vtable = DynRc::vtable(&self.ptr);
         // SAFETY: `value_ptr()` is a live `ffi::ListVal` for `vtable`.
@@ -1423,7 +1423,7 @@ impl RcList {
     }
 
     /// Append to the end, growing in place (the outer handle stays valid
-    /// — see `RcList`'s doc comment).
+    /// - see `RcList`'s doc comment).
     pub fn push(&self, val: Val) {
         let vtable = DynRc::vtable(&self.ptr);
         // SAFETY: as `set`'s.
@@ -1475,7 +1475,7 @@ impl fmt::Display for RcList {
 // ---------------------------------------------------------------------
 // RcRecord: Val::Record's backing. `ffi::RecordVal` is a
 // `RawVec<RawFieldVal>`; each entry's `name` is a borrowed `Str` view
-// into its own small, singly-owned (non-refcounted — never aliased)
+// into its own small, singly-owned (non-refcounted - never aliased)
 // allocation, freed explicitly on overwrite/removal/destroy.
 // ---------------------------------------------------------------------
 
@@ -1513,13 +1513,13 @@ fn key_str(s: &Str) -> &str {
 unsafe extern "C" fn record_destroy(ptr: raft_ffi::RcPtr<Void>) {
     let ptr = ptr.cast::<RcInner<UnsafeCell<ffi::RecordVal>>>();
     // SAFETY: strong count just hit zero (`DynRc::drop`, the only
-    // caller) — this is the sole reference. Turning it into a reference
+    // caller) - this is the sole reference. Turning it into a reference
     // immediately confines everything after to safe operations.
     let inner: &mut RcInner<UnsafeCell<ffi::RecordVal>> = unsafe { &mut *ptr.as_ptr() };
     let header = inner.value.get_mut();
     // SAFETY: `header`'s ptr/size/capacity are valid `Vec<RawFieldVal>`
     // raw parts. `RawFieldVal` has no `Drop` impl of its own, so this
-    // `Vec`'s own drop just frees the buffer — field cleanup is manual,
+    // `Vec`'s own drop just frees the buffer - field cleanup is manual,
     // below.
     let fields = unsafe { Vec::from_raw_parts(header.ptr, header.size, header.capacity) };
     for field in &fields {
@@ -1799,7 +1799,7 @@ impl fmt::Display for RcRecord {
 }
 
 // ---------------------------------------------------------------------
-// RcOpaque: Val::Opaque's backing — a fully host-erased `T`, monomorphized
+// RcOpaque: Val::Opaque's backing - a fully host-erased `T`, monomorphized
 // per concrete `T` (see `rc::any_vtable`/`rc::DynRc::erase`).
 // ---------------------------------------------------------------------
 
@@ -1821,11 +1821,11 @@ impl RcOpaque {
 // Function/RcFn: Val::Fn's backing. `raft-core`'s own `Function` trait
 // (partial application, min/max args) bridges into `rc::Callable`
 // (the minimal bound `rc::fn_vtable`/`DynRc::erase_fn` need), same
-// relationship the old `Function`/`DynFn` split had — just retargeted
+// relationship the old `Function`/`DynFn` split had - just retargeted
 // at `*mut ffi::RawHost` instead of `&mut dyn Host`.
 //
 // Note: unlike the old design, there is no `call_once`/`Rc::try_unwrap`
-// fast path here — safely replicating "move captured state instead of
+// fast path here - safely replicating "move captured state instead of
 // cloning it" through a fully type-erased `DynRc<FnVTable, Void>` would
 // need a dedicated "take" vtable slot (deallocation must stay owned by
 // `destroy`, so a `call` shim can't `try_unwrap`-and-deallocate without
@@ -1837,10 +1837,10 @@ impl RcOpaque {
 /// bytecode), partially-applied functions, and host-provided closures all
 /// implement this.
 ///
-/// Callers must supply at least [`Function::min_args`] arguments — the
+/// Callers must supply at least [`Function::min_args`] arguments - the
 /// generic dispatch in [`call_dispatch`]-via-[`rc::Callable`] handles
 /// partial application *before* calling [`Function::call`], so
-/// implementations never see an underfull call. `host` is a safe view —
+/// implementations never see an underfull call. `host` is a safe view -
 /// nothing in this trait, or anything implementing it, ever touches a raw
 /// pointer; that's confined to `rc::call_shim` and [`RcFn::call`].
 pub trait Function: Sized + 'static {
@@ -1898,7 +1898,7 @@ impl<F: Function> Callable for F {
     #[inline]
     unsafe fn call_raw(this: raft_ffi::RcPtr<F>, args: usize, host: &mut rc::Host) -> usize {
         // SAFETY: `this` is the live, whole-provenance `RcInner<F>` box
-        // (caller's contract) — viewing it as a borrowed `Rc<F>` (in
+        // (caller's contract) - viewing it as a borrowed `Rc<F>` (in
         // `ManuallyDrop`, so no double-decrement) lets `call_dispatch`
         // clone it into a partial-application value when needed.
         let rc = ManuallyDrop::new(unsafe { Rc::<F>::from_raw_box(this.cast()) });
@@ -1947,7 +1947,7 @@ where
 
 /// A function with some arguments already applied, waiting for the rest.
 /// Wraps the callee as an already-type-erased [`RcFn`] rather than a
-/// generic `Rc<F>` — re-partial-applying a `PartialFn` would otherwise
+/// generic `Rc<F>` - re-partial-applying a `PartialFn` would otherwise
 /// nest `PartialFn<PartialFn<PartialFn<..>>>` without bound, and since
 /// `call_dispatch`'s own body (reachable, regardless of whether it's ever
 /// taken at runtime) constructs one more nesting level, that blows the
@@ -2022,12 +2022,12 @@ impl RcFn {
     pub fn call(&self, host: &mut rc::Host, args: usize) -> usize {
         let vtable = DynRc::vtable(&self.ptr);
         // SAFETY: raw place projection from the live box pointer (never a
-        // reference) keeps whole-box provenance on `data` — `rc::call_shim`
+        // reference) keeps whole-box provenance on `data` - `rc::call_shim`
         // walks it back to the box header to reach the strong count.
         let data = unsafe {
             raft_ffi::VoidPtr::new_unchecked(&raw mut (*DynRc::data_ptr(&self.ptr).as_ptr()).value)
         };
-        // SAFETY: crossing into the `extern "C"` `CallFn` ABI — the one
+        // SAFETY: crossing into the `extern "C"` `CallFn` ABI - the one
         // place a raw pointer is unavoidable; `host.as_raw()` is still
         // the exact valid, exclusively-borrowed `RawHost` `host` wraps.
         unsafe { (vtable.call)(data, args, host.as_raw()) }

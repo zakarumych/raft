@@ -31,7 +31,7 @@ fn runtime_with(defs: &str, compiled: bool) -> (Runtime, Rc<Frame>) {
 }
 
 /// A runtime whose `defs` functions were transpiled to Rust, built as a
-/// cdylib bundle (same profile as the bench itself — release), linked,
+/// cdylib bundle (same profile as the bench itself - release), linked,
 /// and re-exposed as globals so `call` scripts resolve them by name.
 fn runtime_oxidized(group: &str, defs: &str) -> (Runtime, Rc<Frame>) {
     let mut rt = Runtime::new();
@@ -232,7 +232,7 @@ fn collatz(c: &mut Criterion) {
 }
 
 /// ~100 lines of Raft: a driver looping over a data set and calling a
-/// dozen small helpers — records, lists, atoms, destructuring, bit ops.
+/// dozen small helpers - records, lists, atoms, destructuring, bit ops.
 /// Call-heavy but without recursion, resembling ordinary scripting code.
 const PIPELINE: &str = r#"fn imod a n:
     a - (a / n) * n

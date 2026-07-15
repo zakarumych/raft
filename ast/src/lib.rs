@@ -137,21 +137,21 @@ impl UnOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
-    // Bit ops — tightest, left-to-right
+    // Bit ops - tightest, left-to-right
     BitAnd, // &
     BitOr,  // |
     BitXor, // ^
     Shl,    // <<
     Shr,    // >>
-    // Power — right-to-left
+    // Power - right-to-left
     Pow, // **
-    // Multiplicative — left-to-right
+    // Multiplicative - left-to-right
     Mul, // *
     Div, // /
-    // Additive — left-to-right
+    // Additive - left-to-right
     Add, // +
     Sub, // -
-    // Comparison — left-to-right, loosest
+    // Comparison - left-to-right, loosest
     Eq, // ==
     Ne, // !=
     Lt, // <
@@ -420,7 +420,7 @@ impl Export {
 pub struct Module {
     stmts: Rc<[Stmt]>,
 
-    /// `export { .. }` — the mandatory tail statement of a module,
+    /// `export { .. }` - the mandatory tail statement of a module,
     /// declaring its public bindings with record syntax.
     export: Export,
 }

@@ -370,7 +370,7 @@ fn expr_apply() {
 
 #[test]
 fn expr_apply_unary_arg() {
-    // f !a — ! is unambiguously unary, so it's an argument
+    // f !a - ! is unambiguously unary, so it's an argument
     let e = tokens_from_str("f !a").parse_expr().unwrap();
     let ExprKind::Apply(_, args) = e.kind() else {
         panic!()
@@ -501,14 +501,14 @@ fn number_suffix_validated_at_parse_time() {
 
 #[test]
 fn underscore_rejected_as_record_key() {
-    // `_` is the wildcard binder, not a field name — in expressions...
+    // `_` is the wildcard binder, not a field name - in expressions...
     assert!(tokens_from_str("{ _: 1 }").parse_expr().is_err());
     assert!(tokens_from_str("{ _ }").parse_expr().is_err());
     // ...and in patterns
     assert!(tokens_from_str("{ _: x }").parse_pat().is_err());
     assert!(tokens_from_str("{ _ }").parse_pat().is_err());
 
-    // nor as a field in dot access — reading or assigning
+    // nor as a field in dot access - reading or assigning
     assert!(tokens_from_str("p._").parse_expr().is_err());
     assert!(tokens_from_str("p._ = 1").parse_stmt().is_err());
     assert!(tokens_from_str("p._.q").parse_expr().is_err());
@@ -521,7 +521,7 @@ fn underscore_rejected_as_record_key() {
 
 #[test]
 fn expr_paren_grouping() {
-    // (1 + 2) * 3 — parens override precedence
+    // (1 + 2) * 3 - parens override precedence
     let e = tokens_from_str("(1 + 2) * 3").parse_expr().unwrap();
     let ExprKind::Binary(lhs, op, _) = e.kind() else {
         panic!()

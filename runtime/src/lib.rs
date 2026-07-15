@@ -42,7 +42,7 @@ type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 // Object storage specifically needs this (not the `RandomState`-backed
 // `HashMap` above): the walker and the VM each build a record's map
 // independently, and the equivalence suite below compares their `Display`
-// output — a per-instance random hash seed would make two maps holding
+// output - a per-instance random hash seed would make two maps holding
 // the same keys iterate (and so print) in different orders.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FixedHashState;
@@ -59,11 +59,11 @@ impl core::hash::BuildHasher for FixedHashState {
 pub type FixedHashMap<K, V> = hashbrown::HashMap<K, V, FixedHashState>;
 
 // List/record storage now lives entirely in `raft-core` (`RcList`/
-// `RcRecord`, growable in place — see their doc comments there); this
+// `RcRecord`, growable in place - see their doc comments there); this
 // crate just builds `Val`s from them. `Module` is no longer a distinct
-// kind — an imported module's exports are a plain (mutable) `RcRecord`.
+// kind - an imported module's exports are a plain (mutable) `RcRecord`.
 // Module immutability isn't enforced at the object level anymore (a
-// known behavior gap versus the old `Object::frozen` — `raft-core`'s
+// known behavior gap versus the old `Object::frozen` - `raft-core`'s
 // `RecordVTable` has no freeze concept); flagged, not fixed here.
 
 pub fn new_list(elements: Vec<Val>) -> Val {
@@ -101,7 +101,7 @@ impl Function for AstFn {
     fn call(&self, host: &mut raft_core::rc::Host, args: usize) {
         // SAFETY: every `Host` reaching a `Function::call` implemented in
         // this crate was built by casting a `&mut Runtime` to
-        // `*mut ffi::RawHost` — `Runtime` is `#[repr(C)]` with
+        // `*mut ffi::RawHost` - `Runtime` is `#[repr(C)]` with
         // `host: ffi::RawHost` as its first field (see `Runtime`'s doc
         // comment), so this recovers exactly that `Runtime`.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
@@ -159,7 +159,7 @@ fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
 }
 
 /// Extension for `raft-ast` node types' `.rc_name()` (which returns
-/// `alloc::rc::Rc<str>`) — this crate wants `raft_core::RcStr` throughout
+/// `alloc::rc::Rc<str>`) - this crate wants `raft_core::RcStr` throughout
 /// instead. Named differently (`rc_str_name`) since an inherent method
 /// can't be shadowed by a trait impl.
 trait RcStrName {
@@ -187,7 +187,7 @@ pub struct SlotId(pub u32);
 
 /// Collect every identifier *read* reachable from an expression (record
 /// shorthand `{ key }` counts as a read of `key`) into `out`. Doesn't
-/// distinguish bound from outer — callers filter against a `SlotTable`.
+/// distinguish bound from outer - callers filter against a `SlotTable`.
 fn collect_reads_expr(expr: &Expr, out: &mut Vec<RcStr>) {
     match expr.kind() {
         ExprKind::Ident(id) => out.push(id.rc_str_name()),
@@ -225,7 +225,7 @@ fn collect_reads_expr(expr: &Expr, out: &mut Vec<RcStr>) {
     }
 }
 
-/// Same, but over a statement — nested `fn` statements contribute their own
+/// Same, but over a statement - nested `fn` statements contribute their own
 /// outer names (recursively computed by [`fn_outer_names`]) as reads at this
 /// level, so a name that's only outer several levels deep still propagates
 /// outward.
@@ -305,13 +305,13 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
 }
 
 /// Names read inside `body` (params included as bound) that aren't bound
-/// anywhere within it — i.e. must resolve to an enclosing scope. Recurses
+/// anywhere within it - i.e. must resolve to an enclosing scope. Recurses
 /// into nested `fn` bodies, so a name only referenced by a grandchild `fn`
 /// still shows up here (propagated up through [`collect_reads_stmt`]'s
 /// `StmtKind::Fn` arm).
 fn fn_outer_names(params: &[Pat], body: &[Stmt]) -> Vec<RcStr> {
     // only params are unconditionally initialized before any possible
-    // read — a body-assigned name may still read through to an enclosing
+    // read - a body-assigned name may still read through to an enclosing
     // scope on its first (pre-assignment) access under the language's
     // shadow-with-fallback rule (`x = x + 1` reads the outer `x`), so it
     // must NOT be excluded here just because it's also assigned locally
@@ -447,7 +447,7 @@ impl SlotTable {
     }
 
     /// Which of this function's own slots are read by some `fn` nested
-    /// (at any depth) inside `body` — those need to live in a per-call
+    /// (at any depth) inside `body` - those need to live in a per-call
     /// [`Frame`] instead of a stack slot, since a closure escaping this
     /// call must still see them. Everything else stays a stack slot.
     fn mark_captured(&self, body: &[Stmt]) -> Vec<bool> {
@@ -538,7 +538,7 @@ pub struct Context {
 
     /// Interned custom-atom names. `raft-core`'s `Atom::Custom` only
     /// carries an `AtomId` (it has no host-agnostic way to keep a name
-    /// table) — this is that table. `Nil`/`True`/`False` never appear
+    /// table) - this is that table. `Nil`/`True`/`False` never appear
     /// here; they're distinct `Atom` variants of their own.
     atoms: Vec<RcStr>,
 }
@@ -577,7 +577,7 @@ where
 }
 
 impl Context {
-    /// Intern a constant. Only immutable scalar values are deduplicated —
+    /// Intern a constant. Only immutable scalar values are deduplicated -
     /// and never across numeric kinds, since `Any`'s equality treats `1`
     /// and `1.0` as equal but the program must observe distinct values.
     pub fn const_(&mut self, v: Val) -> ConstId {
@@ -637,7 +637,7 @@ impl Context {
 
     /// Intern (or look up) a custom atom's name, returning the `AtomId`
     /// `Atom::Custom` carries. `name` must not be `"Nil"`/`"True"`/
-    /// `"False"` — those are distinct `Atom` variants, not interned here.
+    /// `"False"` - those are distinct `Atom` variants, not interned here.
     pub fn atom_id(&mut self, name: &str) -> AtomId {
         if let Some(i) = self.atoms.iter().position(|s| s.as_str() == name) {
             return AtomId(i);
@@ -652,7 +652,7 @@ impl Context {
 }
 
 /// Build the `Atom` for atom literal `name` (`:Nil`/`:True`/`:False`, or a
-/// custom atom — interned into `ctx`'s atom table so equal names compare
+/// custom atom - interned into `ctx`'s atom table so equal names compare
 /// equal via `AtomId`).
 pub fn atom_from_name(ctx: &mut Context, name: &str) -> Atom {
     match name {
@@ -663,19 +663,19 @@ pub fn atom_from_name(ctx: &mut Context, name: &str) -> Atom {
     }
 }
 
-/// Build the `Val` for atom literal `name` — see [`atom_from_name`].
+/// Build the `Val` for atom literal `name` - see [`atom_from_name`].
 pub fn atom_val(rt: &mut Runtime, name: &str) -> Val {
     Val::from(ValEnum::Atom(atom_from_name(&mut rt.ctx, name)))
 }
 
-/// Whether `atom` is the atom named `name` — mirrors [`atom_val`]'s
+/// Whether `atom` is the atom named `name` - mirrors [`atom_val`]'s
 /// special-casing of `Nil`/`True`/`False`.
 pub fn atom_eq(rt: &mut Runtime, atom: &Atom, name: &str) -> bool {
     *atom == atom_from_name(&mut rt.ctx, name)
 }
 
 /// The AST walker's dynamic scope. Grows as statements assign new names
-/// (no fixed layout — unlike [`vm::CompiledFrame`], which compiled code
+/// (no fixed layout - unlike [`vm::CompiledFrame`], which compiled code
 /// uses instead), resolved purely by name, chained to whatever frame was
 /// live when the enclosing `fn`/module/REPL root started executing.
 #[derive(Debug)]
@@ -720,7 +720,7 @@ impl Frame {
         }
     }
 
-    /// This frame's own bindings (not the parent chain) — for inspection
+    /// This frame's own bindings (not the parent chain) - for inspection
     /// (e.g. comparing walker/VM globals in tests), not used by evaluation.
     pub fn own_entries(&self) -> SmallVec<[(StringId, Val); 8]> {
         self.slots.borrow().clone()
@@ -732,11 +732,11 @@ impl Frame {
 /// `#[repr(C)]`: that's what lets `&mut Runtime` be reinterpreted as
 /// `*mut ffi::RawHost` with no offset adjustment (see
 /// [`AstFn`]/[`vm::CompiledFn`]'s `Function::call`, which recover
-/// `Runtime` from the `rc::Host` they're handed via `Host::as_raw` — the
+/// `Runtime` from the `rc::Host` they're handed via `Host::as_raw` - the
 /// same pointer `Runtime` cast itself into in the first place).
 #[repr(C)]
 pub struct Runtime {
-    /// The operand stack shared by all compiled-function frames — see
+    /// The operand stack shared by all compiled-function frames - see
     /// [`Runtime::stack`]. `raft-core`'s object model reaches through here
     /// (as a bare `ffi::RawStack`) when dispatching a `Val::Fn` call.
     host: ffi::RawHost,
@@ -765,7 +765,7 @@ pub struct Runtime {
     /// Bundle cdylibs linked into this runtime (see [`Runtime::link_bundle`]).
     /// Values produced by a bundle carry vtable and code pointers into its
     /// library, so the libraries must outlive every `Val` this runtime
-    /// holds — this field is declared last, dropping only after `global`/
+    /// holds - this field is declared last, dropping only after `global`/
     /// `modules` (and the operand stack, torn down in `Drop::drop` before
     /// any field).
     #[cfg(feature = "bundle")]
@@ -775,7 +775,7 @@ pub struct Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         // SAFETY: `self.host.stack` is always a valid `Vec<Val>`-shaped
-        // allocation (see `Runtime::new`/`Runtime::stack`) — reconstructing
+        // allocation (see `Runtime::new`/`Runtime::stack`) - reconstructing
         // it here runs each remaining `Val`'s `Drop` and frees the buffer,
         // same as an ordinarily-owned `Vec<Val>` field would on its own.
         drop(unsafe {
@@ -803,7 +803,7 @@ pub enum Exec {
 impl Runtime {
     pub fn new() -> Self {
         // A properly-aligned dangling pointer, matching `Vec::new()`'s own
-        // convention — `Runtime::stack`/`Drop for Runtime` treat
+        // convention - `Runtime::stack`/`Drop for Runtime` treat
         // `host.stack` as real `Vec<Val>` raw parts from here on.
         let empty = ManuallyDrop::new(Vec::<Val>::with_capacity(1024));
         Runtime {
@@ -826,14 +826,14 @@ impl Runtime {
     }
 
     /// The operand stack shared by all compiled-function frames. Reachable
-    /// for inspection — a host function called from compiled code can
+    /// for inspection - a host function called from compiled code can
     /// watch the caller's temporaries live. Each frame works relative to
     /// the stack height at its entry and restores it on exit; pushing
     /// extra values from a host function mid-call is at your own peril.
     #[inline]
     pub fn stack(&mut self) -> Stack<'_> {
         // SAFETY: `self.host.stack` is always a valid `Vec<Val>`-shaped
-        // allocation — established in `new` above, maintained by every
+        // allocation - established in `new` above, maintained by every
         // mutation going through this same guard. `Val` is
         // `#[repr(transparent)]` over `ffi::RawVal`, so reinterpreting
         // `&mut ffi::RawVec<RawVal>` (what `RawStack` is) as
@@ -844,7 +844,7 @@ impl Runtime {
     /// A safe `rc::Host` view of `self`, for dispatching a `Val::Fn` call
     /// (`RcFn::call`). Sound because `Runtime` is `#[repr(C)]` with
     /// `host: ffi::RawHost` as its first field (see `Runtime`'s doc
-    /// comment) — this is the cast `AstFn`/`vm::CompiledFn`'s
+    /// comment) - this is the cast `AstFn`/`vm::CompiledFn`'s
     /// `Function::call` reverses via `Host::as_raw`.
     #[inline]
     fn as_host(&mut self) -> raft_core::rc::Host<'_> {
@@ -854,7 +854,7 @@ impl Runtime {
     /// Choose how `fn` statements executed from here on are realized:
     /// `true` compiles them to bytecode run by [`vm::run`], `false` (the
     /// default) keeps the tree-walking closure. The modes mix freely within
-    /// one runtime — functions defined either way call each other through
+    /// one runtime - functions defined either way call each other through
     /// the same `Any::Fn` interface.
     pub fn set_compile_fns(&mut self, enabled: bool) {
         self.compile_fns = enabled;
@@ -882,7 +882,7 @@ impl Runtime {
     /// pointer plus callbacks for name interning, global-variable access,
     /// and error signaling. Every callback recovers this exact `Runtime`
     /// from the raw pointer (sound per `Runtime`'s `#[repr(C)]` layout
-    /// contract — see its doc comment).
+    /// contract - see its doc comment).
     pub fn ffi_host(&mut self) -> ffi::RaftFFIHost {
         ffi::RaftFFIHost {
             raw: self as *mut Runtime as *mut ffi::RawHost,
@@ -1048,7 +1048,7 @@ impl Runtime {
             self.apply_value_ast(fval, args)
         } else {
             // `fval` is an owned local here (not borrowed from `self`), so
-            // dispatching straight off it — no intermediate `RcFn` clone —
+            // dispatching straight off it - no intermediate `RcFn` clone -
             // is sound even though `self.as_host()` needs `&mut self` too.
             if fval.call_as_fn(&mut self.as_host(), 0).is_none() {
                 let callee = match callee(fval) {
@@ -1069,7 +1069,7 @@ impl Runtime {
     fn apply_value(&mut self, mut args: usize) -> Result<(), RuntimeError> {
         while args > 0 {
             let fval = self.stack().pop();
-            // `fval` just moved out of the stack — independent of `self`
+            // `fval` just moved out of the stack - independent of `self`
             // now, so calling straight off it (no intermediate `RcFn`
             // clone/drop) is sound. Falls back to `callee()` only for the
             // rarer `Record.__call` protocol or the not-callable error.
@@ -1109,7 +1109,7 @@ impl Runtime {
         while args > 0 {
             // `fval` is an owned local (parameter or reassigned from a
             // fresh `pop()` below), never borrowed from `self` at this
-            // point — dispatching straight off it skips the `RcFn`
+            // point - dispatching straight off it skips the `RcFn`
             // clone/drop `callee()` would otherwise pay.
             let consumed = match fval.call_as_fn(&mut self.as_host(), args) {
                 Some(consumed) => consumed,
@@ -1264,8 +1264,8 @@ impl Runtime {
         }
     }
 
-    /// Register an already-built module object under `name` — e.g. one
-    /// loaded from a transpiled-bundle cdylib — so [`Runtime::module`]
+    /// Register an already-built module object under `name` - e.g. one
+    /// loaded from a transpiled-bundle cdylib - so [`Runtime::module`]
     /// lookups and cached [`Runtime::load_module`] calls find it without
     /// executing any source.
     pub fn register_module(&mut self, name: &str, module: Val) {
@@ -1306,7 +1306,7 @@ impl Runtime {
         let stmts = ast.rc_stmts();
 
         // export values are parse-restricted to bare names (shorthand or
-        // `key: name`) — this doubles as the set of names the compiled
+        // `key: name`) - this doubles as the set of names the compiled
         // body must keep alive past its own `Return`, which otherwise
         // truncates the stack region ordinary locals live in
         let export_names: Vec<RcStr> = ast
@@ -1326,7 +1326,7 @@ impl Runtime {
 
         // the module body runs in a fresh environment: it must not see the
         // importer's locals, and its own bindings must not leak. A module
-        // is otherwise an ordinary zero-arg function — no bespoke
+        // is otherwise an ordinary zero-arg function - no bespoke
         // environment type, just the same compile/walk pipeline every
         // other `fn` goes through.
         self.loading.push(name_id);
@@ -1350,7 +1350,7 @@ impl Runtime {
                         let key = f.key().rc_str_name();
                         let source_id = self.ctx.string(source.clone());
                         // a name never bound anywhere in the module (a
-                        // genuinely unbound export) has no slot at all —
+                        // genuinely unbound export) has no slot at all -
                         // that's an UnboundIdentifier, not a bug
                         let val = compiled
                             .own_names
@@ -1441,7 +1441,7 @@ impl Runtime {
                 // compare literal with value
                 match (lit, val.unpack()) {
                     (Lit::Num(nlit), ValEnum::Number(actual)) => {
-                        // suffix-aware, exact matching — same rules as the
+                        // suffix-aware, exact matching - same rules as the
                         // compiled representation (see vm::NumberPat)
                         if vm::NumberPat::from_literal(nlit).matches(actual) {
                             Ok(())
@@ -1543,7 +1543,7 @@ fn literal_value(lit: &Lit) -> Result<Val, RuntimeError> {
     }
 }
 
-/// `value.field` — read a record field.
+/// `value.field` - read a record field.
 fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     match v.unpack() {
         ValEnum::Record(record) => record
@@ -1553,7 +1553,7 @@ fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     }
 }
 
-/// `value[index]` — read a list element.
+/// `value[index]` - read a list element.
 fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => match usize::try_from(i) {
@@ -1571,7 +1571,7 @@ fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     }
 }
 
-/// `target.field = value` — write a record field.
+/// `target.field = value` - write a record field.
 fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError> {
     match objv.unpack() {
         ValEnum::Record(record) => {
@@ -1582,7 +1582,7 @@ fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError> {
     }
 }
 
-/// `target[index] = value` — write a list element.
+/// `target[index] = value` - write a list element.
 fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => {
@@ -1669,7 +1669,7 @@ fn callee_ref(val: &Val) -> Option<RcFn> {
 
 // ---------------------------------------------------------------------
 // FFI callbacks handed to transpiled bundles via `Runtime::ffi_host`.
-// Each one recovers the `Runtime` from the raw host pointer — sound per
+// Each one recovers the `Runtime` from the raw host pointer - sound per
 // `Runtime`'s `#[repr(C)]`/host-first layout contract (the same cast
 // `AstFn::call` performs).
 // ---------------------------------------------------------------------
@@ -1731,7 +1731,7 @@ unsafe extern "C" fn ffi_take_error(host: *mut ffi::RawHost) -> ffi::RawVal {
 mod tests {
     use super::*;
 
-    /// Test sources are plain statement blocks, not modules — no export.
+    /// Test sources are plain statement blocks, not modules - no export.
     struct TestBlock {
         stmts: Vec<Stmt>,
     }
@@ -1891,7 +1891,7 @@ mod tests {
 
     // NOTE: the old `frozen_object_mutation_errors` test lived here,
     // covering module-export immutability (`Object::frozen`). `raft-core`'s
-    // `RecordVTable` has no freeze concept, so that enforcement is gone —
+    // `RecordVTable` has no freeze concept, so that enforcement is gone -
     // a known regression from the `Val`/`RcRecord` redesign, not yet
     // reinstated. Removed rather than left asserting behavior that no
     // longer holds.
@@ -1964,10 +1964,10 @@ mod tests {
 
     // NOTE: the old `call_once_dispatch_for_last_reference` test lived
     // here, probing `Function::call_once`'s "last reference, move instead
-    // of clone" optimization. That trait method no longer exists —
+    // of clone" optimization. That trait method no longer exists -
     // safely replicating it through a fully type-erased
     // `DynRc<FnVTable, Void>` isn't possible without a dedicated vtable
-    // slot (see `Function`'s doc comment in `raft-core`) — so there's
+    // slot (see `Function`'s doc comment in `raft-core`) - so there's
     // nothing left for this test to distinguish. Removed rather than
     // adapted to assert a distinction that no longer exists.
 

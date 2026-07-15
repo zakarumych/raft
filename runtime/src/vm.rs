@@ -9,7 +9,7 @@
 //! into an ordinary `Any::Fn` value ([`CompiledFn::into_function`]) speaking
 //! the same `(result, args_consumed)` protocol as AST-defined and
 //! host-registered functions, so compiled code can call interpreted code and
-//! vice versa — including currying/partial application. Enable per-runtime
+//! vice versa - including currying/partial application. Enable per-runtime
 //! with [`Runtime::set_compile_fns`].
 //!
 //! The compiler produces [`Instr`] values (a plain Rust enum) and then
@@ -22,8 +22,8 @@
 //! carry a sign- or zero-extended payload (never the const pool), and jump
 //! targets are fixed 4-byte little-endian byte offsets. [`Code::disassemble`]
 //! decodes back to `Instr` for inspection. Operands are indices into pools shared by all of
-//! a runtime's compiled functions — constants, names and patterns are interned once into the
-//! [`VmContext`] living on the [`Runtime`] — or absolute jump targets into
+//! a runtime's compiled functions - constants, names and patterns are interned once into the
+//! [`VmContext`] living on the [`Runtime`] - or absolute jump targets into
 //! the function's own `code`. The context also owns the operand stack all
 //! compiled frames execute on; frames address it relative to a base
 //! recorded on entry and truncate back on exit.
@@ -31,7 +31,7 @@
 //! Locals are compile-time-resolved frame slots on that same stack (see
 //! [`SlotTable`]): the arguments a caller leaves on the stack are the
 //! frame's first slots, body-introduced names extend the frame, and reads
-//! of a not-yet-assigned local fall back to the global of the same name —
+//! of a not-yet-assigned local fall back to the global of the same name -
 //! so compiled functions never touch the runtime's name-keyed scopes.
 
 use alloc::{
@@ -54,7 +54,7 @@ use crate::{
 use raft_core::{Function, RcFn, RcStr, rc};
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
-/// (never a global pool — a nested `fn` is only ever referenced from the
+/// (never a global pool - a nested `fn` is only ever referenced from the
 /// one `Instr::MakeClosure` site that defines it). Flattened: `0..consts.len()`
 /// addresses `consts`, `consts.len()..` addresses `templates`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,111 +72,111 @@ pub struct FnId(pub u32);
 /// Stack effects below are written `before → after`, top of stack rightmost.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Instr {
-    /// `→ v` — push a copy of frame slot `slot`.
+    /// `→ v` - push a copy of frame slot `slot`.
     /// If unassigned, loads from outer scope using slot's name index stored in function object.
     LoadSlot(SlotId),
-    /// `v →` — pop and store into frame slot `slot` (assignments inside a
+    /// `v →` - pop and store into frame slot `slot` (assignments inside a
     /// function always target locals).
     StoreSlot(SlotId),
-    /// `→ v` — push parent's slot `slot` of the executing function's module.
+    /// `→ v` - push parent's slot `slot` of the executing function's module.
     /// Falls back to the global scope using the slot's name index stored in the module object.
     LoadParent(SlotId),
-    /// `→` — add/subtract 1 to frame slot `slot` in place (no stack
+    /// `→` - add/subtract 1 to frame slot `slot` in place (no stack
     /// traffic). Falls back to the global `names[name]` when the slot is
     /// still unassigned, exactly like `LoadLocal`.
     IncSlot(SlotId),
     DecSlot(SlotId),
-    /// `v1 .. vn → list` — pop `n` values, push a new list of them.
+    /// `v1 .. vn → list` - pop `n` values, push a new list of them.
     MakeList(u32),
-    /// `k1 v1 .. kn vn → record` — pop `n` key/value pairs (keys are
+    /// `k1 v1 .. kn vn → record` - pop `n` key/value pairs (keys are
     /// string constants pushed by the compiler), push a new record.
     MakeRecord(u32),
-    /// `f a1 .. an → ret` — apply `f` to `n` arguments with the language's
+    /// `f a1 .. an → ret` - apply `f` to `n` arguments with the language's
     /// currying rules: a callee consuming fewer than `n` arguments has the
     /// leftovers re-applied to its result.
     Call(u32),
-    /// `→ const` — push `consts[i]`.
+    /// `→ const` - push `consts[i]`.
     Const(ConstId),
-    /// `→ v` — push global variable `names[i]`; error if unbound. Used for
-    /// names never assigned in the function — they can only be globals.
+    /// `→ v` - push global variable `names[i]`; error if unbound. Used for
+    /// names never assigned in the function - they can only be globals.
     LoadGlobal(StringId),
-    /// `v →` — pop and bind against pattern `pats[i]`, which may bind
+    /// `v →` - pop and bind against pattern `pats[i]`, which may bind
     /// several frame slots (destructuring) or fail the match with an error.
     Bind(PatId),
-    /// `obj → obj.names[i]` — read a record field.
+    /// `obj → obj.names[i]` - read a record field.
     GetField(StringId),
-    /// `obj v →` — write record field `names[i]`.
+    /// `obj v →` - write record field `names[i]`.
     SetField(StringId),
-    /// `a → op(a)` — apply a unary operator.
+    /// `a → op(a)` - apply a unary operator.
     Unary(UnOpKind),
-    /// `a b → a op b` — apply a binary operator.
+    /// `a b → a op b` - apply a binary operator.
     Binary(BinOpKind),
-    /// `v →` — pop and discard.
+    /// `v →` - pop and discard.
     Pop,
-    /// `obj idx → obj[idx]` — read a list element.
+    /// `obj idx → obj[idx]` - read a list element.
     GetIndex,
-    /// `obj idx v →` — write a list element.
+    /// `obj idx v →` - write a list element.
     SetIndex,
-    /// `iterable →` — pop, open an iterator over it and push it on the
+    /// `iterable →` - pop, open an iterator over it and push it on the
     /// iterator stack.
     IterInit,
-    /// `→` — close the innermost iterator (used by `break` in a `for`).
+    /// `→` - close the innermost iterator (used by `break` in a `for`).
     IterPop,
-    /// `v →` — pop the return value and leave the function.
+    /// `v →` - pop the return value and leave the function.
     Return,
-    /// `→` — unconditional jump to code index `t`.
+    /// `→` - unconditional jump to code index `t`.
     Jump(u32),
-    /// `c →` — pop; jump to `t` if the value is falsey.
+    /// `c →` - pop; jump to `t` if the value is falsey.
     JumpIfFalse(u32),
-    /// `→ item` *or* jump — advance the innermost iterator: push the next
+    /// `→ item` *or* jump - advance the innermost iterator: push the next
     /// item, or (when exhausted) close the iterator and jump to `t`.
     IterNext(u32),
-    /// `→ Nil` — push the `Nil` atom.
+    /// `→ Nil` - push the `Nil` atom.
     Nil,
-    /// `→ True` — push the `True` atom.
+    /// `→ True` - push the `True` atom.
     True,
-    /// `→ False` — push the `False` atom.
+    /// `→ False` - push the `False` atom.
     False,
-    /// `→ n` — push an integer immediate. Values in [`SMALL_INTS`] ride
+    /// `→ n` - push an integer immediate. Values in [`SMALL_INTS`] ride
     /// entirely in the opcode; anything else is encoded as the smallest
     /// signed or unsigned payload that holds it (`INT_8`..`INT_64`,
     /// `UINT_8`..`UINT_32`). Integers never touch the const pool.
     Int(i64),
-    /// `a → a op n` — apply a binary operator whose right operand is an
+    /// `a → a op n` - apply a binary operator whose right operand is an
     /// integer carried by the opcode. `Add`/`Sub` take values from
     /// [`SMALL_INTS`], `BitAnd`/`BitOr`/`BitXor` from [`TINY_MASKS`], and
     /// the six comparisons from [`TINY_INTS`].
     BinaryInt(BinOpKind, i16),
-    /// `→ v` — push a copy of own-frame slot `slot` (a local some nested
+    /// `→ v` - push a copy of own-frame slot `slot` (a local some nested
     /// `fn` captures). Falls back to the enclosing scope, same as
     /// [`Instr::LoadSlot`], when not yet assigned.
     LoadCap(SlotId),
-    /// `v →` — pop and store into own-frame slot `slot`.
+    /// `v →` - pop and store into own-frame slot `slot`.
     StoreCap(SlotId),
-    /// `→ v` — push nested `fn` `i` from the *defining function's own*
+    /// `→ v` - push nested `fn` `i` from the *defining function's own*
     /// `consts`/`templates` arrays (flattened: `i < consts.len()` clones a
     /// ready value, otherwise instantiates `templates[i - consts.len()]`,
-    /// attaching the current function's captured-frame — or, if it has
-    /// none, its own parent — as the new closure's parent scope). A
+    /// attaching the current function's captured-frame - or, if it has
+    /// none, its own parent - as the new closure's parent scope). A
     /// nested `fn` is only ever read from the one site that defines it,
     /// so it lives on the defining function rather than a shared pool.
     MakeClosure(FnId),
-    /// `→ v` — push `names[i]` read by name from the function's parent
+    /// `→ v` - push `names[i]` read by name from the function's parent
     /// scope, walking as many further ancestors as needed. Used when a
     /// outer name doesn't live in the *immediate* parent's own schema (so
-    /// no fixed [`SlotId`] can be resolved at compile time) — [`Instr::LoadParent`]
+    /// no fixed [`SlotId`] can be resolved at compile time) - [`Instr::LoadParent`]
     /// stays the fast path for the common one-hop case.
     LoadParentByName(StringId),
 }
 
-/// One byte per instruction, with the operand width — or the operand
-/// itself — packed into the opcode.
+/// One byte per instruction, with the operand width - or the operand
+/// itself - packed into the opcode.
 ///
 /// Every single-operand instruction owns a block of 11 consecutive
 /// opcodes: `base+0..=base+7` carry the operand value inline (the whole
 /// instruction is one byte), and `base+8`/`base+9`/`base+10` are followed
 /// by a `u8`/`u16`/`u32` little-endian operand. The opcode alone therefore
-/// determines the instruction's length — no continuation bits to chase.
+/// determines the instruction's length - no continuation bits to chase.
 /// Unary/binary operators get one opcode per kind, jump targets are fixed
 /// 4-byte little-endian **byte offsets** (so patching never changes
 /// instruction widths).
@@ -195,7 +195,7 @@ mod opcode {
     pub const DEC_SLOT: u8 = INC_SLOT_END;
     pub const DEC_SLOT_END: u8 = DEC_SLOT + 10;
     /// Own-frame equivalents of LOAD_SLOT/STORE_SLOT, for locals a nested
-    /// `fn` captures — same inline/u8/u16/u32 operand shape, just reading
+    /// `fn` captures - same inline/u8/u16/u32 operand shape, just reading
     /// and writing the function's reified [`crate::Frame`] instead of the
     /// shared operand stack.
     pub const LOAD_CAP: u8 = DEC_SLOT_END;
@@ -210,7 +210,7 @@ mod opcode {
     pub const CALL_END: u8 = CALL + 10;
 
     /// Operands indexing the shared `VmContext` pools grow with the whole
-    /// program, so inline values would be wasted opcodes — these blocks
+    /// program, so inline values would be wasted opcodes - these blocks
     /// only encode the operand's byte width: `base+0/1/2` = u8/u16/u32.
     pub const CONST: u8 = CALL_END;
     pub const CONST_END: u8 = CONST + 3;
@@ -222,7 +222,7 @@ mod opcode {
     pub const GET_FIELD_END: u8 = GET_FIELD + 3;
     pub const SET_FIELD: u8 = GET_FIELD_END;
     pub const SET_FIELD_END: u8 = SET_FIELD + 3;
-    /// `→ closure` — instantiate a `fn` template from the const pool,
+    /// `→ closure` - instantiate a `fn` template from the const pool,
     /// attaching the executing function's own captured-frame (or, if it
     /// has none, passing its own parent straight through) as the new
     /// closure's parent scope.
@@ -231,7 +231,7 @@ mod opcode {
     pub const LOAD_PARENT_BY_NAME: u8 = MAKE_CLOSURE_END;
     pub const LOAD_PARENT_BY_NAME_END: u8 = LOAD_PARENT_BY_NAME + 3;
 
-    /// One opcode per operator kind — no operand bytes at all.
+    /// One opcode per operator kind - no operand bytes at all.
     pub const UNARY: u8 = LOAD_PARENT_BY_NAME_END; // + unop_to_byte(kind), 4 kinds
     pub const UNARY_END: u8 = UNARY + 4;
     pub const BINARY: u8 = UNARY_END; // + binop_to_byte(kind), 16 kinds
@@ -594,8 +594,8 @@ pub struct Code {
 
 /// Encode instructions into bytes. Jump operands come in as instruction
 /// indices (the compiler's view) and leave as byte offsets: pass one lays
-/// out every instruction's offset — operand widths depend only on values
-/// known up front — and pass two emits with targets mapped through that
+/// out every instruction's offset - operand widths depend only on values
+/// known up front - and pass two emits with targets mapped through that
 /// layout.
 pub fn encode(instrs: &[Instr]) -> Code {
     let mut offsets = Vec::with_capacity(instrs.len() + 1);
@@ -871,7 +871,7 @@ impl fmt::Debug for Code {
     }
 }
 
-/// A pattern lowered for execution. The AST [`Pat`] is built for parsing —
+/// A pattern lowered for execution. The AST [`Pat`] is built for parsing -
 /// spans everywhere, literals still in source text; this form does all of
 /// that work once at compile time: number literals are pre-parsed, string
 /// and char literals pre-unescaped, record-shorthand fields normalized to
@@ -879,7 +879,7 @@ impl fmt::Debug for Code {
 /// slot indices of the function the pattern was compiled in.
 ///
 /// `bind` mirrors `Runtime::bind_pattern` (the tree walker's reference
-/// implementation) — keep their semantics in sync.
+/// implementation) - keep their semantics in sync.
 #[derive(Clone, Debug)]
 pub enum CompiledPat {
     Ignore,
@@ -902,17 +902,17 @@ pub enum CompiledPat {
 
 /// How a number literal matches in a pattern. The suffix chooses the
 /// strictness: an unsuffixed integer literal matches numerically, while a
-/// suffix pins the type — making number patterns usable as type
+/// suffix pins the type - making number patterns usable as type
 /// discriminators.
 #[derive(Clone, Copy, Debug)]
 pub enum NumberPat {
-    /// `1i` — matches the integer `1` only, never a float.
+    /// `1i` - matches the integer `1` only, never a float.
     Integer(i64),
-    /// `1f`, `1.0`, `1e3` — matches exactly this float (IEEE equality, so
+    /// `1f`, `1.0`, `1e3` - matches exactly this float (IEEE equality, so
     /// `+inf`/`-inf` match by sign and `-0.0` matches `0.0`; NaN matches
     /// NaN and only NaN). Never matches an integer.
     Float(f64),
-    /// `1` — matches the integer `1`, or a float that *is* that integer
+    /// `1` - matches the integer `1`, or a float that *is* that integer
     /// (finite, nothing after the dot, exactly convertible).
     Numeric(i64),
     /// An out-of-range literal: matches nothing at all.
@@ -960,7 +960,7 @@ impl NumberPat {
 /// Lower an AST pattern, resolving bound names to frame slots through
 /// `slots`. Infallible: bad suffixes are rejected by the parser before
 /// patterns exist, and an out-of-range number literal compiles to a
-/// pattern that matches nothing (`NumberPat::Never`) — the same non-match
+/// pattern that matches nothing (`NumberPat::Never`) - the same non-match
 /// the tree walker produces for it.
 fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledPat {
     fn slot_of(slots: &SlotTable, name: &str) -> SlotId {
@@ -1008,7 +1008,7 @@ fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledP
 
 impl CompiledPat {
     /// Match `val` against this pattern, binding variables into the slots
-    /// of the frame based at `base`. Mirrors `Runtime::bind_pattern` —
+    /// of the frame based at `base`. Mirrors `Runtime::bind_pattern` -
     /// including its failure behavior of leaving earlier bindings in place.
     pub fn bind(&self, rt: &mut Runtime, base: usize, val: &Val) -> Result<(), RuntimeError> {
         fn fail() -> RuntimeError {
@@ -1063,13 +1063,13 @@ impl CompiledPat {
 }
 
 /// Runtime storage for a compiled scope's reified captured locals. Chains
-/// to whatever *its own* nearest used ancestor is (`outer`) — set once,
+/// to whatever *its own* nearest used ancestor is (`outer`) - set once,
 /// at materialization time, from whichever `CompiledFn`/`CompiledFrame`
-/// created it — so a multi-level lookup keeps walking past this frame if
+/// created it - so a multi-level lookup keeps walking past this frame if
 /// the slot it lands on here was itself never assigned. A scope that
 /// captures nothing (and whose descendants read nothing from it) never
 /// gets one of these at all: `Instr::MakeClosure` skips straight past it,
-/// so no hop — nor allocation — is ever spent on a transparent level.
+/// so no hop - nor allocation - is ever spent on a transparent level.
 #[derive(Debug)]
 pub struct CompiledFrame {
     names: SmallVec<[StringId; 8]>,
@@ -1150,10 +1150,10 @@ impl CompiledFrame {
     }
 }
 
-/// A function's own name schema, fixed at compile time — never holds slot
+/// A function's own name schema, fixed at compile time - never holds slot
 /// values. Ancestor schemas are threaded separately during compilation as
 /// a flat list (see `Compiler::ancestors`/`CompileParent`) rather than a
-/// chain living on `Schema` itself — a schema only ever needs to describe
+/// chain living on `Schema` itself - a schema only ever needs to describe
 /// its own scope.
 #[derive(Debug)]
 pub struct Schema {
@@ -1176,7 +1176,7 @@ impl Schema {
 }
 
 /// A function lowered to instructions. Its operands index the pools of the
-/// [`VmContext`] it was compiled against — running it on a different
+/// [`VmContext`] it was compiled against - running it on a different
 /// runtime's context yields wrong constants or errors.
 ///
 /// Locals are frame slots on the shared operand stack: the `arity`
@@ -1193,7 +1193,7 @@ pub struct CompiledFn {
 
     /// Variable-length-encoded instructions (see [`Code`]).
     pub code: Code,
-    /// This function's own local names, indexed by [`SlotId`] — the
+    /// This function's own local names, indexed by [`SlotId`] - the
     /// by-name fallback source for a stack/captured slot read before
     /// assignment when [`CompiledFn::fallback`] has no flat answer. Also
     /// what a fresh [`CompiledFrame`] is built from when this function
@@ -1203,14 +1203,14 @@ pub struct CompiledFn {
     /// `Some(offset)` is a flat offset into `outer`; `None` falls to
     /// `outer_named` by name, then the global scope.
     fallback: Rc<[Option<u32>]>,
-    /// Whether this function has locals some nested `fn` captures — if so,
+    /// Whether this function has locals some nested `fn` captures - if so,
     /// each call reifies a fresh [`CompiledFrame`] for just those slots
     /// (`Instr::LoadCap`/`Instr::StoreCap`); otherwise every local stays a
     /// zero-allocation stack slot, exactly like a function with no nested
     /// closures at all.
     pub owns_frame: bool,
     /// The nearest ancestor [`CompiledFrame`] this function (or something
-    /// it calls through `Instr::MakeClosure`) actually reads from — using
+    /// it calls through `Instr::MakeClosure`) actually reads from - using
     /// it by way of a nested closure counts as using it. `None` for a
     /// plain (non-instantiated) compiled function: only ever populated
     /// when `Instr::MakeClosure` builds a real closure over a live
@@ -1221,17 +1221,17 @@ pub struct CompiledFn {
     /// module, which has no walked ancestor by construction.
     outer_named: Option<Rc<Frame>>,
     /// Nested `fn`s defined directly in this function's own body that
-    /// don't capture anything — ready `Val::Fn` values, indexed
+    /// don't capture anything - ready `Val::Fn` values, indexed
     /// `0..consts.len()` by `Instr::MakeClosure`. Never referenced from
     /// anywhere but this function's own bytecode, so they live here
     /// instead of a runtime-shared pool.
     consts: Rc<[Val]>,
     /// Nested `fn`s defined directly in this function's own body that DO
-    /// capture something — indexed `consts.len()..` by `Instr::MakeClosure`.
+    /// capture something - indexed `consts.len()..` by `Instr::MakeClosure`.
     templates: Rc<[Rc<FnTemplate>]>,
 }
 
-/// A `fn` compiled once as a reusable template — no ancestor frame
+/// A `fn` compiled once as a reusable template - no ancestor frame
 /// attached yet. Instantiated into a real [`CompiledFn`] by
 /// `Instr::MakeClosure` each time its defining statement executes, so a
 /// function called multiple times produces independent closures over that
@@ -1248,13 +1248,13 @@ pub struct FnTemplate {
     owns_frame: bool,
     /// Whether this template actually reads something from its defining
     /// function's own reified frame (as opposed to only reading further
-    /// out, or nothing at all) — decides whether `Instr::MakeClosure`
+    /// out, or nothing at all) - decides whether `Instr::MakeClosure`
     /// attaches that frame directly or skips straight past it to whatever
     /// the defining function's own `outer` already is.
     needs_own_frame: bool,
     /// This function's own nested `fn`s, carried through so the
     /// instantiated [`CompiledFn`] has them too (see `CompiledFn::consts`/
-    /// `CompiledFn::templates`) — shared, not copied, across every
+    /// `CompiledFn::templates`) - shared, not copied, across every
     /// instantiation of this template.
     consts: Rc<[Val]>,
     templates: Rc<[Rc<FnTemplate>]>,
@@ -1267,14 +1267,14 @@ impl CompiledFn {
     }
 
     /// Wrap into a first-class `Any::Fn` value that speaks the same calling
-    /// convention as AST-defined and host functions — partial application
+    /// convention as AST-defined and host functions - partial application
     /// and currying are handled by the runtime through the arity hint.
     #[inline]
     pub fn into_function(self) -> Val {
         Val::from(ValEnum::Fn(RcFn::new(self)))
     }
 
-    /// Resolve slot `slot` against this function's own enclosing scope —
+    /// Resolve slot `slot` against this function's own enclosing scope -
     /// used when a stack slot or captured slot is read before assignment.
     fn resolve_outer(&self, slot: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
         let val = match self.fallback[slot.0 as usize] {
@@ -1315,7 +1315,7 @@ impl CompiledFn {
         own.get(slot, rt)
     }
 
-    /// Walk a flat offset from this function's own nearest used ancestor —
+    /// Walk a flat offset from this function's own nearest used ancestor -
     /// no per-instruction list lookup, just a chain of frames that
     /// actually own something.
     fn get_parent(&self, flat: SlotId, rt: &mut Runtime) -> Result<Val, RuntimeError> {
@@ -1341,7 +1341,7 @@ impl Function for CompiledFn {
 
     // Partial application is handled generically now (see `raft-core`'s
     // `call_dispatch`, which every `Function` impl goes through via the
-    // `Callable` bridge) — this only ever runs with exactly `arity()` args.
+    // `Callable` bridge) - this only ever runs with exactly `arity()` args.
     fn call(&self, host: &mut rc::Host, args: usize) {
         debug_assert_eq!(args, self.arity());
 
@@ -1412,7 +1412,7 @@ impl fmt::Display for CompileError {
 /// the AST walker on error, which reproduces the interpreter's runtime
 /// behavior for those cases.
 pub enum CompileParent {
-    /// Nested inside another compiled function — the flat, nearest-first
+    /// Nested inside another compiled function - the flat, nearest-first
     /// list of ancestor schemas visible from here (built by the caller:
     /// the immediately enclosing function's own schema prepended if it
     /// owns a frame, otherwise its own list passed straight through), plus
@@ -1422,10 +1422,10 @@ pub enum CompileParent {
         walked_tail: bool,
     },
     /// Compiled directly under AST-walked code (module/REPL root, or an
-    /// `AstFn`'s frame) — the live frame to attach to the *returned*
+    /// `AstFn`'s frame) - the live frame to attach to the *returned*
     /// `CompiledFn` directly, since (unlike a nested closure, instantiated
     /// fresh by `Instr::MakeClosure`) it's never re-materialized later.
-    /// No compile-time schema list at all — anything not found locally
+    /// No compile-time schema list at all - anything not found locally
     /// resolves by name at runtime instead.
     Walked(Rc<Frame>),
 }
@@ -1441,10 +1441,10 @@ pub fn compile_fn(
     let mut slots = SlotTable::with_params(&params);
     slots.add_stmts(body);
 
-    // which of this function's own slots some nested `fn` reads — those
+    // which of this function's own slots some nested `fn` reads - those
     // need a per-call reified Frame instead of a stack slot. `force_captured`
     // additionally pins specific names to the reified frame regardless of
-    // whether anything nested reads them — used by modules to keep
+    // whether anything nested reads them - used by modules to keep
     // exported bindings alive past the compiled body's own `Return`, which
     // otherwise truncates the stack region ordinary locals live in.
     let mut captured = slots.mark_captured(body);
@@ -1458,7 +1458,7 @@ pub fn compile_fn(
     if owns_frame && body_has_destructuring(&params, body) {
         // a captured local bound through list/record destructuring would
         // need `Instr::Bind` to write a frame slot instead of a stack
-        // slot, which isn't supported yet — fall back to the AST walker
+        // slot, which isn't supported yet - fall back to the AST walker
         // for the whole function rather than risk it landing on the stack
         let span = params
             .first()
@@ -1471,7 +1471,7 @@ pub fn compile_fn(
         ));
     }
 
-    // this function's own name schema — used both to compile nested `fn`
+    // this function's own name schema - used both to compile nested `fn`
     // statements (so a grandchild resolves through *this* function's own
     // scope, not straight past it) and as this function's own by-name
     // fallback source
@@ -1491,7 +1491,7 @@ pub fn compile_fn(
         };
 
     // precompute, for each of this function's own slots, where a
-    // read-before-assignment resolves — `Instr::LoadSlot`/`Instr::LoadCap`
+    // read-before-assignment resolves - `Instr::LoadSlot`/`Instr::LoadCap`
     // consult this at runtime instead of re-walking anything
     let fallback: Rc<[Option<u32>]> = names
         .iter()
@@ -1539,15 +1539,15 @@ pub fn compile_fn(
         }
     }
 
-    // the body is compiled in tail position: exactly one value — the
-    // function's result — is on the stack when `Return` is reached
+    // the body is compiled in tail position: exactly one value - the
+    // function's result - is on the stack when `Return` is reached
     c.compile_block(body, true)?;
     c.emit(Instr::Return);
 
     let frame_size = c.slots.next.0 - arity;
 
     // `nested_templates` occupy the flat range starting right after
-    // `nested_consts` — final only now that no more consts can be added —
+    // `nested_consts` - final only now that no more consts can be added -
     // so every `MakeClosure` site recorded against a template gets its
     // local (templates-only) index shifted up by the final consts count
     let consts_len = c.nested_consts.len() as u32;
@@ -1597,7 +1597,7 @@ struct LoopCtx {
 
 /// Whether `params`/`body` bind any name through a destructuring pattern
 /// (list/record pattern, or a non-plain-ident `for` target) rather than a
-/// plain identifier. Doesn't recurse into nested `fn` bodies — their own
+/// plain identifier. Doesn't recurse into nested `fn` bodies - their own
 /// destructuring is their own concern. Captured *destructured* names aren't
 /// supported yet (`Instr::Bind` always writes to a stack slot); a function
 /// that both owns a captured-frame and destructures anywhere falls back to
@@ -1640,15 +1640,15 @@ fn body_has_destructuring(params: &[Pat], body: &[Stmt]) -> bool {
 /// materialized ancestors it spans) and the by-name [`Instr::LoadParentByName`].
 enum OuterResolution {
     /// Found at a flat offset spanning every materialized ancestor nearer
-    /// than the one that owns it — matches `Instr::MakeClosure`'s runtime
+    /// than the one that owns it - matches `Instr::MakeClosure`'s runtime
     /// chain, which only ever links frames that actually own something, so
     /// walking it and subtracting slot counts lands in the same place.
     Flat(u32),
-    /// Not resolvable to a fixed slot at compile time — not in the
+    /// Not resolvable to a fixed slot at compile time - not in the
     /// ancestor list, either because it's genuinely free or because it
     /// lives in a walked ancestor beyond the compiled list (a `Schema`
     /// never represents one, so there's no way to tell which at compile
-    /// time). Resolve by name at runtime instead — `Frame::get_var`'s
+    /// time). Resolve by name at runtime instead - `Frame::get_var`'s
     /// recursive chain-walk finds it either way, or the true global scope.
     ByName,
 }
@@ -1695,37 +1695,37 @@ struct Compiler<'a> {
     slots: SlotTable,
     code: Vec<Instr>,
     loops: Vec<LoopCtx>,
-    /// Flat, nearest-first list of ancestor schemas visible from here —
+    /// Flat, nearest-first list of ancestor schemas visible from here -
     /// used to resolve this function's *own* outer names
     /// (`emit_load_name`). Empty when nested directly under AST-walked
     /// code (module/REPL root, an `AstFn`'s frame): anything not locally
     /// bound resolves by name at runtime instead.
     ancestors: Rc<[Rc<Schema>]>,
-    /// Whether there's a walked ancestor somewhere beyond `ancestors` —
+    /// Whether there's a walked ancestor somewhere beyond `ancestors` -
     /// decides `Instr::LoadParentByName` vs `Instr::LoadGlobal` when a free
     /// name isn't found in `ancestors`.
     walked_tail: bool,
-    /// This function's own schema — used to build the ancestor list when
+    /// This function's own schema - used to build the ancestor list when
     /// compiling a *nested* `fn` statement, so a grandchild resolves
     /// through this function's own captured slots (previously nested fns
     /// skipped straight to `parent`, missing this function's own scope
     /// entirely).
     own_schema: Rc<Schema>,
     /// Which of this function's own slots (by [`SlotId`]) are captured by
-    /// some nested `fn` — those live in a per-call [`CompiledFrame`]
+    /// some nested `fn` - those live in a per-call [`CompiledFrame`]
     /// instead of a stack slot.
     captured: Vec<bool>,
     /// Nested `fn`s defined directly in this function's body that don't
-    /// capture anything — becomes this `CompiledFn`'s own `consts`.
+    /// capture anything - becomes this `CompiledFn`'s own `consts`.
     /// `Instr::MakeClosure` operands referencing these are final as soon
     /// as they're emitted (they occupy the flat range `0..consts.len()`).
     nested_consts: Vec<Val>,
-    /// Nested `fn`s that DO capture something — becomes this `CompiledFn`'s
+    /// Nested `fn`s that DO capture something - becomes this `CompiledFn`'s
     /// own `templates`. These occupy the flat range starting at
     /// `nested_consts.len()`, which isn't final until compilation finishes
     /// (more consts can still be added afterward), so `Instr::MakeClosure`
     /// operands emitted for these start as a *local* templates-only index
-    /// and get `nested_consts.len()` added on once it's known — see
+    /// and get `nested_consts.len()` added on once it's known - see
     /// `template_refs`.
     nested_templates: Vec<Rc<FnTemplate>>,
     /// `c.code` indices of `Instr::MakeClosure` sites referencing
@@ -1871,7 +1871,7 @@ impl Compiler<'_> {
 
     /// Compile a block of statements. A block's value is its last
     /// statement's value; `tail` marks blocks whose value is the function
-    /// result — only their final statement leaves a value on the stack
+    /// result - only their final statement leaves a value on the stack
     /// (an empty tail block yields nil). Non-tail blocks have no net stack
     /// effect.
     fn compile_block(&mut self, stmts: &[Stmt], tail: bool) -> Result<(), CompileError> {
@@ -2074,7 +2074,7 @@ impl Compiler<'_> {
                 if in_for {
                     self.emit(Instr::IterPop);
                 }
-                // a broken loop skips its `else` block and yields nil —
+                // a broken loop skips its `else` block and yields nil -
                 // which only materializes if the loop's value is the
                 // function result
                 if loop_tail {
@@ -2094,9 +2094,9 @@ impl Compiler<'_> {
             }
             StmtKind::Fn { name, params, body } => {
                 // does the nested fn (or something nested *inside* it,
-                // transitively — `fn_outer_names` already recurses)
+                // transitively - `fn_outer_names` already recurses)
                 // actually read one of *this* function's own names? Owning
-                // a frame at all doesn't mean every nested fn needs it —
+                // a frame at all doesn't mean every nested fn needs it -
                 // only ones that reference it should pay for the hop, so
                 // this is decided per-child, not from `self.own_schema.owns_frame`
                 // (which only says *something* nested in this function
@@ -2105,7 +2105,7 @@ impl Compiler<'_> {
                 let needs_own_schema = free.iter().any(|n| self.slots.get(n).is_some());
                 // invariant: this function's own prepass (`mark_captured`)
                 // scans every direct nested fn's outer names the same way
-                // — if this specific child needs the schema, that pass
+                // - if this specific child needs the schema, that pass
                 // must already have flagged the function as owning a frame
                 debug_assert!(
                     !needs_own_schema || self.own_schema.owns_frame,
@@ -2136,7 +2136,7 @@ impl Compiler<'_> {
                 // itself? If not, it's fully self-contained and can
                 // compile to one shared constant, exactly as before.
                 // Otherwise (this also conservatively covers reading a
-                // genuine global — a `Schema` list can't tell "nothing
+                // genuine global - a `Schema` list can't tell "nothing
                 // out there" from "something in a walked ancestor" apart
                 // at compile time, see `resolve_outer_name`) each
                 // execution of this statement must produce its own
@@ -2155,7 +2155,7 @@ impl Compiler<'_> {
                         consts: compiled.consts,
                         templates: compiled.templates,
                     };
-                    // local (templates-only) index for now — shifted to
+                    // local (templates-only) index for now - shifted to
                     // the final flat index once `nested_consts` stops
                     // growing (see the patch pass at the end of compile_fn)
                     let local = self.nested_templates.len() as u32;
@@ -2332,8 +2332,8 @@ impl Compiler<'_> {
 }
 
 /// Execute a compiled function's code. Parameters are expected to already be
-/// bound in the current (local) scope — [`CompiledFn::into_function`] does
-/// that — so `run` itself is just the instruction loop.
+/// bound in the current (local) scope - [`CompiledFn::into_function`] does
+/// that - so `run` itself is just the instruction loop.
 ///
 /// The frame executes on the runtime's shared operand stack
 /// (`rt.stack`): it treats the stack height at entry as its floor and
@@ -2363,7 +2363,7 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     rt.stack().extend_uninit(f.frame_size as usize);
 
     // a fresh reified frame per call, for locals some nested `fn` captures
-    // — none of this function's calls share captured state with another
+    // - none of this function's calls share captured state with another
     let own = f.owns_frame.then(|| make_own_frame(f));
 
     let result = run_frame(rt, &f.code.bytes, base, f, own.as_ref());
@@ -2375,7 +2375,7 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
 /// field names were force-captured by [`compile_fn`]) and hand back its
 /// reified frame, if it has one, so the caller can read exported values out
 /// of it. The body's own tail value (ordinarily `Nil`, since a module's
-/// last statement is rarely meaningful on its own) is discarded — `export`
+/// last statement is rarely meaningful on its own) is discarded - `export`
 /// is structural, not part of the statement list `f` was compiled from.
 pub fn run_module(rt: &mut Runtime, f: &CompiledFn) -> Result<Option<Rc<CompiledFrame>>, RuntimeError> {
     debug_assert_eq!(f.arity(), 0);
@@ -2391,8 +2391,8 @@ pub fn run_module(rt: &mut Runtime, f: &CompiledFn) -> Result<Option<Rc<Compiled
 }
 
 /// Execute a compiled function's code. Parameters are expected to already be
-/// bound in the current (local) scope — [`CompiledFn::into_function`] does
-/// that — so `run` itself is just the instruction loop.
+/// bound in the current (local) scope - [`CompiledFn::into_function`] does
+/// that - so `run` itself is just the instruction loop.
 ///
 /// The frame executes on the runtime's shared operand stack
 /// (`rt.stack`): it treats the stack height at entry as its floor and
@@ -2526,10 +2526,10 @@ fn run_frame(
                     // attach this function's own captured-frame as the
                     // child's nearest used ancestor only if the child
                     // actually reads something from it (`needs_own_frame`,
-                    // decided per-child at compile time — owning a frame
+                    // decided per-child at compile time - owning a frame
                     // at all doesn't mean every nested fn needs it);
                     // otherwise skip straight past it to whatever this
-                    // function's own `outer` already is — resolved the
+                    // function's own `outer` already is - resolved the
                     // same way when this function was itself instantiated,
                     // so by induction it's already the nearest ancestor
                     // any of *this* function's compiled descendants could
@@ -2927,7 +2927,7 @@ mod tests {
     }
 
     // `Val`'s own `Display` can't resolve a custom atom's name (`Val` has
-    // no access to the `Context` that interned it) — resolve it here via
+    // no access to the `Context` that interned it) - resolve it here via
     // `rt.ctx.atom_name` instead of comparing against `atom#{id}`.
     fn atom_var(rt: &mut Runtime, frame: &Frame, name: &str) -> String {
         let v = frame.get_var(name, rt);
@@ -2964,7 +2964,7 @@ export { pi, sq, dist2, area }
             let module = rt.load_module("math", MATH_MODULE).unwrap();
             rt.set_var("math", module);
 
-            // field access, module-value capture, helper-fn capture — the
+            // field access, module-value capture, helper-fn capture - the
             // functions run *after* the load, so they must see the module
             // environment, not the globals
             for st in &ast_from_str(
@@ -3029,7 +3029,7 @@ r5 = sq pi
         assert_eq!(a.cmp(&b), Some(core::cmp::Ordering::Equal), "same cached module");
 
         // NOTE: this used to also assert that mutating a module's export
-        // (`math.pi = 4`) errors — module immutability enforcement is a
+        // (`math.pi = 4`) errors - module immutability enforcement is a
         // known regression from the `Val`/`RcRecord` redesign (no more
         // `Object::frozen`; see the note in `raft_runtime`'s own test
         // module), not yet reinstated.
@@ -3105,7 +3105,7 @@ export { x }
         // a module-captured function calling itself resolves the callee
         // via LoadParent every time, so the self-recursive fast path in
         // run_frame's CALL handling actually fires here (unlike a plain
-        // global-resolved recursive function) — regression test for a
+        // global-resolved recursive function) - regression test for a
         // stack-imbalance bug in that path (the peeked callee wasn't
         // popped before computing the recursive call's stack floor)
         let mut rt = module_runtime(true);
@@ -3131,7 +3131,7 @@ export { fib }
     fn module_static_call_resolution_respects_reassignment() {
         for compiled in [false, true] {
             let mut rt = module_runtime(compiled);
-            // `f` is reassigned after definition — calls must resolve
+            // `f` is reassigned after definition - calls must resolve
             // dynamically and see the *final* value; `g` is final and
             // resolves statically; recursion works through both
             let m = rt
@@ -3542,14 +3542,14 @@ export { f }
         );
         assert_eq!(int_var(&mut rt, &frame, "r1"), 12);
         assert_eq!(int_var(&mut rt, &frame, "r2"), 102);
-        // g1's captured frame is independent of g2's — reading it again is
+        // g1's captured frame is independent of g2's - reading it again is
         // unaffected by the second call of make_thing
         assert_eq!(int_var(&mut rt, &frame, "r1b"), 12);
     }
 
     #[test]
     fn closure_captures_through_non_capturing_middle_function() {
-        // `middle` doesn't itself reference `g` — only `inner` does — so
+        // `middle` doesn't itself reference `g` - only `inner` does - so
         // `middle` must own no captured frame of its own and pass outer's
         // live frame straight through
         let (mut rt, frame) = assert_modes_agree(
@@ -3561,11 +3561,11 @@ export { f }
 
     #[test]
     fn sibling_closure_unrelated_to_capture_still_works() {
-        // `outer` owns a frame because `user` captures `x` — `skip` is a
+        // `outer` owns a frame because `user` captures `x` - `skip` is a
         // sibling nested fn that reads nothing from `outer` at all, so it
         // must not get `outer`'s frame attached, yet still has to work
         // correctly (it's still a captures_outer fn, since global-vs-outer
-        // isn't distinguished at compile time — see `fn_outer_names`)
+        // isn't distinguished at compile time - see `fn_outer_names`)
         let (mut rt, frame) = assert_modes_agree(
             "fn outer g:\n    x = g + 1\n    fn user:\n        return x\n    fn skip n:\n        return n + 1\n    return [user, skip]\n\
              fns = outer 5\nu = fns[0]\ns = fns[1]\nr1 = (u)\nr2 = s 10\n",
@@ -3580,11 +3580,11 @@ export { f }
         // through level2). level2 owns a frame for `c`,`d` (level3 needs
         // both). Three siblings at the bottom, each with a different
         // capture shape:
-        //   level3         — reads a,b (level1) AND c,d (level2): a
+        //   level3         - reads a,b (level1) AND c,d (level2): a
         //                    two-hop chain, level2's frame -> level1's
-        //   level3_sibling — reads only c (level2's own): must NOT carry
+        //   level3_sibling - reads only c (level2's own): must NOT carry
         //                    level1's frame at all
-        //   level3_pure    — reads nothing: plain Const, no MakeClosure
+        //   level3_pure    - reads nothing: plain Const, no MakeClosure
         // Two separate calls of level1/level2 must produce fully
         // independent closures (no cross-talk), and re-reading the same
         // closure twice must be stable.
@@ -3602,7 +3602,7 @@ export { f }
         assert_eq!(int_var(&mut rt, &frame, "r1"), 62); // 10+11+5+16+20
         assert_eq!(int_var(&mut rt, &frame, "r1_sib"), 10); // c*2
         assert_eq!(int_var(&mut rt, &frame, "r1_pure"), 999);
-        // inner2: a=100, b=101, c=50, d=151 — must not see inner1's values
+        // inner2: a=100, b=101, c=50, d=151 - must not see inner1's values
         assert_eq!(int_var(&mut rt, &frame, "r2"), 602); // 100+101+50+151+200
         assert_eq!(int_var(&mut rt, &frame, "r2_sib"), 100); // c*2
         assert_eq!(int_var(&mut rt, &frame, "r2_pure"), 999);
@@ -3632,7 +3632,7 @@ export { f }
     fn nested_fn_sees_module_x_then_shadowing_fn_local_x() {
         // `inner` lexically reads `x` from `middle` (middle also assigns
         // `x`, so `x` resolves to middle's own captured slot, never
-        // module's, by static scoping) — but the FIRST call happens
+        // module's, by static scoping) - but the FIRST call happens
         // before middle's own assignment runs, so it must fall through
         // middle's still-Uninit captured slot to the module's live `x`.
         // The SECOND call, after middle assigns its own `x`, must see
@@ -3735,7 +3735,7 @@ export { middle }
 
     #[test]
     fn all_pattern_kinds_bind_identically_in_both_modes() {
-        // atom tags, literal matches, and nested destructuring — every
+        // atom tags, literal matches, and nested destructuring - every
         // CompiledPat variant, checked against the walker's bind_pattern
         let (mut rt, frame) = assert_modes_agree(
             "fn area { kind: Circle, radius }:\n    return radius * radius * 3\n\
@@ -3769,7 +3769,7 @@ export { middle }
         assert_eq!(format!("{}", frame.get_var("r8", &mut rt)), "44");
         assert_eq!(format!("{}", frame.get_var("r9", &mut rt)), "45");
 
-        // mismatches fail identically too — suffixes pin the type: an
+        // mismatches fail identically too - suffixes pin the type: an
         // unsuffixed `1` matches float 1.0, but `1i` matches integers only
         // and `1.0`/`3f` match floats only
         for src in [
@@ -3814,7 +3814,7 @@ export { middle }
             // 2^53+1 must not match the nearest representable float 2^53
             "fn big 9007199254740993:\n    return Big\nr = big 9007199254740992f\n",
             // a float outside i64 range matches no integer literal
-            // (2^63 vs i64::MAX — saturation must not fake equality)
+            // (2^63 vs i64::MAX - saturation must not fake equality)
             "fn m 9223372036854775807:\n    return M\nr = m 9223372036854775808f\n",
             // an out-of-range integer literal matches nothing at all
             "fn huge 99999999999999999999999:\n    return H\nr = huge 1\n",
@@ -3853,7 +3853,7 @@ export { middle }
         assert_eq!(format!("{}", frame.get_var("r", &mut rt)), "42");
 
         // `_` never binds, so *reading* it finds nothing (unless a global
-        // named `_` exists) — an unbound-identifier error in both modes
+        // named `_` exists) - an unbound-identifier error in both modes
         for src in ["fn bad _:\n    return _\nr = bad 1\n"] {
             assert!(run_mode(src, false).is_err(), "walker accepted: {src}");
             assert!(run_mode(src, true).is_err(), "vm accepted: {src}");
@@ -3862,7 +3862,7 @@ export { middle }
 
     #[test]
     fn locals_in_slots_fall_back_to_globals_before_first_assignment() {
-        // `count` is assigned in the body, so it is a local slot — but the
+        // `count` is assigned in the body, so it is a local slot - but the
         // read on the right-hand side happens before the store, and must
         // reach the *global* `count`; the global stays untouched after
         let (mut rt, frame) = assert_modes_agree(
@@ -3931,7 +3931,7 @@ export { middle }
         let mut rt = Runtime::new();
         rt.set_compile_fns(true);
 
-        // a host function that reports how deep the caller's frame is —
+        // a host function that reports how deep the caller's frame is -
         // reading the runtime's operand stack mid-call, as promised
         rt.register_function("depth", 0, Some(0), |rt, _args| {
             Val::from(ValEnum::Number(Number::Integer(rt.stack().len() as i64)))

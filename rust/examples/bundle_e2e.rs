@@ -4,8 +4,8 @@
 //! 1. `Runtime::build_bundle` transpiles a Raft module to a cdylib bundle
 //!    crate, builds it by invoking `cargo` (in the same profile this
 //!    example runs in), and
-//! 2. links the produced cdylib — version check, init against the live
-//!    runtime, module registration, library held by the runtime — then
+//! 2. links the produced cdylib - version check, init against the live
+//!    runtime, module registration, library held by the runtime - then
 //! 3. the host executes Raft AST that `import`s the bundle's module and
 //!    calls its functions.
 //!
@@ -70,7 +70,7 @@ fn register_host_fns(rt: &mut Runtime) {
         Val::nil()
     });
 
-    // import "name" resolves against the runtime's registered modules —
+    // import "name" resolves against the runtime's registered modules -
     // which is where linked bundles' modules land
     rt.register_function("import", 1, Some(1), |rt, _args| {
         let name_val = rt.stack().pop();

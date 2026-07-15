@@ -1,6 +1,6 @@
 //! Transpiled-bundle support (feature `bundle`): [`Runtime`] can generate
 //! a bundle crate from Raft sources (via `raft-rust`), build it by
-//! invoking `cargo`, and link the produced cdylib — registering its
+//! invoking `cargo`, and link the produced cdylib - registering its
 //! modules and holding the loaded library for the runtime's whole
 //! lifetime (values produced by a bundle carry vtable and code pointers
 //! into it, so it must never be unloaded while the runtime lives).
@@ -16,7 +16,7 @@ use crate::{Runtime, RuntimeError, Val, ValEnum, ffi};
 
 /// A recipe for [`Runtime::build_bundle`]: which Raft modules to
 /// transpile, and where/how to build the resulting crate. Every knob has
-/// a default — `BundleBuilder::new("my_bundle").module("math", SRC)` is a
+/// a default - `BundleBuilder::new("my_bundle").module("math", SRC)` is a
 /// complete spec.
 pub struct BundleBuilder {
     name: String,
@@ -101,7 +101,7 @@ impl Runtime {
                 .join(&bundle.name)
         });
 
-        // the checkout this runtime was compiled from — a sensible default
+        // the checkout this runtime was compiled from - a sensible default
         // for local development; embedders can override via `raft_repo`
         let raft_repo = bundle.raft_repo.clone().unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -158,7 +158,7 @@ impl Runtime {
     /// lifetime. Returns the registered module names.
     pub fn link_bundle(&mut self, path: impl AsRef<Path>) -> Result<Vec<String>, RuntimeError> {
         let path = path.as_ref();
-        // SAFETY: loading a library is inherently trusting its init code —
+        // SAFETY: loading a library is inherently trusting its init code -
         // the caller vouches for `path` being a raft bundle; everything
         // after holds it to the raft-ffi contract (version-checked below).
         let lib = unsafe { libloading::Library::new(path) }
@@ -208,7 +208,7 @@ impl Runtime {
                     .unwrap_or("<non-UTF-8 error>");
                 return Err(other(std::format_args!("bundle init failed: {msg}")));
             }
-            // SAFETY: init succeeded — ownership of the modules record
+            // SAFETY: init succeeded - ownership of the modules record
             // transfers to the host.
             unsafe { Val::from_ffi(bundle.modules) }
         };

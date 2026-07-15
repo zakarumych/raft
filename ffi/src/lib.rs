@@ -35,7 +35,7 @@ pub type VoidRcPtr = NonNull<RcInner<Void>>;
 
 /// A growable, reallocatable buffer: `len` live elements out of `capacity`
 /// allocated, behind a movable inner `ptr`. Whoever holds a `RawVec<T>` by
-/// value (embedded in a stable, non-moving header — [`RawHost`]'s stack,
+/// value (embedded in a stable, non-moving header - [`RawHost`]'s stack,
 /// or a list/record's own outer allocation) keeps a fixed address even as
 /// `ptr` gets reallocated underneath it: growing (`push`, stack growth,
 /// ...) may move the *elements*, never the header holding this struct.
@@ -176,7 +176,7 @@ pub struct RawVal {
 }
 
 impl RawVal {
-    /// The uninitialized value — what a host puts in a `RawVal`-typed slot
+    /// The uninitialized value - what a host puts in a `RawVal`-typed slot
     /// before the other side fills it in.
     pub const fn uninit() -> RawVal {
         RawVal {
@@ -197,7 +197,7 @@ impl RawVal {
 /// matches the version of the FFI crate in the host process.
 pub const FFI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
-/// Intern a name (`ptr`/`len` UTF-8 bytes) in the host, returning its id —
+/// Intern a name (`ptr`/`len` UTF-8 bytes) in the host, returning its id -
 /// a `StringId` for identifier names, an `AtomId` for atom names.
 pub type InternFn = unsafe extern "C" fn(*mut RawHost, *const u8, usize) -> usize;
 
@@ -219,12 +219,12 @@ pub type TakeErrorFn = unsafe extern "C" fn(*mut RawHost) -> RawVal;
 
 /// Everything a loaded bundle needs from its host: the raw host itself
 /// (stack + whatever concrete state sits behind it) plus the callbacks the
-/// bundle can't perform on its own — name interning, global-variable
+/// bundle can't perform on its own - name interning, global-variable
 /// access, and error signaling.
 ///
 /// # Pointer validity
 /// `raw` is only guaranteed valid for the duration of the init call it is
-/// passed to — the host is free to move afterwards. A bundle must not
+/// passed to - the host is free to move afterwards. A bundle must not
 /// retain it; every post-init callback invocation must use the live host
 /// pointer of the call it is servicing (the `*mut RawHost` its `CallFn`
 /// received). The *function pointers* are process-stable and may be kept.
@@ -245,7 +245,7 @@ pub struct RaftFFIHost {
 /// init function, which fills `modules` in.
 #[repr(C)]
 pub struct RaftFFIBundle {
-    /// A record value `{ module_name: exports_record, .. }` — one field
+    /// A record value `{ module_name: exports_record, .. }` - one field
     /// per compiled module, each holding that module's export record.
     /// Ownership transfers to the host once init returns success.
     pub modules: RawVal,

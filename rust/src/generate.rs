@@ -3,18 +3,18 @@
 //! [`BundleGenerator`] turns parsed [`raft_ast::Module`]s into a complete,
 //! standalone cdylib crate: one Rust module file per Raft module, a
 //! `lib.rs` carrying the bundle's exactly-sized name/atom tables, the
-//! generated `mod support` runtime (emitted verbatim from a template —
+//! generated `mod support` runtime (emitted verbatim from a template -
 //! the crate depends only on `raft-core`), and a `raft_bundle!` init
 //! function (see `raft-ffi`) that interns every name into the host and
 //! exposes the loaded modules as a record `RawVal`.
 //!
-//! Scoping is fully static — no runtime frame chains. Every name a
+//! Scoping is fully static - no runtime frame chains. Every name a
 //! function binds becomes either an ordinary Rust local (`let mut v_x =
 //! Val::new_uninit();`, hoisted to the function top) or, when some nested
 //! `fn` reads it, a field of a per-call `CaptureN` structure
 //! (`Rc<CaptureN>`, fields `RefCell<Val>`). Nested Raft `fn`s are Rust
 //! `move` closures capturing the `Rc<CaptureN>` handles of their enclosing
-//! functions — transpilation granularity is a whole module, so a
+//! functions - transpilation granularity is a whole module, so a
 //! transpiled function can never capture AST-walker or bytecode state.
 //! Reads follow the walker's shadow-with-fallback rule with a compile-time
 //! resolved cascade: own binding if initialized, else each enclosing
@@ -56,10 +56,10 @@ impl fmt::Display for GenError {
 impl std::error::Error for GenError {}
 
 /// Append-only string interner: assigns each distinct name a stable `u32`
-/// index — the bundle-local index generated code embeds, mapped to a host
+/// index - the bundle-local index generated code embeds, mapped to a host
 /// `StringId`/`AtomId` at bundle init. Only names that can actually reach
 /// the host (global-read fallbacks, atoms) get interned, so the generated
-/// tables — and the static id arrays sized after them — are exact.
+/// tables - and the static id arrays sized after them - are exact.
 #[derive(Default)]
 struct Interner {
     list: Vec<String>,
@@ -112,7 +112,7 @@ fn pat_binds(pat: &Pat, out: &mut BTreeSet<String>) {
 }
 
 /// Names assigned anywhere in `stmts` (branch bodies included, nested `fn`
-/// bodies excluded) — together with parameter binds, a scope's locals.
+/// bodies excluded) - together with parameter binds, a scope's locals.
 fn assigned_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     for stmt in stmts {
         match stmt.kind() {
@@ -276,7 +276,7 @@ fn stmt_reads(stmt: &Stmt, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Names read inside a `fn` that its parameters don't bind — i.e. must
+/// Names read inside a `fn` that its parameters don't bind - i.e. must
 /// resolve to an enclosing scope. Only params count as bound (walker
 /// parity): a body-assigned name may still read through to an enclosing
 /// scope on its first, pre-assignment access under the language's
@@ -295,7 +295,7 @@ fn fn_free_names(params: &[Pat], body: &[Stmt]) -> BTreeSet<String> {
 }
 
 /// The union of free names of every `fn` nested directly in `stmts`
-/// (recursing through control flow, not into `fn` bodies —
+/// (recursing through control flow, not into `fn` bodies -
 /// [`fn_free_names`] itself propagates deeper levels). Intersected with a
 /// scope's locals, this is its captured set.
 fn nested_fn_free_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
@@ -351,7 +351,7 @@ enum Storage {
 
 struct Scope {
     locals: HashMap<String, Storage>,
-    /// Names that are definitely initialized for the scope's whole body —
+    /// Names that are definitely initialized for the scope's whole body -
     /// parameter binds (a call binds every param before the body runs, or
     /// fails). Reads of these skip the uninit-fallback cascade.
     definite: BTreeSet<String>,
@@ -363,10 +363,10 @@ struct Scope {
 
 #[derive(Clone, Copy, PartialEq)]
 enum BodyKind {
-    /// A module's `load` body — `return`/`break`/`continue` at its top
+    /// A module's `load` body - `return`/`break`/`continue` at its top
     /// level are runtime errors, matching the walker.
     Module,
-    /// A `fn` body — `return` maps to a Rust `return Ok(..)`.
+    /// A `fn` body - `return` maps to a Rust `return Ok(..)`.
     Fn,
 }
 
@@ -463,7 +463,7 @@ impl BundleGenerator {
             cx.gen_stmt(&mut b, stmt)?;
         }
 
-        // export { .. } — read each exported binding out of the module
+        // export { .. } - read each exported binding out of the module
         // scope (falling back to host globals, like the walker).
         b.line("let _ = last;");
         b.line("let mut _exports: Vec<(RcStr, Val)> = Vec::new();");
@@ -650,8 +650,8 @@ raft-core = {{ path = {core:?} }}
         )
     }
 
-    /// Write the complete generated crate — `Cargo.toml`, `src/lib.rs`,
-    /// and one `src/<name>.rs` per module — under `dir`.
+    /// Write the complete generated crate - `Cargo.toml`, `src/lib.rs`,
+    /// and one `src/<name>.rs` per module - under `dir`.
     pub fn write_crate(
         &self,
         dir: &Path,
@@ -714,9 +714,9 @@ impl ModuleCx<'_> {
 
     /// Open a new scope binding `locals` (params plus body-assigned names,
     /// with `definite` the param-bound subset) for a body of `stmts`:
-    /// decides each local's storage — names some nested `fn` reads become
+    /// decides each local's storage - names some nested `fn` reads become
     /// fields of one fresh `CaptureN` structure shared by the whole scope,
-    /// everything else an ordinary Rust local — and emits the hoisted
+    /// everything else an ordinary Rust local - and emits the hoisted
     /// declarations (capture allocation first, then plain locals).
     fn open_scope(
         &mut self,
@@ -779,8 +779,8 @@ impl ModuleCx<'_> {
         });
     }
 
-    /// Emit the initialized-fallback cascade read of `name` — own binding,
-    /// then each enclosing binder's capture field, then the host global —
+    /// Emit the initialized-fallback cascade read of `name` - own binding,
+    /// then each enclosing binder's capture field, then the host global -
     /// erroring like the walker when unbound everywhere. A definitely-
     /// initialized binding (a parameter) terminates the cascade early: a
     /// read that ends on one needs neither the global fallback nor the
@@ -1066,7 +1066,7 @@ impl ModuleCx<'_> {
         let mut fb = Body::new(BodyKind::Fn, b.indent + 2);
         self.open_scope(&mut fb, &locals, param_binds, stmts);
 
-        // pop arguments — first argument on top of the stack
+        // pop arguments - first argument on top of the stack
         for param in params.iter() {
             let arg = fb.temp("host.stack().pop()");
             self.gen_bind(&mut fb, param, &arg)?;
@@ -1187,7 +1187,7 @@ impl ModuleCx<'_> {
     }
 
     /// Lower binding `val` (a temp holding an owned `Val`) against a
-    /// pattern — assignments, function parameters and `for` targets all
+    /// pattern - assignments, function parameters and `for` targets all
     /// come through here. Non-binding sub-patterns compare and `return
     /// Err` on mismatch, exactly like the walker's `bind_pattern`.
     fn gen_bind(&mut self, b: &mut Body, pat: &Pat, val: &str) -> Result<(), GenError> {
@@ -1303,7 +1303,7 @@ fn unique_var(name: &str, taken: &mut HashSet<String>) -> String {
     candidate
 }
 
-/// A number literal in expression position, honoring its suffix — the
+/// A number literal in expression position, honoring its suffix - the
 /// walker's `number_value`, evaluated at transpile time.
 fn number_expr(n: &LitNum) -> Result<String, GenError> {
     match n.suffix() {
@@ -1347,7 +1347,7 @@ fn literal_expr(lit: &Lit) -> Result<String, GenError> {
     }
 }
 
-/// A number literal in pattern position — the walker/VM's
+/// A number literal in pattern position - the walker/VM's
 /// `NumberPat::from_literal`, evaluated at transpile time.
 fn number_pat_expr(n: &LitNum) -> String {
     if n.has_dot() || n.has_exponent() || n.suffix() == Some("f") {
@@ -1474,7 +1474,7 @@ mod tests {
         let src = generator.add_module("plain", &module).unwrap().to_owned();
 
         // `area`'s params and local are ordinary Rust locals, and nothing
-        // in this module is read by a nested fn — no capture struct at all
+        // in this module is read by a nested fn - no capture struct at all
         assert!(src.contains("let mut v_w = Val::new_uninit();"));
         assert!(src.contains("let mut v_h = Val::new_uninit();"));
         assert!(src.contains("let mut v_size = Val::new_uninit();"));
@@ -1492,7 +1492,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        // make_counter's scope captures `count` (read by `step`) — all its
+        // make_counter's scope captures `count` (read by `step`) - all its
         // captured bindings live in the one Capture0 struct
         assert!(src.contains("pub(crate) struct Capture0 {"));
         assert!(src.contains("v_count: RefCell<Val>,"));

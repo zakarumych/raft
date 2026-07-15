@@ -1,9 +1,9 @@
 //! Refcounted box used throughout `raft-core`, in place of `alloc::rc::Rc`.
-//! Strong-count-only (no `Weak` — unused anywhere in this codebase), and
+//! Strong-count-only (no `Weak` - unused anywhere in this codebase), and
 //! built directly on [`ffi::RcBox`] (not a locally duplicated header type)
 //! so [`Rc::into_raw_box`]/[`Rc::from_raw_box`] are plain `NonNull::cast`s
 //! of the existing allocation into/out of an [`ffi::FFIRc`]'s `data` field
-//! — no new allocation, no offset math, no `c_void`.
+//! - no new allocation, no offset math, no `c_void`.
 
 use alloc::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc},
@@ -63,7 +63,7 @@ impl<T> Rc<T> {
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         if Rc::strong_count(&this) == 1 {
-            // SAFETY: unique owner — read the value out, then free the
+            // SAFETY: unique owner - read the value out, then free the
             // allocation without running `T`'s destructor a second time.
             let value = unsafe { core::ptr::read(&this.ptr.as_ref().value) };
 
@@ -90,7 +90,7 @@ impl<T> Rc<T> {
 
     /// Consume `this` without dropping, returning the whole allocation
     /// (header included) narrowed to a type-erased `NonNull<RcInner<()>>`
-    /// — the shape [`DynRc`]/opaque vtable-backed types store. No new
+    /// - the shape [`DynRc`]/opaque vtable-backed types store. No new
     /// allocation. Pair with [`from_raw_box`](Rc::from_raw_box).
     #[inline]
     pub fn into_raw_box(this: Self) -> NonNull<RcInner<()>> {
@@ -287,7 +287,7 @@ pub fn erase_fn<F: Callable>(rc: Rc<F>) -> DynRc<raft_ffi::FnVTable, Void> {
 }
 
 /// Minimal callable bound for building a per-concrete-type
-/// [`raft_ffi::FnVTable`] — deliberately smaller than `raft-core`'s own
+/// [`raft_ffi::FnVTable`] - deliberately smaller than `raft-core`'s own
 /// `Function` trait (no min/max-args or partial-application semantics
 /// here, just "invoke, given a host and an argument count, returning how
 /// many were actually consumed"). `Function` bridges into this.
@@ -295,7 +295,7 @@ pub fn erase_fn<F: Callable>(rc: Rc<F>) -> DynRc<raft_ffi::FnVTable, Void> {
 /// Receives the whole `RcInner<Self>` *box* pointer, not `&self`: the
 /// dispatch needs to touch the box's `strong` count (cloning the callee
 /// into a partial-application value), and a pointer derived from a `&Self`
-/// reference has provenance for the value field only — walking back to
+/// reference has provenance for the value field only - walking back to
 /// the header through it is undefined behavior that optimizers really do
 /// exploit (dropping the refcount bump entirely).
 pub trait Callable: 'static + Sized {
@@ -316,11 +316,11 @@ unsafe extern "C" fn call_shim<F: Callable>(
     // SAFETY: `data` points at the `value` field of a live `RcInner<F>`
     // and carries whole-box provenance (see `RcFn::call`/`Val::call_as_fn`,
     // which derive it via raw place projection, never through a
-    // reference) — stepping back to the box start stays in bounds.
+    // reference) - stepping back to the box start stays in bounds.
     let offset = core::mem::offset_of!(RcInner<F>, value);
     let box_ptr = unsafe { data.as_ptr().cast::<u8>().sub(offset) } as *mut RcInner<F>;
     // SAFETY: `host`, per `raft_ffi::CallFn`'s contract, is a valid,
-    // exclusively-held `RawHost` for the duration of this call — this is
+    // exclusively-held `RawHost` for the duration of this call - this is
     // the one place that raw pointer gets turned into a reference.
     let mut host = unsafe { Host::from_raw(host) };
     // SAFETY: derived from `data` per the contract above; non-null since
@@ -328,11 +328,11 @@ unsafe extern "C" fn call_shim<F: Callable>(
     unsafe { F::call_raw(NonNull::new_unchecked(box_ptr), args, &mut host) }
 }
 
-/// Safe view over a host's operand stack — the only thing
+/// Safe view over a host's operand stack - the only thing
 /// `Function`/`Callable` implementors ever need. Never exposes the raw
 /// `*mut ffi::RawHost` it was built from as part of its public API; every
 /// method here derives a reference from it internally and is safe to
-/// call. (`as_raw` is `pub(crate)`, not public — only [`crate::RcFn::call`]
+/// call. (`as_raw` is `pub(crate)`, not public - only [`crate::RcFn::call`]
 /// needs it, to cross back into the `extern "C"` `CallFn` ABI, which is
 /// the one place a raw pointer is unavoidable.)
 pub struct Host<'a> {
@@ -353,7 +353,7 @@ impl<'a> Host<'a> {
     /// concrete host implementation (`raft-runtime`'s `Runtime`, say,
     /// arranging its own layout so it *is* a `RawHost` at heart, and
     /// casting `&mut self` to build a `Host` in the first place) is the
-    /// only sound caller — it can cast this back to its own type. Ordinary
+    /// only sound caller - it can cast this back to its own type. Ordinary
     /// `Function` implementations never need this; `Host`'s other methods
     /// cover everything they should touch.
     #[inline]
@@ -417,7 +417,7 @@ impl<'a> ExactSizeIterator for DrainIter<'a> {
     }
 }
 
-/// A borrowing view over `Host`'s own operand stack — `Host` embeds
+/// A borrowing view over `Host`'s own operand stack - `Host` embeds
 /// a `ffi::RawStack` directly (see `Host`'s doc comment) rather than
 /// owning a `Vec<Val>` field, so this reconstructs a real `Vec<Val>` (via
 /// [`StackGuard`]) on each access rather than holding one permanently.
@@ -553,12 +553,12 @@ impl<'a> Stack<'a> {
         // (just asserted `self.raw.size >= n`).
         for (i, slot) in out.iter_mut().enumerate() {
             // SAFETY: reading the bits without touching the source's own
-            // refcount — the source slots are truncated away right after,
+            // refcount - the source slots are truncated away right after,
             // so ownership transfers to `out` exactly once.
             *slot = Val::from_raw(unsafe { core::ptr::read(self.raw.ptr.add(start + i)) });
         }
         // SAFETY: elements `[start, size)` were just moved out above via
-        // `ptr::read`, not dropped — shrinking past them without running
+        // `ptr::read`, not dropped - shrinking past them without running
         // their (nonexistent, since they're moved-from) destructors again
         // is exactly `raw_vec_truncate_no_drop`'s contract.
         unsafe { raw_vec_truncate_no_drop(&mut self.raw, start) };
@@ -583,7 +583,7 @@ impl<'a> Stack<'a> {
             stack_out_of_bounds();
         }
 
-        // SAFETY: `idx < self.raw.size` (just asserted) — live element.
+        // SAFETY: `idx < self.raw.size` (just asserted) - live element.
         unsafe { Val::from_raw_ref(&*self.raw.ptr.add(idx)) }
     }
 
@@ -594,7 +594,7 @@ impl<'a> Stack<'a> {
             stack_out_of_bounds();
         }
 
-        // SAFETY: `idx < self.raw.size` (just asserted) — live element.
+        // SAFETY: `idx < self.raw.size` (just asserted) - live element.
         unsafe {
             let raw = self.raw.ptr.add(idx);
             drop(Val::from_raw(core::ptr::read(raw)));
@@ -616,7 +616,7 @@ fn raw_val_uninit() -> raft_ffi::RawVal {
 }
 
 // ---------------------------------------------------------------------
-// Direct `RawVec<T>` growth/mutation primitives — no `Vec<T>`
+// Direct `RawVec<T>` growth/mutation primitives - no `Vec<T>`
 // reconstruction. Each op touches `header.ptr`/`size`/`capacity`
 // directly and leaves them self-consistent when it returns (no separate
 // "guard" object whose `Drop` writes them back later); growth mirrors
@@ -630,7 +630,7 @@ fn raw_val_uninit() -> raft_ffi::RawVal {
 ///
 /// # Safety
 /// `header.ptr`/`size`/`capacity` must be valid `alloc`/`realloc`
-/// raw parts for `T` (or all-zero, for a not-yet-allocated header) —
+/// raw parts for `T` (or all-zero, for a not-yet-allocated header) -
 /// i.e. whatever `RawVec<T>::default()`, or a prior call here, leaves
 /// behind. `T` must not be a zero-sized type.
 #[inline(always)]
@@ -654,8 +654,8 @@ pub unsafe fn raw_vec_reserve<T>(header: &mut RawVec<T>, additional: usize) {
         } else {
             let old_layout = Layout::array::<T>(header.capacity).expect("capacity overflow");
             // SAFETY: `header.ptr` was allocated with `old_layout` by a prior
-            // call here (`Vec`'s own growth policy — global allocator,
-            // `Layout::array::<T>` sizing — matches exactly, so a `header`
+            // call here (`Vec`'s own growth policy - global allocator,
+            // `Layout::array::<T>` sizing - matches exactly, so a `header`
             // seeded from a `Vec`'s raw parts is just as valid a starting
             // point).
             unsafe { realloc(header.ptr as *mut u8, old_layout, new_layout.size()) }
@@ -681,7 +681,7 @@ pub unsafe fn raw_vec_push<T>(header: &mut RawVec<T>, value: T) {
 
 /// # Safety
 /// `header.ptr`/`size` must describe live, initialized elements (as
-/// [`raw_vec_reserve`]'s contract, minus the allocator part — this
+/// [`raw_vec_reserve`]'s contract, minus the allocator part - this
 /// never grows).
 #[inline(always)]
 pub unsafe fn raw_vec_pop<T>(header: &mut RawVec<T>) -> Option<T> {
@@ -697,7 +697,7 @@ pub unsafe fn raw_vec_pop<T>(header: &mut RawVec<T>) -> Option<T> {
 
 /// # Safety
 /// `header.ptr`/`size` must describe live, initialized elements (as
-/// [`raw_vec_reserve`]'s contract, minus the allocator part — this
+/// [`raw_vec_reserve`]'s contract, minus the allocator part - this
 /// never grows).
 #[inline(always)]
 pub unsafe fn raw_vec_last<T>(header: &RawVec<T>) -> Option<&T> {
@@ -716,7 +716,7 @@ pub unsafe fn raw_vec_last<T>(header: &RawVec<T>) -> Option<&T> {
 #[inline(always)]
 pub unsafe fn raw_vec_remove<T>(header: &mut RawVec<T>, index: usize) -> T {
     debug_assert!(index < header.size);
-    // SAFETY: `index < header.size` (caller's contract) — live element.
+    // SAFETY: `index < header.size` (caller's contract) - live element.
     let removed = unsafe { header.ptr.add(index).read() };
     let tail = header.size - index - 1;
     if tail > 0 {
@@ -730,7 +730,7 @@ pub unsafe fn raw_vec_remove<T>(header: &mut RawVec<T>, index: usize) -> T {
 }
 
 /// Shrink `header.size` to `new_len` without dropping the elements past
-/// it — for callers that have already moved them out (e.g. read their
+/// it - for callers that have already moved them out (e.g. read their
 /// bits directly to transfer ownership elsewhere).
 ///
 /// # Safety
@@ -741,7 +741,7 @@ pub unsafe fn raw_vec_truncate_no_drop<T>(header: &mut RawVec<T>, new_len: usize
     header.size = new_len;
 }
 
-/// One shared, monomorphized `&'static FnVTable` per concrete `F` — same
+/// One shared, monomorphized `&'static FnVTable` per concrete `F` - same
 /// idea as [`any_vtable`], plus the `call` shim `Fn` values need.
 pub fn fn_vtable<F: Callable>() -> &'static raft_ffi::FnVTable {
     struct Holder<F>(PhantomData<F>);
@@ -771,7 +771,7 @@ pub unsafe extern "C" fn destroy_shim<T>(ptr: RcPtr<Void>) {
     }
 }
 
-/// One shared, monomorphized `&'static AnyVTable` per concrete `T` —
+/// One shared, monomorphized `&'static AnyVTable` per concrete `T` -
 /// built once (first use) per instantiation, reused by every `DynRc::erase`
 /// call for that `T`.
 pub fn any_vtable<T: 'static>() -> &'static raft_ffi::AnyVTable {
