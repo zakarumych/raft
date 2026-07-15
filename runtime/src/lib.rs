@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::{rc::Rc, vec::Vec};
+use raft_core::rc::Stack;
 
 use core::{cell::RefCell, cmp::Ordering, fmt, mem::ManuallyDrop};
 
@@ -518,90 +519,6 @@ impl SlotTable {
     }
 }
 
-/// A borrowing view over `Runtime`'s own operand stack — `Runtime` embeds
-/// a `ffi::RawStack` directly (see `Runtime`'s doc comment) rather than
-/// owning a `Vec<Val>` field, so this reconstructs a real `Vec<Val>` (via
-/// [`raft_core::rc::RawVecGuard`]) on each access rather than holding one
-/// permanently. `Runtime::stack()` is the only way to get one.
-pub struct Stack<'a> {
-    guard: raft_core::rc::RawVecGuard<'a, Val>,
-}
-
-impl<'a> Stack<'a> {
-    /// Reserve `n` not-yet-assigned locals on top of the stack.
-    #[inline]
-    pub fn extend_uninit(&mut self, n: usize) {
-        let len = self.guard.len();
-        self.guard
-            .resize_with(len + n, || Val::from(ValEnum::Uninit));
-    }
-
-    #[inline]
-    pub fn push(&mut self, v: Val) {
-        self.guard.push(v);
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.guard.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.guard.is_empty()
-    }
-
-    #[inline]
-    pub fn pop(&mut self) -> Val {
-        match self.guard.pop() {
-            Some(v) => v,
-            None => unreachable!("Attempted to pop from an empty VM stack"),
-        }
-    }
-
-    #[inline]
-    pub fn peek(&self) -> &Val {
-        match self.guard.last() {
-            Some(v) => v,
-            None => unreachable!("Attempted to peek from an empty VM stack"),
-        }
-    }
-
-    #[inline]
-    pub fn extend(&mut self, values: impl IntoIterator<Item = Val>) {
-        self.guard.extend(values);
-    }
-
-    #[inline]
-    pub fn reverse(&mut self, count: usize) {
-        let at = self.guard.len() - count;
-        self.guard[at..].reverse();
-    }
-
-    #[inline]
-    pub fn drain_top(&mut self, count: usize) -> impl DoubleEndedIterator<Item = Val> + '_ {
-        let at = self.guard.len() - count;
-        self.guard.drain(at..)
-    }
-
-    #[inline]
-    pub fn truncate(&mut self, len: usize) {
-        self.guard.truncate(len);
-    }
-
-    /// Read frame slot `slot` of the frame based at `base`.
-    #[inline]
-    pub fn get(&self, idx: usize) -> &Val {
-        &self.guard[idx]
-    }
-
-    /// Write frame slot `slot` of the frame based at `base`.
-    #[inline]
-    pub fn set(&mut self, idx: usize, v: Val) {
-        self.guard[idx] = v;
-    }
-}
-
 #[derive(Default)]
 pub struct Context {
     /// Interned strings used as identifiers in compiled functions.
@@ -873,13 +790,13 @@ impl Runtime {
         // A properly-aligned dangling pointer, matching `Vec::new()`'s own
         // convention — `Runtime::stack`/`Drop for Runtime` treat
         // `host.stack` as real `Vec<Val>` raw parts from here on.
-        let empty = ManuallyDrop::new(Vec::<Val>::new());
+        let empty = ManuallyDrop::new(Vec::<Val>::with_capacity(1024));
         Runtime {
             host: ffi::RawHost {
                 stack: ffi::RawStack {
                     ptr: empty.as_ptr() as *mut ffi::RawVal,
                     size: 0,
-                    capacity: 0,
+                    capacity: empty.capacity(),
                 },
             },
             ctx: Context::default(),
@@ -904,11 +821,7 @@ impl Runtime {
         // `#[repr(transparent)]` over `ffi::RawVal`, so reinterpreting
         // `&mut ffi::RawVec<RawVal>` (what `RawStack` is) as
         // `&mut ffi::RawVec<Val>` is layout-sound.
-        let stack: &mut ffi::RawVec<Val> =
-            unsafe { &mut *(&mut self.host.stack as *mut ffi::RawStack as *mut ffi::RawVec<Val>) };
-        Stack {
-            guard: unsafe { raft_core::rc::RawVecGuard::new(stack) },
-        }
+        unsafe { Stack::new(&mut self.host.stack) }
     }
 
     /// A safe `rc::Host` view of `self`, for dispatching a `Val::Fn` call
@@ -987,7 +900,7 @@ impl Runtime {
             ExprKind::Literal(lit) => literal_value(lit),
             ExprKind::Atom(a) => Ok(atom_val(self, a.name())),
             ExprKind::Ident(i) => {
-                let name = self.ctx.string(i.rc_str_name());
+                let name = self.ctx.string(i.name());
 
                 // Get the variable from the current frame first,
                 // then from the global scope if uninitialized.
@@ -1091,11 +1004,16 @@ impl Runtime {
         if args > 0 {
             self.apply_value_ast(fval, args)
         } else {
-            let callee = match callee(fval) {
-                Ok(callee) => callee,
-                Err(fval) => return Ok(fval),
-            };
-            callee.call(&mut self.as_host(), 0);
+            // `fval` is an owned local here (not borrowed from `self`), so
+            // dispatching straight off it — no intermediate `RcFn` clone —
+            // is sound even though `self.as_host()` needs `&mut self` too.
+            if fval.call_as_fn(&mut self.as_host(), 0).is_none() {
+                let callee = match callee(fval) {
+                    Ok(callee) => callee,
+                    Err(fval) => return Ok(fval),
+                };
+                callee.call(&mut self.as_host(), 0);
+            }
             self.status.clone()?;
             Ok(self.stack().pop())
         }
@@ -1108,22 +1026,31 @@ impl Runtime {
     fn apply_value(&mut self, mut args: usize) -> Result<(), RuntimeError> {
         while args > 0 {
             let fval = self.stack().pop();
-            let callee = match callee(fval) {
-                Ok(callee) => callee,
-                Err(fval) => {
-                    // don't strand the unconsumed arguments
-                    drop(self.stack().drain_top(args));
-                    return Err(RuntimeError::NotAFunction(
-                        format!("{fval:?} is not callable").into(),
-                    ));
-                }
+            // `fval` just moved out of the stack — independent of `self`
+            // now, so calling straight off it (no intermediate `RcFn`
+            // clone/drop) is sound. Falls back to `callee()` only for the
+            // rarer `Record.__call` protocol or the not-callable error.
+            let consumed = match fval.call_as_fn(&mut self.as_host(), args) {
+                Some(consumed) => consumed,
+                None => match callee(fval) {
+                    Ok(callee) => callee.call(&mut self.as_host(), args),
+                    Err(fval) => {
+                        // don't strand the unconsumed arguments
+                        let len = self.stack().len();
+                        self.stack().truncate(len - args);
+                        return Err(RuntimeError::NotAFunction(
+                            format!("{fval:?} is not callable").into(),
+                        ));
+                    }
+                },
             };
 
             // the callee establishes its own function-local scope (see
             // `Function::call`)
-            args -= callee.call(&mut self.as_host(), args);
+            args -= consumed;
             if self.status.is_err() {
-                drop(self.stack().drain_top(args));
+                let len = self.stack().len();
+                self.stack().truncate(len - args);
                 self.status.clone()?;
             }
         }
@@ -1137,20 +1064,27 @@ impl Runtime {
     /// arguments are re-applied to whatever it returned.
     fn apply_value_ast(&mut self, mut fval: Val, mut args: usize) -> Result<Val, RuntimeError> {
         while args > 0 {
-            let callee = match callee(fval) {
-                Ok(callee) => callee,
-                Err(fval) => {
-                    // don't strand the unconsumed arguments
-                    drop(self.stack().drain_top(args));
-                    return Err(RuntimeError::NotAFunction(
-                        format!("{fval:?} is not callable").into(),
-                    ));
-                }
+            // `fval` is an owned local (parameter or reassigned from a
+            // fresh `pop()` below), never borrowed from `self` at this
+            // point — dispatching straight off it skips the `RcFn`
+            // clone/drop `callee()` would otherwise pay.
+            let consumed = match fval.call_as_fn(&mut self.as_host(), args) {
+                Some(consumed) => consumed,
+                None => match callee(fval) {
+                    Ok(callee) => callee.call(&mut self.as_host(), args),
+                    Err(fval) => {
+                        // don't strand the unconsumed arguments
+                        drop(self.stack().drain_top(args));
+                        return Err(RuntimeError::NotAFunction(
+                            format!("{fval:?} is not callable").into(),
+                        ));
+                    }
+                },
             };
 
             // the callee establishes its own function-local scope (see
             // `Function::call`)
-            args -= callee.call(&mut self.as_host(), args);
+            args -= consumed;
             fval = self.stack().pop();
             if self.status.is_err() {
                 drop(self.stack().drain_top(args));
@@ -1262,7 +1196,7 @@ impl Runtime {
             StmtKind::Break => Ok(Exec::Break),
             StmtKind::Continue => Ok(Exec::Continue),
             StmtKind::Fn { name, params, body } => {
-                let name = self.ctx.string(name.rc_str_name());
+                let name = self.ctx.string(name.name());
                 frame.set_var(name, Val::nil());
 
                 let fval = if self.compile_fns {
@@ -1436,7 +1370,7 @@ impl Runtime {
         match pattern.kind() {
             PatKind::Ident(id) => {
                 if id.name() != "_" {
-                    let name = self.ctx.string(id.rc_str_name());
+                    let name = self.ctx.string(id.name());
                     frame.set_var(name, val.clone());
                 }
                 Ok(())
@@ -1489,7 +1423,7 @@ impl Runtime {
             PatKind::Record(fields) => match val.unpack() {
                 ValEnum::Record(record) => {
                     for f in fields.iter() {
-                        let key_id = self.ctx.string(f.key().rc_str_name());
+                        let key_id = self.ctx.string(f.key().name());
                         if let Some(v) = record.get_field(f.key().name()) {
                             match f.pattern() {
                                 None => {

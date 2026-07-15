@@ -404,7 +404,7 @@ impl Val {
     /// Move `self`'s raw bits out without running `Drop` — for handing
     /// ownership across a `RawVal`-returning boundary (the receiver
     /// becomes the new owner of whatever heap reference this held).
-    #[inline]
+    #[inline(always)]
     fn into_raw(self) -> ffi::RawVal {
         // SAFETY: copying the bits out is fine — `mem::forget` below means
         // `self`'s own `Drop` never runs, so this isn't a double-owned copy.
@@ -413,9 +413,15 @@ impl Val {
         raw
     }
 
-    #[inline]
+    #[inline(always)]
     fn from_raw(raw: ffi::RawVal) -> Val {
         Val { raw }
+    }
+
+    #[inline(always)]
+    fn from_raw_ref(raw: &ffi::RawVal) -> &Val {
+        // SAFETY: `Val` is `#[repr(transparent)]` over `RawVal`.
+        unsafe { &*(raw as *const ffi::RawVal as *const Val) }
     }
 
     /// Clone a `Val` out of a borrowed `RawVal` (e.g. one embedded in a
@@ -472,6 +478,122 @@ impl Val {
             },
         }
     }
+
+    /// Which variant this is, without touching a heap kind's refcount —
+    /// unlike [`unpack`](Val::unpack), which always builds an owned
+    /// [`ValEnum`] (a real `clone()` for heap kinds). Callers that only
+    /// need to branch on shape — not read or hold the payload — should
+    /// use this instead: `if val.kind() == ValKind::Fn { ... }` costs one
+    /// masked pointer read, no `Cell` bump, no matching drop.
+    #[inline(always)]
+    pub fn kind(&self) -> ValKind {
+        match self.tag_bits() {
+            ffi::MASK_TAG_UNINIT => ValKind::Uninit,
+            ffi::MASK_TAG_INT | ffi::MASK_TAG_FLOAT => ValKind::Number,
+            ffi::MASK_TAG_CHAR => ValKind::Char,
+            ffi::MASK_TAG_ATOM_NIL
+            | ffi::MASK_TAG_ATOM_TRUE
+            | ffi::MASK_TAG_ATOM_FALSE
+            | ffi::MASK_TAG_ATOM_ID => ValKind::Atom,
+            ffi::MASK_TAG_STRING => ValKind::String,
+            ffi::MASK_TAG_RECORD => ValKind::Record,
+            ffi::MASK_TAG_LIST => ValKind::List,
+            ffi::MASK_TAG_FN => ValKind::Fn,
+            ffi::MASK_TAG_OPAQUE => ValKind::Opaque,
+            _ => unsafe { core::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// Raft truthiness, without cloning a heap kind just to check it.
+    /// `0`/`0.0`/`False`/an empty list or record are falsey; everything
+    /// else (including `Nil` — matching this crate's existing `is_falsey`
+    /// free function) is truthy. List/Record only need their length,
+    /// read directly off the heap header — no [`clone_heap`](Val::clone_heap).
+    #[inline]
+    pub fn is_falsey(&self) -> bool {
+        match self.tag_bits() {
+            ffi::MASK_TAG_INT => unsafe { self.raw.data.int == 0 },
+            ffi::MASK_TAG_FLOAT => unsafe { self.raw.data.flt == 0.0 },
+            ffi::MASK_TAG_ATOM_FALSE => true,
+            ffi::MASK_TAG_RECORD => {
+                // SAFETY: tag confirmed `Record`; `heap_ptr` is a live
+                // `RcInner<UnsafeCell<RecordVal>>` for this exact tag.
+                let inner = unsafe { self.heap_ptr::<UnsafeCell<ffi::RecordVal>>().as_ref() };
+                unsafe { (*inner.value.get()).size == 0 }
+            }
+            ffi::MASK_TAG_LIST => {
+                // SAFETY: as the `Record` arm's, for `ListVal`.
+                let inner = unsafe { self.heap_ptr::<UnsafeCell<ffi::ListVal>>().as_ref() };
+                unsafe { (*inner.value.get()).size == 0 }
+            }
+            _ => false,
+        }
+    }
+
+    /// If this is a `Fn`, dispatch a call directly off `self`'s own
+    /// borrow — no [`clone_heap`](Val::clone_heap)/[`RcFn`] built and torn
+    /// down around it. Sound because the call is synchronous and `self`
+    /// (which already owns a live reference) outlives it; equivalent to,
+    /// but skips the refcount bump+drop pair that `unpack()` matching
+    /// `ValEnum::Fn` and calling through the resulting `RcFn` would pay.
+    #[inline]
+    pub fn call_as_fn(&self, host: &mut rc::Host, args: usize) -> Option<usize> {
+        if self.tag_bits() != ffi::MASK_TAG_FN {
+            return None;
+        }
+        let vtable = self.vtable_ref::<raft_ffi::FnVTable>();
+        // SAFETY: tag confirmed `Fn`; `heap_ptr` is a live `RcInner<Void>`
+        // box for this exact tag, matching `RcFn::call`'s own approach.
+        let inner = unsafe { self.heap_ptr::<Void>().as_ref() };
+        let data =
+            unsafe { raft_ffi::VoidPtr::new_unchecked(&inner.value as *const Void as *mut Void) };
+        // SAFETY: crossing into the `extern "C"` `CallFn` ABI, same as
+        // `RcFn::call` — `host.as_raw()` is the exact valid, exclusively
+        // borrowed `RawHost` `host` wraps.
+        Some(unsafe { (vtable.call)(data, args, host.as_raw()) })
+    }
+
+    pub fn new_uninit() -> Val {
+        Val::from_tag_only(ffi::MASK_TAG_UNINIT)
+    }
+
+    pub fn new_int(i: i64) -> Val {
+        Val::from_data_only(ffi::MASK_TAG_INT, ffi::RawData { int: i })
+    }
+
+    pub fn new_float(f: f64) -> Val {
+        Val::from_data_only(ffi::MASK_TAG_FLOAT, ffi::RawData { flt: f })
+    }
+
+    pub fn new_char(c: char) -> Val {
+        Val::from_data_only(ffi::MASK_TAG_CHAR, ffi::RawData { int: c as i64 })
+    }
+
+    pub fn new_nil() -> Val {
+        Val::from_tag_only(ffi::MASK_TAG_ATOM_NIL)
+    }
+
+    pub fn new_false() -> Val {
+        Val::from_tag_only(ffi::MASK_TAG_ATOM_FALSE)
+    }
+
+    pub fn new_true() -> Val {
+        Val::from_tag_only(ffi::MASK_TAG_ATOM_TRUE)
+    }
+}
+
+/// Cheap, clone-free discriminant for [`Val::kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValKind {
+    Uninit,
+    Number,
+    Char,
+    Atom,
+    String,
+    List,
+    Record,
+    Fn,
+    Opaque,
 }
 
 impl From<ValEnum> for Val {
@@ -504,9 +626,39 @@ impl From<ValEnum> for Val {
 }
 
 impl Clone for Val {
+    /// Bumps a heap kind's refcount directly and bit-copies the raw
+    /// tag/data — *not* `Val::from(self.unpack())`. That round trip would
+    /// build a full `ValEnum` (a `RcStr`/`RcList`/.../`RcFn` wrapper) and
+    /// then immediately re-pack it (`pack_heap`: re-fetch the vtable,
+    /// re-derive the tagged pointer via `map_addr`, `NonNull` construction)
+    /// — all to end up with the exact same bits this already has, since a
+    /// clone never changes which allocation a `Val` points at. `unpack()`
+    /// is for callers that actually want the ergonomic, kind-matched view;
+    /// a clone doesn't.
     #[inline(always)]
     fn clone(&self) -> Val {
-        Val::from(self.unpack())
+        match self.tag_bits() {
+            ffi::MASK_TAG_STRING
+            | ffi::MASK_TAG_RECORD
+            | ffi::MASK_TAG_LIST
+            | ffi::MASK_TAG_FN
+            | ffi::MASK_TAG_OPAQUE => {
+                // SAFETY: heap tag confirmed; `RcInner<T>::strong` is
+                // `#[repr(C)]`'s first field regardless of `T` — the same
+                // invariant `rc::erase`/`rc::erase_fn` already rely on when
+                // they cast `RcPtr<T>` down to `RcPtr<Void>` and read
+                // `.strong` through it. Bumping it here in place is exactly
+                // what `DynRc::clone` does, minus building the `DynRc` at all.
+                let inner = unsafe { self.heap_ptr::<Void>().as_ref() };
+                inner.strong.set(inner.strong.get() + 1);
+            }
+            _ => {}
+        }
+        // SAFETY: bitwise-copying the tag/data union never touches a
+        // refcount by itself — for heap kinds, the bump above already made
+        // this an independent, correctly-counted owning reference; for
+        // scalars there was never a count to touch.
+        Val { raw: unsafe { core::ptr::read(&self.raw) } }
     }
 }
 
@@ -938,14 +1090,7 @@ impl Val {
 }
 
 pub fn is_falsey(v: &Val) -> bool {
-    match v.unpack() {
-        ValEnum::Number(Number::Integer(0)) => true,
-        ValEnum::Number(Number::Float(f)) if f == 0.0 => true,
-        ValEnum::Atom(a) => a.is_false(),
-        ValEnum::List(l) => l.len() == 0,
-        ValEnum::Record(r) => r.len() == 0,
-        _ => false,
-    }
+    v.is_falsey()
 }
 
 // ---------------------------------------------------------------------
@@ -1173,20 +1318,14 @@ unsafe extern "C" fn list_swap_shim(
 
 unsafe extern "C" fn list_push_shim(data: raft_ffi::VoidPtr, val: ffi::RawVal) {
     let header: &mut ffi::ListVal = unsafe { &mut *(data.as_ptr() as *mut ffi::ListVal) };
-    // SAFETY: `header` describes a valid `Vec<RawVal>`-shaped allocation.
-    // `RawVecGuard` grows it exactly like any other `Vec::push` (and, if
-    // growth ever panics, still leaves `header` correctly synced).
-    let mut guard = unsafe { rc::RawVecGuard::<ffi::RawVal>::new(header) };
-    guard.push(val);
+    // SAFETY: `header` describes valid `RawVec<RawVal>` raw parts.
+    unsafe { rc::raw_vec_push(header, val) };
 }
 
 unsafe extern "C" fn list_pop_shim(data: raft_ffi::VoidPtr) -> ffi::RawVal {
     let header: &mut ffi::ListVal = unsafe { &mut *(data.as_ptr() as *mut ffi::ListVal) };
     // SAFETY: as `list_push_shim`.
-    let mut guard = unsafe { rc::RawVecGuard::<ffi::RawVal>::new(header) };
-    guard
-        .pop()
-        .unwrap_or_else(|| Val::from(ValEnum::Uninit).into_raw())
+    unsafe { rc::raw_vec_pop(header) }.unwrap_or_else(|| Val::from(ValEnum::Uninit).into_raw())
 }
 
 unsafe extern "C" fn list_elements_shim(data: raft_ffi::VoidPtr) -> *const ffi::RawVal {
@@ -1431,7 +1570,7 @@ unsafe extern "C" fn record_set_by_name_shim(
     let key: &str = unsafe { key_view(name_ptr, name_len) };
     {
         // Scoped so this slice's borrow of `header` ends before the
-        // (mutually-exclusive) `RawVecGuard` borrow below, in the
+        // (mutually-exclusive) `raw_vec_push` borrow below, in the
         // not-found case.
         let slice: &mut [ffi::RawFieldVal] =
             unsafe { core::slice::from_raw_parts_mut(header.ptr, header.size) };
@@ -1440,13 +1579,16 @@ unsafe extern "C" fn record_set_by_name_shim(
             return;
         }
     }
-    // SAFETY: `header` describes a valid `Vec<RawFieldVal>`-shaped
-    // allocation.
-    let mut guard = unsafe { rc::RawVecGuard::<ffi::RawFieldVal>::new(header) };
-    guard.push(ffi::RawFieldVal {
-        name: alloc_key_bytes(key),
-        val,
-    });
+    // SAFETY: `header` describes valid `RawVec<RawFieldVal>` raw parts.
+    unsafe {
+        rc::raw_vec_push(
+            header,
+            ffi::RawFieldVal {
+                name: alloc_key_bytes(key),
+                val,
+            },
+        )
+    };
 }
 
 unsafe extern "C" fn record_set_shim(data: raft_ffi::VoidPtr, index: usize, val: ffi::RawVal) {
@@ -1492,12 +1634,9 @@ fn record_rem_at(header: &mut ffi::RecordVal, index: usize) {
     if index >= header.size {
         return;
     }
-    // SAFETY: `header` describes a valid `Vec<RawFieldVal>`-shaped
-    // allocation; `RawVecGuard` keeps it in sync even if `remove`'s
-    // internal shift somehow panicked partway (it can't in practice —
-    // `remove` never allocates — but this costs nothing to make robust).
-    let mut guard = unsafe { rc::RawVecGuard::<ffi::RawFieldVal>::new(header) };
-    let removed = guard.remove(index);
+    // SAFETY: `header` describes valid `RawVec<RawFieldVal>` raw parts;
+    // `index < header.size` (checked above).
+    let removed = unsafe { rc::raw_vec_remove(header, index) };
     unsafe { free_key_bytes(removed.name) };
     drop(Val::from_raw(removed.val));
 }
@@ -1705,19 +1844,19 @@ fn call_dispatch<F: Function>(rc: &Rc<F>, host: &mut rc::Host, args: usize) -> u
     let min_args = rc.min_args();
     if args < min_args {
         if args == 0 {
-            host.push(Val::from(ValEnum::Fn(RcFn::from_rc(rc.clone()))));
+            host.stack().push(Val::from(ValEnum::Fn(RcFn::from_rc(rc.clone()))));
             return 0;
         }
         let mut preapplied: SmallVec<[Val; 4]> =
             smallvec::smallvec![Val::from(ValEnum::Uninit); args];
-        host.drain_top_into(&mut preapplied);
+        host.stack().drain_top_into(&mut preapplied);
         let partial = Rc::new(PartialFn {
             fun: RcFn::from_rc(rc.clone()),
             min_args: min_args - args,
             max_args: rc.max_args().map(|max| max - args),
             preapplied,
         });
-        host.push(Val::from(ValEnum::Fn(RcFn::from_rc(partial))));
+        host.stack().push(Val::from(ValEnum::Fn(RcFn::from_rc(partial))));
         return args;
     }
 
@@ -1774,7 +1913,7 @@ where
     fn call(&self, host: &mut rc::Host, args: usize) {
         debug_assert!(args >= self.min_args);
         let ret = (self.fun)(host, args);
-        host.push(ret);
+        host.stack().push(ret);
     }
 
     #[inline]
@@ -1814,8 +1953,9 @@ impl Function for PartialFn {
     }
 
     fn call(&self, host: &mut rc::Host, args: usize) {
-        host.extend(&self.preapplied);
-        self.fun.call(host, self.preapplied.len() + args);
+        let len = self.preapplied.len();
+        host.stack().extend_from_slice(&self.preapplied);
+        self.fun.call(host, len + args);
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

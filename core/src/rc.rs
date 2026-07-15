@@ -6,17 +6,10 @@
 //! — no new allocation, no offset math, no `c_void`.
 
 use alloc::{
-    alloc::{Layout, dealloc},
+    alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc},
     boxed::Box,
-    vec::Vec,
 };
-use core::{
-    cell::Cell,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-    ops::{Deref, DerefMut},
-    ptr::NonNull,
-};
+use core::{cell::Cell, marker::PhantomData, ops::Deref, ptr::NonNull};
 
 use raft_ffi::{RawVal, RawVec, RcInner, RcPtr, Void};
 
@@ -324,8 +317,7 @@ unsafe extern "C" fn call_shim<F: Callable>(
 /// needs it, to cross back into the `extern "C"` `CallFn` ABI, which is
 /// the one place a raw pointer is unavoidable.)
 pub struct Host<'a> {
-    raw: *mut raft_ffi::RawHost,
-    _marker: PhantomData<&'a mut raft_ffi::RawHost>,
+    raw: &'a mut raft_ffi::RawHost,
 }
 
 impl<'a> Host<'a> {
@@ -334,8 +326,7 @@ impl<'a> Host<'a> {
     #[inline]
     pub unsafe fn from_raw(raw: *mut raft_ffi::RawHost) -> Self {
         Host {
-            raw,
-            _marker: PhantomData,
+            raw: unsafe { &mut *raw },
         }
     }
 
@@ -352,61 +343,249 @@ impl<'a> Host<'a> {
     }
 
     #[inline]
-    fn stack(&mut self) -> &mut raft_ffi::RawStack {
+    pub fn stack(&mut self) -> Stack<'_> {
         // SAFETY: struct invariant (`from_raw`'s contract).
-        unsafe { &mut (*self.raw).stack }
+        Stack {
+            raw: &mut self.raw.stack,
+        }
+    }
+}
+
+pub struct DrainIter<'a> {
+    raw: &'a mut RawVec<RawVal>,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Drop for DrainIter<'a> {
+    fn drop(&mut self) {
+        for i in self.start..self.end {
+            let raw = unsafe { self.raw.ptr.add(i) };
+            unsafe { drop(Val::from_raw(core::ptr::read(raw))) };
+        }
+    }
+}
+
+impl<'a> Iterator for DrainIter<'a> {
+    type Item = Val;
+
+    fn next(&mut self) -> Option<Val> {
+        if self.start < self.end {
+            let raw = unsafe { self.raw.ptr.add(self.start) };
+            self.start += 1;
+            Some(Val::from_raw(unsafe { core::ptr::read(raw) }))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for DrainIter<'a> {
+    fn next_back(&mut self) -> Option<Val> {
+        if self.start < self.end {
+            self.end -= 1;
+            let raw = unsafe { self.raw.ptr.add(self.end) };
+            Some(Val::from_raw(unsafe { core::ptr::read(raw) }))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> ExactSizeIterator for DrainIter<'a> {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+/// A borrowing view over `Host`'s own operand stack — `Host` embeds
+/// a `ffi::RawStack` directly (see `Host`'s doc comment) rather than
+/// owning a `Vec<Val>` field, so this reconstructs a real `Vec<Val>` (via
+/// [`StackGuard`]) on each access rather than holding one permanently.
+/// `Host::stack()` is the only way to get one.
+pub struct Stack<'a> {
+    raw: &'a mut raft_ffi::RawVec<RawVal>,
+}
+
+#[cold]
+#[inline(never)]
+fn stack_out_of_bounds() -> ! {
+    panic!("Attempted to access a stack element beyond the current stack size");
+}
+
+impl<'a> Stack<'a> {
+    #[doc(hidden)]
+    pub unsafe fn new(raw: &'a mut raft_ffi::RawVec<RawVal>) -> Self {
+        Stack { raw }
     }
 
-    pub fn push(&mut self, v: Val) {
-        // SAFETY: a host's stack is always a valid `Vec<RawVal>`-shaped
-        // allocation.
-        let mut guard = unsafe { RawVecGuard::<RawVal>::new(self.stack()) };
-        guard.push(Val::into_raw(v));
-    }
-
-    pub fn pop(&mut self) -> Val {
-        // SAFETY: as above.
-        let mut guard = unsafe { RawVecGuard::<RawVal>::new(self.stack()) };
-        match guard.pop() {
-            Some(raw) => Val::from_raw(raw),
-            None => {
-                debug_assert!(false, "host stack underflow");
-                Val::from_raw(raw_val_nothing())
+    /// Reserve `n` not-yet-assigned locals on top of the stack.
+    #[inline(always)]
+    pub fn extend_uninit(&mut self, n: usize) {
+        unsafe {
+            raw_vec_reserve(self.raw, n);
+            for _ in 0..n {
+                raw_vec_push(self.raw, raw_val_uninit());
             }
         }
     }
 
-    /// Remove the top `out.len()` values into `out`, oldest-of-the-drained-
-    /// range first.
-    pub fn drain_top_into(&mut self, out: &mut [Val]) {
-        // SAFETY: as above.
-        let mut guard = unsafe { RawVecGuard::<RawVal>::new(self.stack()) };
-        let n = out.len();
-        debug_assert!(guard.len() >= n);
-        let start = guard.len() - n;
-        for (slot, raw) in out.iter_mut().zip(guard[start..].iter()) {
-            // SAFETY: reading the bits without touching the source's own
-            // refcount — the source slots are truncated away right after,
-            // so ownership transfers to `out` exactly once.
-            *slot = Val::from_raw(unsafe { core::ptr::read(raw) });
+    #[inline(always)]
+    pub fn push(&mut self, v: Val) {
+        unsafe {
+            raw_vec_push(self.raw, v.into_raw());
         }
-        guard.truncate(start);
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.raw.size
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.raw.size == 0
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> Val {
+        match unsafe { raw_vec_pop(self.raw) } {
+            None => stack_out_of_bounds(),
+            Some(raw) => Val::from_raw(raw),
+        }
+    }
+
+    #[inline(always)]
+    pub fn peek(&self) -> &Val {
+        match unsafe { raw_vec_last(self.raw) } {
+            None => stack_out_of_bounds(),
+            Some(raw) => Val::from_raw_ref(raw),
+        }
+    }
+
+    #[inline(always)]
+    pub fn extend(&mut self, values: impl IntoIterator<Item = Val>) {
+        let iter = values.into_iter();
+
+        let reserve = match iter.size_hint() {
+            (lower, Some(upper)) if (upper / 2) < lower => upper,
+            (lower, _) => lower,
+        };
+
+        unsafe { raw_vec_reserve(self.raw, reserve) };
+        for v in iter {
+            unsafe { raw_vec_push(self.raw, v.into_raw()) };
+        }
     }
 
     /// Push a batch of values in order (the first ends up deepest),
     /// cloning each one out of `values`.
-    pub fn extend(&mut self, values: &[Val]) {
-        // SAFETY: as above.
-        let mut guard = unsafe { RawVecGuard::<RawVal>::new(self.stack()) };
-        guard.reserve(values.len());
+    pub fn extend_from_slice(&mut self, values: &[Val]) {
+        unsafe { raw_vec_reserve(self.raw, values.len()) };
         for v in values {
-            guard.push(Val::into_raw(v.clone()));
+            unsafe { raw_vec_push(self.raw, v.clone().into_raw()) };
+        }
+    }
+
+    #[inline(always)]
+    pub fn reverse(&mut self, count: usize) {
+        if count < 2 {
+            return;
+        }
+
+        if self.raw.size < count {
+            stack_out_of_bounds();
+        }
+
+        let start = self.raw.size - count;
+
+        for i in 0..(count / 2) {
+            let j = count - 1 - i;
+            // SAFETY: `i`/`j` are both < `count`, which is <= `self.raw.size`
+            // (caller's contract).
+            unsafe {
+                let pi = self.raw.ptr.add(start + i);
+                let pj = self.raw.ptr.add(start + j);
+                core::ptr::swap(pi, pj);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn drain_top(&mut self, count: usize) -> DrainIter<'_> {
+        if self.raw.size < count {
+            stack_out_of_bounds();
+        }
+
+        self.raw.size -= count;
+
+        DrainIter {
+            start: self.raw.size,
+            end: self.raw.size + count,
+            raw: self.raw,
+        }
+    }
+
+    pub fn drain_top_into(&mut self, out: &mut [Val]) {
+        let n = out.len();
+        debug_assert!(self.raw.size >= n);
+        let start = self.raw.size - n;
+        // SAFETY: `[start, start+n)` are `n` live, initialized elements
+        // (just asserted `self.raw.size >= n`).
+        for (i, slot) in out.iter_mut().enumerate() {
+            // SAFETY: reading the bits without touching the source's own
+            // refcount — the source slots are truncated away right after,
+            // so ownership transfers to `out` exactly once.
+            *slot = Val::from_raw(unsafe { core::ptr::read(self.raw.ptr.add(start + i)) });
+        }
+        // SAFETY: elements `[start, size)` were just moved out above via
+        // `ptr::read`, not dropped — shrinking past them without running
+        // their (nonexistent, since they're moved-from) destructors again
+        // is exactly `raw_vec_truncate_no_drop`'s contract.
+        unsafe { raw_vec_truncate_no_drop(&mut self.raw, start) };
+    }
+
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        unsafe {
+            for i in len..self.raw.size {
+                let raw = self.raw.ptr.add(i);
+                drop(Val::from_raw(core::ptr::read(raw)));
+            }
+
+            raw_vec_truncate_no_drop(&mut self.raw, len);
+        }
+    }
+
+    /// Read frame slot `slot` of the frame based at `base`.
+    #[inline]
+    pub fn get(&self, idx: usize) -> &Val {
+        if self.raw.size <= idx {
+            stack_out_of_bounds();
+        }
+
+        // SAFETY: `idx < self.raw.size` (just asserted) — live element.
+        unsafe { Val::from_raw_ref(&*self.raw.ptr.add(idx)) }
+    }
+
+    /// Write frame slot `slot` of the frame based at `base`.
+    #[inline]
+    pub fn set(&mut self, idx: usize, v: Val) {
+        if self.raw.size <= idx {
+            stack_out_of_bounds();
+        }
+
+        // SAFETY: `idx < self.raw.size` (just asserted) — live element.
+        unsafe {
+            let raw = self.raw.ptr.add(idx);
+            drop(Val::from_raw(core::ptr::read(raw)));
+            raw.write(v.into_raw());
         }
     }
 }
 
 #[inline]
-fn raw_val_nothing() -> raft_ffi::RawVal {
+fn raw_val_uninit() -> raft_ffi::RawVal {
     // SAFETY: `MASK_TAG_UNINIT` is a nonzero constant, never dereferenced
     // as a real pointer.
     raft_ffi::RawVal {
@@ -417,56 +596,130 @@ fn raw_val_nothing() -> raft_ffi::RawVal {
     }
 }
 
-/// RAII guard: reconstructs a `Vec<T>` from a [`raft_ffi::RawVec<T>`]-
-/// shaped header's raw parts for the duration of some (possibly growing,
-/// possibly panicking) operation, and writes the resulting ptr/size/
-/// capacity back to the header on drop — including mid-panic-unwind — so
-/// a growth failure can never leave the header describing memory a
-/// temporarily-reconstructed `Vec` already freed out from under it. The
-/// `Vec` itself is never actually dropped (its buffer is handed back to
-/// `header`, not deallocated here).
-pub struct RawVecGuard<'a, T> {
-    header: &'a mut RawVec<T>,
-    vec: ManuallyDrop<Vec<T>>,
-}
+// ---------------------------------------------------------------------
+// Direct `RawVec<T>` growth/mutation primitives — no `Vec<T>`
+// reconstruction. Each op touches `header.ptr`/`size`/`capacity`
+// directly and leaves them self-consistent when it returns (no separate
+// "guard" object whose `Drop` writes them back later); growth mirrors
+// `Vec`'s doubling policy so the allocations stay `realloc`-compatible
+// with each other call over call.
+// ---------------------------------------------------------------------
 
-impl<'a, T> RawVecGuard<'a, T> {
-    /// # Safety
-    /// `header.ptr`/`size`/`capacity` must be valid `Vec::<T>::from_raw_parts`
-    /// arguments.
-    #[inline]
-    pub unsafe fn new(header: &'a mut RawVec<T>) -> Self {
-        // SAFETY: caller's contract above.
-        let vec = unsafe { Vec::from_raw_parts(header.ptr, header.size, header.capacity) };
-        RawVecGuard {
-            header,
-            vec: ManuallyDrop::new(vec),
+/// Ensure `header` has room for `additional` more elements beyond its
+/// current `size`, growing (`Vec`-style doubling) and reallocating in
+/// place if not.
+///
+/// # Safety
+/// `header.ptr`/`size`/`capacity` must be valid `alloc`/`realloc`
+/// raw parts for `T` (or all-zero, for a not-yet-allocated header) —
+/// i.e. whatever `RawVec<T>::default()`, or a prior call here, leaves
+/// behind. `T` must not be a zero-sized type.
+#[inline(always)]
+pub unsafe fn raw_vec_reserve<T>(header: &mut RawVec<T>, additional: usize) {
+    let required = header.size + additional;
+    if required <= header.capacity {
+        return;
+    }
+
+    raw_vec_reserve_slow(header, required);
+
+    #[cold]
+    #[inline(never)]
+    fn raw_vec_reserve_slow<T>(header: &mut RawVec<T>, required: usize) {
+        let new_cap = required.max(header.capacity.saturating_mul(2)).max(16);
+        let new_layout = Layout::array::<T>(new_cap).expect("capacity overflow");
+        let new_ptr = if header.capacity == 0 {
+            // SAFETY: `new_layout` is non-zero-sized (`new_cap >= 16`, `T` is
+            // never a ZST per this function's contract).
+            unsafe { alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<T>(header.capacity).expect("capacity overflow");
+            // SAFETY: `header.ptr` was allocated with `old_layout` by a prior
+            // call here (`Vec`'s own growth policy — global allocator,
+            // `Layout::array::<T>` sizing — matches exactly, so a `header`
+            // seeded from a `Vec`'s raw parts is just as valid a starting
+            // point).
+            unsafe { realloc(header.ptr as *mut u8, old_layout, new_layout.size()) }
+        };
+        if new_ptr.is_null() {
+            handle_alloc_error(new_layout);
         }
+        header.ptr = new_ptr as *mut T;
+        header.capacity = new_cap;
     }
 }
 
-impl<'a, T> Deref for RawVecGuard<'a, T> {
-    type Target = Vec<T>;
-
-    #[inline]
-    fn deref(&self) -> &Vec<T> {
-        &self.vec
-    }
+/// # Safety
+/// As [`raw_vec_reserve`]'s.
+#[inline(always)]
+pub unsafe fn raw_vec_push<T>(header: &mut RawVec<T>, value: T) {
+    // SAFETY: caller's contract.
+    unsafe { raw_vec_reserve(header, 1) };
+    // SAFETY: the reserve above guarantees `size < capacity`.
+    unsafe { header.ptr.add(header.size).write(value) };
+    header.size += 1;
 }
 
-impl<'a, T> DerefMut for RawVecGuard<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        &mut self.vec
+/// # Safety
+/// `header.ptr`/`size` must describe live, initialized elements (as
+/// [`raw_vec_reserve`]'s contract, minus the allocator part — this
+/// never grows).
+#[inline(always)]
+pub unsafe fn raw_vec_pop<T>(header: &mut RawVec<T>) -> Option<T> {
+    if header.size == 0 {
+        return None;
     }
+    header.size -= 1;
+    // SAFETY: index `size` (post-decrement) was live and initialized the
+    // instant before this call; ownership moves to the caller, and this
+    // slot is no longer in `[0, size)` so it won't be read again.
+    Some(unsafe { header.ptr.add(header.size).read() })
 }
 
-impl<'a, T> Drop for RawVecGuard<'a, T> {
-    fn drop(&mut self) {
-        self.header.ptr = self.vec.as_mut_ptr();
-        self.header.size = self.vec.len();
-        self.header.capacity = self.vec.capacity();
+/// # Safety
+/// `header.ptr`/`size` must describe live, initialized elements (as
+/// [`raw_vec_reserve`]'s contract, minus the allocator part — this
+/// never grows).
+#[inline(always)]
+pub unsafe fn raw_vec_last<T>(header: &RawVec<T>) -> Option<&T> {
+    if header.size == 0 {
+        return None;
     }
+    // SAFETY: index `size-1` (post-decrement) was live and initialized.
+    Some(unsafe { &*header.ptr.add(header.size - 1) })
+}
+
+/// Remove the element at `index`, shifting everything after it left by
+/// one (like `Vec::remove`).
+///
+/// # Safety
+/// As [`raw_vec_pop`]'s; `index < header.size`.
+#[inline(always)]
+pub unsafe fn raw_vec_remove<T>(header: &mut RawVec<T>, index: usize) -> T {
+    debug_assert!(index < header.size);
+    // SAFETY: `index < header.size` (caller's contract) — live element.
+    let removed = unsafe { header.ptr.add(index).read() };
+    let tail = header.size - index - 1;
+    if tail > 0 {
+        // SAFETY: `[index+1, size)` and `[index, size-1)` are both
+        // within the live allocation; `read()` above left `index`'s
+        // slot logically empty (not yet overwritten), which this fills.
+        unsafe { core::ptr::copy(header.ptr.add(index + 1), header.ptr.add(index), tail) };
+    }
+    header.size -= 1;
+    removed
+}
+
+/// Shrink `header.size` to `new_len` without dropping the elements past
+/// it — for callers that have already moved them out (e.g. read their
+/// bits directly to transfer ownership elsewhere).
+///
+/// # Safety
+/// `new_len <= header.size`.
+#[inline(always)]
+pub unsafe fn raw_vec_truncate_no_drop<T>(header: &mut RawVec<T>, new_len: usize) {
+    debug_assert!(new_len <= header.size);
+    header.size = new_len;
 }
 
 /// One shared, monomorphized `&'static FnVTable` per concrete `F` — same

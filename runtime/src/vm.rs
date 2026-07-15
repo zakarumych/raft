@@ -477,6 +477,8 @@ fn read_u32(code: &[u8], pc: &mut usize) -> Result<u32, RuntimeError> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+#[cold]
+#[inline(never)]
 fn truncated() -> RuntimeError {
     RuntimeError::Other("vm: truncated bytecode".into())
 }
@@ -716,7 +718,7 @@ impl Code {
                     decode_operand(op - opcode::LOAD_SLOT, code, &mut pc)?,
                 )),
                 opcode::LOAD_PARENT..opcode::LOAD_PARENT_END => {
-                    Instr::LoadParent(SlotId(decode_wop(op - opcode::LOAD_PARENT, code, &mut pc)?))
+                    Instr::LoadParent(SlotId(decode_operand(op - opcode::LOAD_PARENT, code, &mut pc)?))
                 }
                 opcode::LOAD_GLOBAL..opcode::LOAD_GLOBAL_END => Instr::LoadGlobal(StringId(
                     decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?,
@@ -1916,7 +1918,7 @@ impl Compiler<'_> {
             } => {
                 self.compile_expr(target, true)?;
                 self.compile_expr(value, true)?;
-                let i = self.rt.ctx.string(field.rc_str_name());
+                let i = self.rt.ctx.string(field.name());
                 self.emit(Instr::SetField(i));
                 if tail {
                     self.emit(Instr::Nil);
@@ -2292,7 +2294,7 @@ impl Compiler<'_> {
             }
             ExprKind::Field(obj, field) => {
                 self.compile_expr(obj, used)?;
-                let i = self.rt.ctx.string(field.rc_str_name());
+                let i = self.rt.ctx.string(field.name());
                 if used {
                     self.emit(Instr::GetField(i));
                 }
@@ -2575,15 +2577,15 @@ fn run_frame(
                 let n = decode_operand(op - opcode::MAKE_LIST, code, &mut pc)?;
                 let mut stack = rt.stack();
                 let elements: Vec<Val> = stack.drain_top(n as usize).collect();
-                drop(stack);
                 let list = new_list(elements);
-                rt.stack().push(list);
+                stack.push(list);
             }
             opcode::MAKE_RECORD..opcode::MAKE_RECORD_END => {
+                let mut stack = rt.stack();
+
                 let n = decode_operand(op - opcode::MAKE_RECORD, code, &mut pc)?;
                 let mut map = FixedHashMap::default();
                 {
-                    let mut stack = rt.stack();
                     let mut fields = stack.drain_top(n as usize * 2);
                     while let (Some(key), Some(val)) = (fields.next(), fields.next()) {
                         match key.unpack() {
@@ -2600,7 +2602,7 @@ fn run_frame(
                     }
                 }
                 let record = new_record(map);
-                rt.stack().push(record);
+                stack.push(record);
             }
             opcode::UNARY..opcode::UNARY_END => {
                 let k = byte_to_unop(op - opcode::UNARY)?;
