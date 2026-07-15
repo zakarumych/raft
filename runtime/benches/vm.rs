@@ -1,13 +1,16 @@
-//! Criterion benchmarks comparing the AST walker against the bytecode VM,
-//! plus compiler and binding micro-benchmarks.
+//! Criterion benchmarks comparing the AST walker against the bytecode VM
+//! and against "oxidized" (Raft-transpiled-to-Rust cdylib bundle)
+//! execution, plus compiler and binding micro-benchmarks.
 //!
-//! Run with `cargo bench -p raft-runtime` or `cargo criterion`.
+//! Run with `cargo bench -p raft-runtime` or `cargo criterion`. The
+//! oxidized mode transpiles, cargo-builds and links a bundle per group on
+//! first run (cached under the temp dir afterwards).
 
 use std::{hint::black_box, rc::Rc};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use raft_ast::{Stmt, StmtKind};
-use raft_runtime::{Frame, Runtime, vm};
+use raft_runtime::{BundleBuilder, Frame, Runtime, vm};
 
 fn parse(src: &str) -> Vec<Stmt> {
     let tokens = raft_ast::lexer::parse_str(src, &raft_ast::lexer::Options::wss()).unwrap();
@@ -23,19 +26,57 @@ fn runtime_with(defs: &str, compiled: bool) -> (Runtime, Rc<Frame>) {
     for stmt in parse(defs) {
         rt.exec_stmt(&stmt, frame.clone()).unwrap();
     }
-    
+
+    (rt, frame)
+}
+
+/// A runtime whose `defs` functions were transpiled to Rust, built as a
+/// cdylib bundle (same profile as the bench itself — release), linked,
+/// and re-exposed as globals so `call` scripts resolve them by name.
+fn runtime_oxidized(group: &str, defs: &str) -> (Runtime, Rc<Frame>) {
+    let mut rt = Runtime::new();
+    let frame = Rc::new(Frame::new());
+
+    // export every top-level fn of `defs` from the bundle module
+    let exports: Vec<String> = parse(defs)
+        .iter()
+        .filter_map(|stmt| match stmt.kind() {
+            StmtKind::Fn { name, .. } => Some(name.name().to_string()),
+            _ => None,
+        })
+        .collect();
+    let module_src = format!("{defs}export {{ {} }}\n", exports.join(", "));
+
+    let crate_name = format!("raft_bench_{}", group.replace('-', "_"));
+    rt.build_bundle(
+        &BundleBuilder::new(&crate_name)
+            .module("bench", module_src)
+            .release(true),
+    )
+    .unwrap_or_else(|e| panic!("building oxidized bundle for {group}: {e}"));
+
+    let module = rt.module("bench").expect("bundle module registered");
+    for name in &exports {
+        let f = module.get_field(name).expect("exported fn");
+        rt.set_var(name.as_str(), f);
+    }
     (rt, frame)
 }
 
 /// Benchmark executing `call` (with functions from `defs` predefined) in
-/// both execution modes.
+/// all three execution modes.
 fn bench_modes(c: &mut Criterion, group: &str, defs: &str, call: &str) {
     let mut g = c.benchmark_group(group);
     let call_stmts = parse(call);
 
-    for (mode, compiled) in [("ast-walk", false), ("bytecode", true)] {
-        let (mut rt, frame) = runtime_with(defs, compiled);
-        g.bench_function(mode, |b| {
+    let mut runtimes = vec![
+        ("ast-walk", runtime_with(defs, false)),
+        ("bytecode", runtime_with(defs, true)),
+        ("oxidized", runtime_oxidized(group, defs)),
+    ];
+    for (mode, (rt, frame)) in &mut runtimes {
+        let _ = mode;
+        g.bench_function(*mode, |b| {
             b.iter(|| {
                 for stmt in &call_stmts {
                     black_box(rt.exec_stmt(stmt, frame.clone()).unwrap());
@@ -377,18 +418,25 @@ def crunch(rounds):
 
 /// A big non-recursive driver calling many small helpers (~100 lines).
 fn pipeline(c: &mut Criterion) {
-    // sanity: both execution modes must agree on the result being timed
-    let results: Vec<String> = [false, true]
-        .iter()
-        .map(|&compiled| {
-            let (mut rt, frame) = runtime_with(PIPELINE, compiled);
-            for stmt in &parse("r = crunch 10\n") {
-                rt.exec_stmt(stmt, frame.clone()).unwrap();
-            }
-            format!("{}", frame.get_var("r", &mut rt))
-        })
-        .collect();
-    assert_eq!(results[0], results[1], "modes disagree on pipeline result");
+    // sanity: all execution modes must agree on the result being timed
+    let results: Vec<String> = [
+        runtime_with(PIPELINE, false),
+        runtime_with(PIPELINE, true),
+        runtime_oxidized("pipeline-check", PIPELINE),
+    ]
+    .into_iter()
+    .map(|(mut rt, frame)| {
+        for stmt in &parse("r = crunch 10\n") {
+            rt.exec_stmt(stmt, frame.clone()).unwrap();
+        }
+        format!("{}", frame.get_var("r", &mut rt))
+    })
+    .collect();
+    assert_eq!(results[0], results[1], "walker/VM disagree on pipeline");
+    assert_eq!(
+        results[0], results[2],
+        "walker/oxidized disagree on pipeline"
+    );
 
     bench_modes(c, "pipeline-10", PIPELINE, "crunch 10\n");
     bench_python(c, "pipeline-10", PIPELINE_PY, "crunch(10)\n");

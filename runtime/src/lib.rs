@@ -15,6 +15,12 @@ use crate::vm::CompiledPat;
 
 pub mod vm;
 
+#[cfg(feature = "bundle")]
+mod bundle;
+
+#[cfg(feature = "bundle")]
+pub use bundle::BundleBuilder;
+
 // The object model (`Val`, `Object`, `Atom`, `Number`, `RuntimeError`,
 // `Function`/`DynFn`/`FnVal`, the `Host` bridge trait, ...) lives in
 // `raft-core` now, so it can be shared unmodified by other execution modes.
@@ -755,6 +761,15 @@ pub struct Runtime {
     /// (see [`vm`]) instead of being closed over as AST. Both kinds of
     /// function are plain `Any::Fn` values and can call each other freely.
     compile_fns: bool,
+
+    /// Bundle cdylibs linked into this runtime (see [`Runtime::link_bundle`]).
+    /// Values produced by a bundle carry vtable and code pointers into its
+    /// library, so the libraries must outlive every `Val` this runtime
+    /// holds — this field is declared last, dropping only after `global`/
+    /// `modules` (and the operand stack, torn down in `Drop::drop` before
+    /// any field).
+    #[cfg(feature = "bundle")]
+    libraries: Vec<libloading::Library>,
 }
 
 impl Drop for Runtime {
@@ -805,6 +820,8 @@ impl Runtime {
             loading: Vec::new(),
             status: Ok(()),
             compile_fns: false,
+            #[cfg(feature = "bundle")]
+            libraries: Vec::new(),
         }
     }
 
@@ -850,6 +867,32 @@ impl Runtime {
     #[cold]
     pub fn set_error(&mut self, err: RuntimeError) {
         self.status = Err(err);
+    }
+
+    /// Take (and clear) the pending error status, if any.
+    pub fn take_error(&mut self) -> Option<RuntimeError> {
+        match core::mem::replace(&mut self.status, Ok(())) {
+            Ok(()) => None,
+            Err(e) => Some(e),
+        }
+    }
+
+    /// The FFI view of this runtime, for initializing a transpiled bundle
+    /// (see `raft-ffi`'s `RaftFFIHost`/`RaftFFIInitBundleFn`): the raw host
+    /// pointer plus callbacks for name interning, global-variable access,
+    /// and error signaling. Every callback recovers this exact `Runtime`
+    /// from the raw pointer (sound per `Runtime`'s `#[repr(C)]` layout
+    /// contract — see its doc comment).
+    pub fn ffi_host(&mut self) -> ffi::RaftFFIHost {
+        ffi::RaftFFIHost {
+            raw: self as *mut Runtime as *mut ffi::RawHost,
+            intern_string: ffi_intern_string,
+            intern_atom: ffi_intern_atom,
+            getvar: ffi_getvar,
+            setvar: ffi_setvar,
+            set_error: ffi_set_error,
+            take_error: ffi_take_error,
+        }
     }
 
     /// Register a host function in the global scope.
@@ -1219,6 +1262,21 @@ impl Runtime {
                 Ok(Exec::Value(Val::nil()))
             }
         }
+    }
+
+    /// Register an already-built module object under `name` — e.g. one
+    /// loaded from a transpiled-bundle cdylib — so [`Runtime::module`]
+    /// lookups and cached [`Runtime::load_module`] calls find it without
+    /// executing any source.
+    pub fn register_module(&mut self, name: &str, module: Val) {
+        let id = self.ctx.string(name);
+        self.modules.insert(id, module);
+    }
+
+    /// Look up a cached or [registered](Runtime::register_module) module.
+    pub fn module(&mut self, name: impl IntoStringId) -> Option<Val> {
+        let id = name.into_id(&mut self.ctx);
+        self.modules.get(&id).cloned()
     }
 
     /// Parse, execute and cache a module. `source` is a block of Raft code
@@ -1606,6 +1664,66 @@ fn callee_ref(val: &Val) -> Option<RcFn> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// FFI callbacks handed to transpiled bundles via `Runtime::ffi_host`.
+// Each one recovers the `Runtime` from the raw host pointer — sound per
+// `Runtime`'s `#[repr(C)]`/host-first layout contract (the same cast
+// `AstFn::call` performs).
+// ---------------------------------------------------------------------
+
+/// # Safety
+/// `host` must be the pointer `Runtime::ffi_host` was built from, still live.
+unsafe fn ffi_runtime<'a>(host: *mut ffi::RawHost) -> &'a mut Runtime {
+    unsafe { &mut *(host as *mut Runtime) }
+}
+
+/// # Safety
+/// `ptr`/`len` must describe a valid UTF-8 string for the call's duration.
+unsafe fn ffi_name<'a>(ptr: *const u8, len: usize) -> &'a str {
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) }
+}
+
+unsafe extern "C" fn ffi_intern_string(
+    host: *mut ffi::RawHost,
+    ptr: *const u8,
+    len: usize,
+) -> usize {
+    let rt = unsafe { ffi_runtime(host) };
+    let name = unsafe { ffi_name(ptr, len) };
+    rt.ctx.string(name).0 as usize
+}
+
+unsafe extern "C" fn ffi_intern_atom(host: *mut ffi::RawHost, ptr: *const u8, len: usize) -> usize {
+    let rt = unsafe { ffi_runtime(host) };
+    let name = unsafe { ffi_name(ptr, len) };
+    rt.ctx.atom_id(name).0
+}
+
+unsafe extern "C" fn ffi_getvar(host: *mut ffi::RawHost, id: usize) -> ffi::RawVal {
+    let rt = unsafe { ffi_runtime(host) };
+    rt.get_var(StringId(id as u32)).into_ffi()
+}
+
+unsafe extern "C" fn ffi_setvar(host: *mut ffi::RawHost, id: usize, val: ffi::RawVal) {
+    let rt = unsafe { ffi_runtime(host) };
+    let val = unsafe { Val::from_ffi(val) };
+    rt.set_var(StringId(id as u32), val);
+}
+
+unsafe extern "C" fn ffi_set_error(host: *mut ffi::RawHost, msg: ffi::RawVal) {
+    let rt = unsafe { ffi_runtime(host) };
+    let msg = unsafe { Val::from_ffi(msg) };
+    rt.set_error(RuntimeError::Other(alloc::format!("{msg}").into()));
+}
+
+unsafe extern "C" fn ffi_take_error(host: *mut ffi::RawHost) -> ffi::RawVal {
+    let rt = unsafe { ffi_runtime(host) };
+    match rt.take_error() {
+        Some(e) => Val::string(&alloc::format!("{e}")).into_ffi(),
+        None => Val::new_uninit().into_ffi(),
     }
 }
 

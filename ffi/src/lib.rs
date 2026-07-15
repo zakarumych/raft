@@ -175,6 +175,21 @@ pub struct RawVal {
     pub data: RawData,
 }
 
+impl RawVal {
+    /// The uninitialized value — what a host puts in a `RawVal`-typed slot
+    /// before the other side fills it in.
+    pub const fn uninit() -> RawVal {
+        RawVal {
+            tag: RawTag {
+                // SAFETY: `MASK_TAG_UNINIT` is a nonzero constant, never
+                // dereferenced as a real pointer.
+                tag_ptr: unsafe { NonNull::new_unchecked(MASK_TAG_UNINIT as *mut Void) },
+            },
+            data: RawData { nothing: () },
+        }
+    }
+}
+
 /// The version of the FFI crate.
 /// Bundle may only be used with the same version of the FFI crate.
 ///
@@ -182,22 +197,65 @@ pub struct RawVal {
 /// matches the version of the FFI crate in the host process.
 pub const FFI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
-/// A bundle of Raft modules exposed by compiled cdylib.
+/// Intern a name (`ptr`/`len` UTF-8 bytes) in the host, returning its id —
+/// a `StringId` for identifier names, an `AtomId` for atom names.
+pub type InternFn = unsafe extern "C" fn(*mut RawHost, *const u8, usize) -> usize;
+
+/// Read/write a host global variable by interned `StringId`. Reading an
+/// unbound name returns the uninit value.
+pub type GetVarFn = unsafe extern "C" fn(*mut RawHost, usize) -> RawVal;
+pub type SetVarFn = unsafe extern "C" fn(*mut RawHost, usize, RawVal);
+
+/// Report a runtime error to the host (message as a string `RawVal`,
+/// ownership transferred). Mirrors what the host's own functions do when
+/// they fail mid-call: the failing callee pushes no result and the caller
+/// checks the error status after the call returns.
+pub type SetErrorFn = unsafe extern "C" fn(*mut RawHost, RawVal);
+
+/// Take (and clear) the host's pending error, if any: returns the message
+/// as a string `RawVal` (ownership transferred), or the uninit value when
+/// no error is pending.
+pub type TakeErrorFn = unsafe extern "C" fn(*mut RawHost) -> RawVal;
+
+/// Everything a loaded bundle needs from its host: the raw host itself
+/// (stack + whatever concrete state sits behind it) plus the callbacks the
+/// bundle can't perform on its own — name interning, global-variable
+/// access, and error signaling.
+///
+/// # Pointer validity
+/// `raw` is only guaranteed valid for the duration of the init call it is
+/// passed to — the host is free to move afterwards. A bundle must not
+/// retain it; every post-init callback invocation must use the live host
+/// pointer of the call it is servicing (the `*mut RawHost` its `CallFn`
+/// received). The *function pointers* are process-stable and may be kept.
 #[repr(C)]
-pub struct RaftFFIBundle {
-    modules: *mut RaftFFIModule,
-    modules_count: i32,
+#[derive(Clone, Copy)]
+pub struct RaftFFIHost {
+    pub raw: *mut RawHost,
+    pub intern_string: InternFn,
+    pub intern_atom: InternFn,
+    pub getvar: GetVarFn,
+    pub setvar: SetVarFn,
+    pub set_error: SetErrorFn,
+    pub take_error: TakeErrorFn,
 }
 
+/// A bundle of Raft modules exposed by a compiled cdylib. The host
+/// constructs it (with `modules` uninit) and passes it to the bundle's
+/// init function, which fills `modules` in.
 #[repr(C)]
-pub struct RaftFFIModule {}
-
-pub type RaftFFIMakeAtomFn = unsafe extern "C" fn(*const u8, i32);
+pub struct RaftFFIBundle {
+    /// A record value `{ module_name: exports_record, .. }` — one field
+    /// per compiled module, each holding that module's export record.
+    /// Ownership transfers to the host once init returns success.
+    pub modules: RawVal,
+}
 
 pub type RaftFFIVersionFn = unsafe extern "C" fn() -> *const u8;
 
 /// Type signature for the function that initializes the Raft bundle in the cdylib.
-pub type RaftFFIInitBundleFn = unsafe extern "C" fn(&mut RaftFFIBundle, *mut u8, i32) -> i32;
+pub type RaftFFIInitBundleFn =
+    unsafe extern "C" fn(&mut RaftFFIBundle, &RaftFFIHost, *mut u8, i32) -> i32;
 
 /// Name of the function that initializes the Raft bundle in the cdylib.
 pub const INIT_RAFT_BUNDLE_FN_NAME: &str = "raft_ffi_init_bundle";
@@ -265,7 +323,7 @@ pub mod for_macro {
 
 #[macro_export]
 macro_rules! raft_bundle {
-    ($bundle:pat => $code:block) => {
+    (($bundle:pat, $host:pat) => $code:block) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn raft_ffi_version() -> *const u8 {
             const _: $crate::RaftFFIVersionFn = raft_ffi_version;
@@ -276,6 +334,7 @@ macro_rules! raft_bundle {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn raft_ffi_init_bundle(
             bundle: &mut $crate::RaftFFIBundle,
+            host: &$crate::RaftFFIHost,
             error_buf: *mut u8,
             error_buf_len: i32,
         ) -> i32 {
@@ -283,11 +342,14 @@ macro_rules! raft_bundle {
 
             use $crate::for_macro::InitResult;
 
-            fn inner($bundle: &mut $crate::RaftFFIBundle) -> impl InitResult {
+            fn inner(
+                $bundle: &mut $crate::RaftFFIBundle,
+                $host: &$crate::RaftFFIHost,
+            ) -> impl InitResult {
                 $code
             }
 
-            inner(bundle).into_code(error_buf, error_buf_len)
+            inner(bundle, host).into_code(error_buf, error_buf_len)
         }
     };
 }

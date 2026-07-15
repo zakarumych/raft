@@ -553,6 +553,26 @@ impl Val {
         Some(unsafe { (vtable.call)(data, args, host.as_raw()) })
     }
 
+    /// Hand ownership of this value across an FFI boundary as its raw
+    /// 2-word representation. The receiver becomes the owner of whatever
+    /// heap reference this held — pair with [`Val::from_ffi`] on the other
+    /// side, or leak it.
+    #[inline(always)]
+    pub fn into_ffi(self) -> ffi::RawVal {
+        self.into_raw()
+    }
+
+    /// Take ownership of a `RawVal` received across an FFI boundary.
+    ///
+    /// # Safety
+    /// `raw` must be a valid `RawVal` whose ownership is being transferred
+    /// to this handle (produced by [`Val::into_ffi`] or an equivalent
+    /// contract-honoring producer), not still owned by the other side.
+    #[inline(always)]
+    pub unsafe fn from_ffi(raw: ffi::RawVal) -> Val {
+        Val::from_raw(raw)
+    }
+
     pub fn new_uninit() -> Val {
         Val::from_tag_only(ffi::MASK_TAG_UNINIT)
     }

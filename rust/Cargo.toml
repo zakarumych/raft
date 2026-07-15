@@ -1,0 +1,12 @@
+[package]
+name = "raft-rust"
+version = "0.1.0"
+edition.workspace = true
+description = "Raft-to-Rust transpiler and runtime support for transpiled bundles"
+
+[dependencies]
+raft-ast = { path = "../ast" }
+
+[dev-dependencies]
+raft-core = { path = "../core" }
+raft-runtime = { path = "../runtime" }
