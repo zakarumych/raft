@@ -543,10 +543,12 @@ impl Val {
         }
         let vtable = self.vtable_ref::<raft_ffi::FnVTable>();
         // SAFETY: tag confirmed `Fn`; `heap_ptr` is a live `RcInner<Void>`
-        // box for this exact tag, matching `RcFn::call`'s own approach.
-        let inner = unsafe { self.heap_ptr::<Void>().as_ref() };
-        let data =
-            unsafe { raft_ffi::VoidPtr::new_unchecked(&inner.value as *const Void as *mut Void) };
+        // box for this exact tag. Raw place projection (never a reference)
+        // keeps whole-box provenance on `data` — `rc::call_shim` walks it
+        // back to the box header to reach the strong count.
+        let data = unsafe {
+            raft_ffi::VoidPtr::new_unchecked(&raw mut (*self.heap_ptr::<Void>().as_ptr()).value)
+        };
         // SAFETY: crossing into the `extern "C"` `CallFn` ABI, same as
         // `RcFn::call` — `host.as_raw()` is the exact valid, exclusively
         // borrowed `RawHost` `host` wraps.
@@ -1894,15 +1896,13 @@ fn call_dispatch<F: Function>(rc: &Rc<F>, host: &mut rc::Host, args: usize) -> u
 
 impl<F: Function> Callable for F {
     #[inline]
-    fn call(&self, args: usize, host: &mut rc::Host) -> usize {
-        // SAFETY: `rc::call_shim` (the only caller) reconstructs `self`
-        // from a live `Rc::<F>::into_raw_box`/`DynRc::erase_fn` pointer —
-        // reborrowing it as `Rc<F>` here (immediately forgotten by the
-        // caller) is sound and doesn't double-decrement.
-        let rc = unsafe { Rc::from_raw(self as *const F) };
-        let consumed = call_dispatch(&rc, host, args);
-        core::mem::forget(rc);
-        consumed
+    unsafe fn call_raw(this: raft_ffi::RcPtr<F>, args: usize, host: &mut rc::Host) -> usize {
+        // SAFETY: `this` is the live, whole-provenance `RcInner<F>` box
+        // (caller's contract) — viewing it as a borrowed `Rc<F>` (in
+        // `ManuallyDrop`, so no double-decrement) lets `call_dispatch`
+        // clone it into a partial-application value when needed.
+        let rc = ManuallyDrop::new(unsafe { Rc::<F>::from_raw_box(this.cast()) });
+        call_dispatch(&rc, host, args)
     }
 }
 
@@ -2021,8 +2021,11 @@ impl RcFn {
     #[inline]
     pub fn call(&self, host: &mut rc::Host, args: usize) -> usize {
         let vtable = DynRc::vtable(&self.ptr);
+        // SAFETY: raw place projection from the live box pointer (never a
+        // reference) keeps whole-box provenance on `data` — `rc::call_shim`
+        // walks it back to the box header to reach the strong count.
         let data = unsafe {
-            raft_ffi::VoidPtr::new_unchecked(&self.ptr.rc_box().value as *const Void as *mut Void)
+            raft_ffi::VoidPtr::new_unchecked(&raw mut (*DynRc::data_ptr(&self.ptr).as_ptr()).value)
         };
         // SAFETY: crossing into the `extern "C"` `CallFn` ABI — the one
         // place a raw pointer is unavoidable; `host.as_raw()` is still

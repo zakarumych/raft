@@ -7,22 +7,25 @@ and easy to reason about.
 
 > **Status: early / work in progress.** The lexer, parser, tree-walking
 > runtime and REPL are functional, including user-defined functions with
-> currying, partial application and lexical closures. The language is
-> still missing pieces you'd expect from a "complete" language (a standard
-> library — see [Roadmap](#roadmap)). APIs and syntax may change without
-> notice.
+> currying, partial application and lexical closures; a bytecode VM and an
+> ahead-of-time Raft → Rust transpiler provide two further execution modes
+> (see [Execution modes](#execution-modes-ast-walking-bytecode-and-transpiled-rust)).
+> The language is still missing pieces you'd expect from a "complete"
+> language (a standard library — see [Roadmap](#roadmap)). APIs and syntax
+> may change without notice.
 
 ## Project layout
 
-This is a Cargo workspace made up of six crates:
+This is a Cargo workspace made up of seven crates:
 
 | Crate               | Path        | Description                                                                 |
 | ------------------- | ----------- | ---------------------------------------------------------------------------- |
 | `raft-lexer`        | `lexer/`    | `no_std`-friendly tokenizer: idents, atoms, numbers, chars, strings, comments, punctuation and delimiter groups (including indentation-based blocks). |
 | `raft-ast`          | `ast/`      | AST types plus a recursive-descent parser built on top of the token stream. |
-| `raft-ffi`          | `ffi/`      | Strictly `no_std`, zero-dependency ABI: the raw, `#[repr(C)]` tagged-pointer/vtable shapes the object model is built from. Declares the calling convention dynamically-loaded/transpiled Raft modules will speak. |
+| `raft-ffi`          | `ffi/`      | Strictly `no_std`, zero-dependency ABI: the raw, `#[repr(C)]` tagged-pointer/vtable shapes the object model is built from. Declares the calling convention dynamically-loaded/transpiled Raft modules speak. |
 | `raft-core`         | `core/`     | The object model (`Val`) built safely on top of `raft-ffi`'s raw shapes — a real, compact tagged pointer, not a Rust enum. `no_std`+`alloc` only, host-agnostic, shared unchanged by every execution mode. |
-| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. Implements the host-specific pieces `raft-core` deliberately doesn't know about (globals, modules, atom names). |
+| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. Builds and links transpiled bundles (feature `bundle`). Implements the host-specific pieces `raft-core` deliberately doesn't know about (globals, modules, atom names). |
+| `raft-rust`         | `rust/`     | The Raft → Rust transpiler: turns parsed Raft modules into a standalone cdylib crate (a *bundle*) that depends only on `raft-core` and speaks `raft-ffi`'s ABI. |
 | `raft-repl`         | `repl/`     | Line-by-line REPL wiring the lexer, parser and runtime together.           |
 
 `raft-lexer`, `raft-ast` and `raft-runtime` support an optional `std`
@@ -36,10 +39,10 @@ feature (enabled by default) so the front-end can, in principle, run in
 scalar kinds (numbers, chars, atoms) are packed inline; heap kinds
 (strings, lists, records, functions, host-opaque values) are handles
 dispatched through a per-kind vtable. This is what lets the same,
-unmodified `raft-core` crate back every execution mode — including a
-future mode that transpiles Raft to Rust and compiles it into a `cdylib`
-or straight into the host binary — without `raft-core` needing to know
-anything about a particular host's `Runtime`.
+unmodified `raft-core` crate back every execution mode — the AST walker,
+the bytecode VM, and transpiled-to-Rust bundles loaded as `cdylib`s —
+without `raft-core` needing to know anything about a particular host's
+`Runtime`.
 
 `Val::unpack()`/`ValEnum` is the ergonomic, `match`-able view (heap kinds
 bump a refcount; scalars are free); `Val::kind()` is a cheap, clone-free
@@ -413,11 +416,12 @@ directly and be wrapped with `raft_core::RcFn::new`.
 The bundled REPL (`repl/src/main.rs`) registers `print`, `debugfmt`,
 `quit` and `import` this way.
 
-### Execution modes: AST walking and bytecode
+### Execution modes: AST walking, bytecode, and transpiled Rust
 
-The runtime has two interchangeable execution modes. By default everything
-is interpreted by walking the AST. Alternatively, `fn` definitions can be
-compiled to a stack-based instruction set (`raft_runtime::vm::Instr`) that
+The runtime has three interchangeable execution modes. By default
+everything is interpreted by walking the AST. Alternatively, `fn`
+definitions can be compiled to a stack-based instruction set
+(`raft_runtime::vm::Instr`) that
 is encoded into a flat byte array: operand widths — and the most common
 operand values, like small slot indices, small integers, `True`/`False`
 and operator kinds — are packed into the opcode byte itself; larger
@@ -445,9 +449,79 @@ a view over it, so a host function called from compiled code can inspect
 the caller's live temporaries (mutate them at your own risk).
 
 The REPL compiles functions by default; pass `--no-vm` to stay on the tree
-walker. `cargo bench -p raft-runtime` (or `cargo criterion`, if installed)
-runs Criterion benchmarks comparing the two modes, plus compiler and
-pattern-binding micro-benchmarks (`runtime/benches/vm.rs`).
+walker.
+
+### Transpiled bundles: Raft compiled to Rust
+
+The third mode compiles Raft ahead of time. `raft-rust` transpiles parsed
+Raft modules into an ordinary Rust crate — a **bundle** — built as a
+`cdylib` that depends only on `raft-core` and talks to its host purely
+through `raft-ffi`'s versioned ABI. `raft-runtime` (feature `bundle`,
+enabled by default) drives the whole cycle:
+
+```rust
+use raft_runtime::{BundleBuilder, Runtime};
+
+let mut rt = Runtime::new();
+rt.build_bundle(
+    &BundleBuilder::new("my_bundle")
+        .module("math", "fn add a b:\n    return a + b\nexport { add }\n"),
+)?;
+// the bundle's modules are now registered: rt.module("math") is the
+// export record, and Raft code can `import` it as usual
+```
+
+`Runtime::build_bundle` transpiles the sources, writes the crate, invokes
+`cargo build` (in the same profile the runtime itself was built in, unless
+overridden), and hands the artifact to `Runtime::link_bundle` — which
+loads the library, checks its `raft-ffi` version against the host's,
+initializes it, registers every module it exposes, and holds the library
+for the runtime's lifetime. An already-built bundle can be linked
+directly with `link_bundle` alone. `cargo run -p raft-rust --example
+bundle_e2e` demonstrates the full cycle; `--example transpile` generates a
+bundle crate from `.raft` files without building it.
+
+Transpiled code is plain safe Rust over `Val`: Raft control flow becomes
+native Rust control flow, locals become Rust locals, and a binding that a
+nested `fn` captures becomes a field of that scope's per-call
+`Rc<Capture>` structure — nested functions are Rust closures capturing
+those handles, so closures, currying and partial application behave
+exactly as in the other two modes. At bundle init, every name the bundle
+can reach the host with is interned once into exactly-sized static id
+tables; globals, atoms and error signaling go through host callbacks, and
+values cross the FFI boundary as raw 2-word `RawVal`s only at that edge.
+All three modes speak the same `Fn` calling convention, so walked,
+bytecode and transpiled functions call each other freely within one
+runtime.
+
+### Benchmarks
+
+`cargo bench -p raft-runtime` (or `cargo criterion`, if installed) runs
+Criterion benchmarks comparing the three modes (`ast-walk` / `bytecode` /
+`oxidized`, the transpiled bundle) against CPython and native Rust
+baselines, plus compiler and pattern-binding micro-benchmarks
+(`runtime/benches/vm.rs`).
+
+Current numbers (Criterion medians, release, Windows x64; CPython 3.14
+and a hand-written native Rust translation as reference points):
+
+| Benchmark | ast-walk | bytecode | oxidized | CPython 3.14 | native Rust |
+| ----------------------------------- | -------: | -------: | -------: | -----------: | ----------: |
+| `fib-15` (recursion, call-heavy)    |   311 µs |   117 µs |    65 µs |        53 µs |     1.06 µs |
+| `loop-1000` (tight arithmetic loop) |   170 µs |    85 µs |    26 µs |        39 µs |         — * |
+| `collatz-27` (branch-heavy loop)    |  22.2 µs |   8.3 µs |   3.4 µs |       9.4 µs |       62 ns |
+| `pipeline-10` (~100-line workload: records, lists, atoms, destructuring) | 514 µs | 207 µs | 118 µs | 88 µs | |
+| `call-direct` (one 3-ary call)      |   162 ns |    85 ns |    72 ns |              | |
+| `call-curried` (chain of partial applications) | 269 ns | 197 ns | 176 ns |              | |
+
+\* the optimizer constant-folds the native loop away.
+
+Transpiled code currently runs ~1.2–3× faster than the bytecode VM and
+~4–7× faster than the walker. Dynamic dispatch still dominates: every
+value is a tagged `Val`, every call crosses the `Fn` vtable, and calls
+into a bundle additionally cross the cdylib boundary — which is why the
+gap to native Rust remains large and call-dominated workloads (`fib`,
+`pipeline`) gain less than loop-dominated ones.
 
 ## Roadmap
 
@@ -464,9 +538,9 @@ Raft is under active development. Notable gaps today:
   its source name (`Pos`, `Done`, ...) outside of `raft-runtime`, which
   keeps its own name table for this — `raft-core`'s `Val` is host-agnostic
   and has no such table built in.
-- A third execution mode, transpiling Raft to Rust (compiled into a
-  `cdylib`, or bundled straight into the host binary), doesn't exist yet;
-  `Val`'s tagged-pointer representation is designed to support it.
+- Transpiled bundles only build as `cdylib`s; bundling transpiled modules
+  straight into the host binary (via proc-macro or build script) is
+  planned.
 
 Contributions and ideas are welcome while the language design is still
 taking shape.

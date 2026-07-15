@@ -291,8 +291,21 @@ pub fn erase_fn<F: Callable>(rc: Rc<F>) -> DynRc<raft_ffi::FnVTable, Void> {
 /// `Function` trait (no min/max-args or partial-application semantics
 /// here, just "invoke, given a host and an argument count, returning how
 /// many were actually consumed"). `Function` bridges into this.
-pub trait Callable: 'static {
-    fn call(&self, args: usize, host: &mut Host) -> usize;
+///
+/// Receives the whole `RcInner<Self>` *box* pointer, not `&self`: the
+/// dispatch needs to touch the box's `strong` count (cloning the callee
+/// into a partial-application value), and a pointer derived from a `&Self`
+/// reference has provenance for the value field only — walking back to
+/// the header through it is undefined behavior that optimizers really do
+/// exploit (dropping the refcount bump entirely).
+pub trait Callable: 'static + Sized {
+    /// Dispatch a call on the value inside `this`.
+    ///
+    /// # Safety
+    /// `this` must be a live `RcInner<Self>` box carrying provenance for
+    /// the whole allocation, whose strong count is kept alive by the
+    /// caller for the duration of the call.
+    unsafe fn call_raw(this: RcPtr<Self>, args: usize, host: &mut Host) -> usize;
 }
 
 unsafe extern "C" fn call_shim<F: Callable>(
@@ -300,13 +313,19 @@ unsafe extern "C" fn call_shim<F: Callable>(
     args: usize,
     host: *mut raft_ffi::RawHost,
 ) -> usize {
-    // SAFETY: `data` points at a live `F` (see `fn_vtable`'s contract).
-    let f = unsafe { &*(data.as_ptr() as *const F) };
+    // SAFETY: `data` points at the `value` field of a live `RcInner<F>`
+    // and carries whole-box provenance (see `RcFn::call`/`Val::call_as_fn`,
+    // which derive it via raw place projection, never through a
+    // reference) — stepping back to the box start stays in bounds.
+    let offset = core::mem::offset_of!(RcInner<F>, value);
+    let box_ptr = unsafe { data.as_ptr().cast::<u8>().sub(offset) } as *mut RcInner<F>;
     // SAFETY: `host`, per `raft_ffi::CallFn`'s contract, is a valid,
     // exclusively-held `RawHost` for the duration of this call — this is
     // the one place that raw pointer gets turned into a reference.
     let mut host = unsafe { Host::from_raw(host) };
-    f.call(args, &mut host)
+    // SAFETY: derived from `data` per the contract above; non-null since
+    // `data` was.
+    unsafe { F::call_raw(NonNull::new_unchecked(box_ptr), args, &mut host) }
 }
 
 /// Safe view over a host's operand stack — the only thing
