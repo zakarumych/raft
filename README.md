@@ -14,18 +14,38 @@ and easy to reason about.
 
 ## Project layout
 
-This is a Cargo workspace made up of four crates:
+This is a Cargo workspace made up of six crates:
 
 | Crate               | Path        | Description                                                                 |
 | ------------------- | ----------- | ---------------------------------------------------------------------------- |
 | `raft-lexer`        | `lexer/`    | `no_std`-friendly tokenizer: idents, atoms, numbers, chars, strings, comments, punctuation and delimiter groups (including indentation-based blocks). |
 | `raft-ast`          | `ast/`      | AST types plus a recursive-descent parser built on top of the token stream. |
-| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. |
+| `raft-ffi`          | `ffi/`      | Strictly `no_std`, zero-dependency ABI: the raw, `#[repr(C)]` tagged-pointer/vtable shapes the object model is built from. Declares the calling convention dynamically-loaded/transpiled Raft modules will speak. |
+| `raft-core`         | `core/`     | The object model (`Val`) built safely on top of `raft-ffi`'s raw shapes — a real, compact tagged pointer, not a Rust enum. `no_std`+`alloc` only, host-agnostic, shared unchanged by every execution mode. |
+| `raft-runtime`      | `runtime/`  | A tree-walking interpreter that evaluates the AST, plus a stack-based bytecode VM (`vm` module) functions can be compiled to. Implements the host-specific pieces `raft-core` deliberately doesn't know about (globals, modules, atom names). |
 | `raft-repl`         | `repl/`     | Line-by-line REPL wiring the lexer, parser and runtime together.           |
 
 `raft-lexer`, `raft-ast` and `raft-runtime` support an optional `std`
 feature (enabled by default) so the front-end can, in principle, run in
-`no_std` environments.
+`no_std` environments. `raft-ffi` and `raft-core` are always `no_std`
+(`alloc`-only for `raft-core`; `raft-ffi` doesn't even depend on `alloc`).
+
+### The object model: `Val`
+
+`Val` is a 2-word tagged pointer (NaN-boxing-style), not a Rust enum:
+scalar kinds (numbers, chars, atoms) are packed inline; heap kinds
+(strings, lists, records, functions, host-opaque values) are handles
+dispatched through a per-kind vtable. This is what lets the same,
+unmodified `raft-core` crate back every execution mode — including a
+future mode that transpiles Raft to Rust and compiles it into a `cdylib`
+or straight into the host binary — without `raft-core` needing to know
+anything about a particular host's `Runtime`.
+
+`Val::unpack()`/`ValEnum` is the ergonomic, `match`-able view (heap kinds
+bump a refcount; scalars are free); `Val::kind()` is a cheap, clone-free
+discriminant for callers that only need to branch on shape. Nothing about
+this is unsafe from the outside — `raft-core`'s job is to be a genuinely
+*safe* wrapper over `raft-ffi`'s raw ABI, not just an ergonomic one.
 
 ## Building & testing
 
@@ -297,18 +317,19 @@ tag-directed control flow — see [Roadmap](#roadmap).
 
 ### Mutability
 
-Lists and records are mutable heap objects by default and can be frozen
-(from host code) to prevent further mutation.
+Lists and records are mutable heap objects. Host-side freezing is not
+supported (see [Roadmap](#roadmap)).
 
 ### Modules
 
 A module is a file of Raft code whose **tail statement must be
 `export { .. }`** (using record syntax, shorthand included). Importing a
 module executes its code once in a fresh environment and turns the export
-into an immutable, record-shaped module object; repeated imports return
-the cached object. Because module bindings can never change after the
-load, functions defined in a module capture its environment — they keep
-seeing the module's values and helper functions wherever they are called:
+into a record-shaped module object; repeated imports return the cached
+object. Functions defined in a module capture its environment — they keep
+seeing the module's values and helper functions wherever they are called.
+Module bindings are meant to be treated as fixed after load, even though
+this isn't enforced (see [Mutability](#mutability)):
 
 ```raft
 // geometry.raft
@@ -339,59 +360,58 @@ lookup and call `Runtime::load_module(name, source)`.
 ### Embedding host functions
 
 Every callable — `fn`-defined (AST-walked or bytecode-compiled), partially
-applied, or host-provided — is an `Any::Fn(FnValue)`. An `FnValue` pairs a
-`Function` implementor with an argument-count hint: a full application
-takes at least `min_args` and at most `max_args` (`None` = unbounded)
-arguments; how many a call actually consumes is somewhere in between and
-is reported back by the call itself. The runtime uses the lower bound to
-build partial applications *before* calling, so implementations never see
-an underfull argument list.
-
-The `Function` trait has two call flavors:
-
-- `call(&self, rt, args) -> (Any, usize)` — mandatory; returns the result
-  and how many arguments were consumed (consuming fewer than given makes
-  the runtime re-apply the leftovers to the returned value).
-- `call_once(self, rt, args)` — optional, defaults to `call`. Takes `self`
-  by value: the runtime dispatches here when the value being called holds
-  the last reference to the function, so implementations can move captured
-  state instead of cloning it — e.g. the built-in partial-application
-  wrapper moves its captured arguments.
-
-`call_once`'s by-value `self` makes `Function` deliberately
-non-dyn-compatible; `FnValue` stores implementors through a hidden
-dyn-compatible bridge trait that recovers the by-value call when its
-`Rc` unwraps as unique, and falls back to `call` when shared.
-
-The easiest way to expose a Rust closure is `register_external` (hint
-`(0, None)`: "takes anything, decides itself how much to consume") or
-`register_function` / `Any::function` with a precise hint:
+applied, or host-provided — is a `Val` of kind `Fn`, backed by
+`raft-core`'s `Function` trait:
 
 ```rust
-use raft_runtime::{Any, Runtime};
+pub trait Function: Sized + 'static {
+    fn min_args(&self) -> usize;
+    fn max_args(&self) -> Option<usize> { None } // `None` = unbounded
+    fn call(&self, host: &mut raft_core::rc::Host, args: usize);
+    fn debug_fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { ... }
+}
+```
+
+A full application takes at least `min_args` and at most `max_args`
+arguments; the runtime checks this *before* calling, building a
+partial-application value instead if fewer are supplied — implementations
+never see an underfull argument list. `call` reads its arguments off
+`host`'s operand stack (`host.pop()`/`host.drain_top_into(..)`) and pushes
+exactly one result back (`host.push(..)`); `host: &mut rc::Host` is a
+narrow, safe view over the call stack — implementing `Function` never
+requires unsafe code.
+
+The easiest way to expose a Rust closure is `Runtime::register_function`,
+which wraps a `Fn(&mut Runtime, usize) -> Val` closure with an
+argument-count hint and installs it as a global:
+
+```rust
+use raft_runtime::{Runtime, Val};
 
 let mut rt = Runtime::new();
 
 // consumes everything it is given
-rt.register_external("print", |_rt, args| {
-    for a in args {
-        println!("{}", a);
+rt.register_function("print", 0, None, |rt, args| {
+    for arg in rt.stack().drain_top(args).rev() {
+        println!("{}", arg);
     }
-    (Any::nil(), args.len())
+    Val::nil()
 });
 
 // takes exactly two arguments — calls with fewer partially apply
-rt.register_function("hypot2", 2, Some(2), |_rt, args| {
-    // args.len() >= 2 is guaranteed here
-    (Any::nil(), 2)
+rt.register_function("add2", 2, Some(2), |rt, _args| {
+    // two arguments are already guaranteed to be on the stack here
+    let b = rt.stack().pop();
+    let a = rt.stack().pop();
+    a.add(&b).unwrap()
 });
 ```
 
 Stateful or allocation-sensitive callables can implement `Function`
-directly and be wrapped with `FnValue::new`/`FnValue::exact`.
+directly and be wrapped with `raft_core::RcFn::new`.
 
-The bundled REPL (`repl/src/main.rs`) registers `print` (hint `(0, None)`)
-and `quit` (hint `(0, Some(0))`) this way.
+The bundled REPL (`repl/src/main.rs`) registers `print`, `debugfmt`,
+`quit` and `import` this way.
 
 ### Execution modes: AST walking and bytecode
 
@@ -417,11 +437,11 @@ application), so AST-interpreted code can call bytecode functions and vice
 versa, and host functions work from both. Anything the compiler rejects
 falls back to the tree walker transparently.
 
-Compiled functions share a per-runtime `VmContext` (`Runtime::vm`):
-constants, variable names and patterns are interned once across all
-functions, and every compiled frame executes on the context's single
-operand stack instead of allocating its own. That stack is public —
-`rt.vm.stack` — so a host function called from compiled code can inspect
+Compiled functions share a per-runtime `Context` (`Runtime::ctx`):
+constants, variable/atom names and patterns are interned once across all
+functions, and every compiled frame executes on the runtime's single
+operand stack instead of allocating its own. `Runtime::stack()` hands out
+a view over it, so a host function called from compiled code can inspect
 the caller's live temporaries (mutate them at your own risk).
 
 The REPL compiles functions by default; pass `--no-vm` to stay on the tree
@@ -438,6 +458,15 @@ Raft is under active development. Notable gaps today:
   different parameter pattern, is planned (see
   [No user-defined types](#no-user-defined-types)).
 - No standard library.
+- No host-side freeze/immutability for lists or records (see
+  [Mutability](#mutability)).
+- A custom atom's printed form (`Display`/`Debug`) doesn't resolve back to
+  its source name (`Pos`, `Done`, ...) outside of `raft-runtime`, which
+  keeps its own name table for this — `raft-core`'s `Val` is host-agnostic
+  and has no such table built in.
+- A third execution mode, transpiling Raft to Rust (compiled into a
+  `cdylib`, or bundled straight into the host binary), doesn't exist yet;
+  `Val`'s tagged-pointer representation is designed to support it.
 
 Contributions and ideas are welcome while the language design is still
 taking shape.
