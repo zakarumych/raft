@@ -75,6 +75,7 @@ pub type PushFn = unsafe extern "C" fn(VoidPtr, RawVal);
 pub type PopFn = unsafe extern "C" fn(VoidPtr) -> RawVal;
 pub type StackGrowFn = unsafe extern "C" fn(*mut RawStack, usize);
 pub type CallFn = unsafe extern "C" fn(VoidPtr, usize, *mut RawHost) -> usize;
+pub type ResumeFn = unsafe extern "C" fn(VoidPtr, *mut RawHost);
 
 #[repr(C, align(16))]
 pub struct AnyVTable {
@@ -125,6 +126,12 @@ pub struct FnVTable {
     pub call: CallFn,
 }
 
+#[repr(C, align(16))]
+pub struct GenVTable {
+    pub any: AnyVTable,
+    pub resume: ResumeFn,
+}
+
 /// Bits occupied by the MASK_TAG_* values in a ValTag.
 pub const MASK_BITS: usize = 0b1111;
 
@@ -155,6 +162,9 @@ pub const MASK_TAG_FN: usize = 0b1100;
 
 /// ValTag contains vtable for opaque object.
 pub const MASK_TAG_OPAQUE: usize = 0b1101;
+
+/// ValTag contains vtable for generator object.
+pub const MASK_TAG_GEN: usize = 0b1110;
 
 #[repr(C)]
 pub struct RawTag {

@@ -9,7 +9,7 @@ use core::{cell::RefCell, cmp::Ordering, fmt, mem::ManuallyDrop};
 
 use smallvec::SmallVec;
 
-use raft_ast::{BinOpKind, Expr, ExprKind, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
+use raft_ast::{BinOpKind, Expr, ExprKind, FnCat, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
 
 use crate::vm::CompiledPat;
 
@@ -71,7 +71,7 @@ pub fn new_list(elements: Vec<Val>) -> Val {
 }
 
 pub fn new_record(fields: FixedHashMap<RcStr, Val>) -> Val {
-    Val::from(ValEnum::Record(RcRecord::new(fields.into_iter().collect())))
+    Val::from(ValEnum::Record(RcRecord::new(fields)))
 }
 
 /// Wrap exported bindings into a module object (a plain record).
@@ -156,6 +156,297 @@ fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
         body,
         parent,
     })))
+}
+
+/// A `gen fn` executed by walking its AST body. Calling it with a full
+/// argument set doesn't run the body - it binds the arguments into a fresh
+/// frame and returns a generator object ([`AstGenerator`]) suspended at
+/// the body's first statement. Partial application works exactly as for
+/// ordinary functions (handled by the generic dispatch before `call`).
+struct AstGenFn {
+    params: Rc<[Pat]>,
+    body: Rc<[Stmt]>,
+    /// Parent frame.
+    parent: Rc<Frame>,
+}
+
+impl Function for AstGenFn {
+    fn min_args(&self) -> usize {
+        self.params.len()
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(self.params.len())
+    }
+
+    fn call(&self, host: &mut raft_core::rc::Host, args: usize) {
+        // SAFETY: as `AstFn::call`'s.
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+
+        debug_assert!(rt.stack().len() >= args);
+        debug_assert_eq!(args, self.params.len());
+
+        let frame = Rc::new(Frame::new().with_parent(self.parent.clone()));
+
+        // first argument is on top of the stack
+        for param in self.params.iter() {
+            let arg = rt.stack().pop();
+            if let Err(e) = rt.bind_pattern(param, &arg, &frame) {
+                rt.set_error(e);
+                return;
+            }
+        }
+
+        let generator = AstGenerator {
+            frame,
+            state: RefCell::new(GenState::Suspended(alloc::vec![GenFrame::Block {
+                stmts: self.body.clone(),
+                idx: 0,
+            }])),
+        };
+        rt.stack()
+            .push(Val::from(ValEnum::Gen(RcGen::new(generator))));
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen fn {:?} {{ ... }}>", self.params)
+    }
+}
+
+fn gen_fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
+    Val::from(ValEnum::Fn(RcFn::new(AstGenFn {
+        params,
+        body,
+        parent,
+    })))
+}
+
+/// One resume point of a suspended walker generator. A generator suspends
+/// only at statement boundaries (`yield` is a statement), so the whole
+/// continuation is a stack of these: which statement of which block runs
+/// next, plus the live loop state (`while` re-checks its condition,
+/// `for` holds its iterator) for every loop enclosing the yield.
+enum GenFrame {
+    /// Execution continues at `stmts[idx]`; the block is done past the end.
+    Block { stmts: Rc<[Stmt]>, idx: usize },
+    /// An active `while` loop - `stmts[idx]` is the `while` statement
+    /// itself. Stepped whenever it's on top: re-evaluate the condition,
+    /// push the body block (truthy) or replace self with the `else` block
+    /// (falsey). `break` pops it directly, skipping the `else`.
+    While { stmts: Rc<[Stmt]>, idx: usize },
+    /// An active `for` loop - `stmts[idx]` is the `for` statement itself,
+    /// `iter` its live iterator.
+    For {
+        stmts: Rc<[Stmt]>,
+        idx: usize,
+        iter: ValsIter,
+    },
+}
+
+enum GenState {
+    Suspended(Vec<GenFrame>),
+    /// Finished (returned, ran off the end, failed), or currently
+    /// executing - a re-entrant resume through the body's own calls sees
+    /// `Done` and reports exhaustion instead of aliasing the live state.
+    Done,
+}
+
+/// A live generator created by calling an [`AstGenFn`]: the locals frame
+/// (arguments bound, persists across resumes) and the suspended
+/// continuation.
+struct AstGenerator {
+    frame: Rc<Frame>,
+    state: RefCell<GenState>,
+}
+
+impl Generator for AstGenerator {
+    fn resume(&self, host: &mut raft_core::rc::Host) {
+        // SAFETY: as `AstFn::call`'s.
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+
+        let state = core::mem::replace(&mut *self.state.borrow_mut(), GenState::Done);
+        let GenState::Suspended(mut frames) = state else {
+            rt.stack().push(Val::from(ValEnum::Uninit));
+            return;
+        };
+
+        match self.step(rt, &mut frames) {
+            Ok(Some(v)) => {
+                *self.state.borrow_mut() = GenState::Suspended(frames);
+                rt.stack().push(v);
+            }
+            // finished - state stays Done
+            Ok(None) => rt.stack().push(Val::from(ValEnum::Uninit)),
+            Err(e) => {
+                rt.set_error(e);
+                rt.stack().push(Val::from(ValEnum::Uninit));
+            }
+        }
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen {{ ... }}>")
+    }
+}
+
+impl AstGenerator {
+    /// Run until the next `yield` (`Ok(Some(value))`) or the generator's
+    /// end (`Ok(None)`): an explicit statement machine over `frames`, so
+    /// suspension is a plain early return with the continuation intact.
+    /// Control statements are stepped here; everything that can't suspend
+    /// (expressions, assignments, nested `fn` definitions) delegates to
+    /// the ordinary walker.
+    fn step(
+        &self,
+        rt: &mut Runtime,
+        frames: &mut Vec<GenFrame>,
+    ) -> Result<Option<Val>, RuntimeError> {
+        loop {
+            let (stmts, idx) = match frames.last_mut() {
+                None => return Ok(None),
+                Some(GenFrame::Block { stmts, idx }) => {
+                    if *idx >= stmts.len() {
+                        frames.pop();
+                        continue;
+                    }
+                    let at = *idx;
+                    *idx += 1;
+                    (stmts.clone(), at)
+                }
+                Some(GenFrame::While { stmts, idx }) => {
+                    let (stmts, at) = (stmts.clone(), *idx);
+                    let StmtKind::While {
+                        cond, body, else_branch, ..
+                    } = stmts[at].kind() else {
+                        unreachable!("GenFrame::While must point at a while statement")
+                    };
+                    let cv = rt.eval(cond, &self.frame)?;
+                    if is_falsey(&cv) {
+                        frames.pop();
+                        if let Some(eb) = else_branch {
+                            frames.push(GenFrame::Block {
+                                stmts: eb.clone(),
+                                idx: 0,
+                            });
+                        }
+                    } else {
+                        frames.push(GenFrame::Block {
+                            stmts: body.clone(),
+                            idx: 0,
+                        });
+                    }
+                    continue;
+                }
+                Some(GenFrame::For { stmts, idx, iter }) => {
+                    let (stmts, at) = (stmts.clone(), *idx);
+                    let StmtKind::For {
+                        target, body, else_branch, ..
+                    } = stmts[at].kind() else {
+                        unreachable!("GenFrame::For must point at a for statement")
+                    };
+                    match iter.next(&mut rt.as_host()) {
+                        Some(item) => {
+                            rt.bind_pattern(target, &item, &self.frame)?;
+                            frames.push(GenFrame::Block {
+                                stmts: body.clone(),
+                                idx: 0,
+                            });
+                        }
+                        None => {
+                            // a generator step that failed also reports
+                            // exhaustion - surface its pending error instead
+                            rt.status.clone()?;
+                            frames.pop();
+                            if let Some(eb) = else_branch {
+                                frames.push(GenFrame::Block {
+                                    stmts: eb.clone(),
+                                    idx: 0,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let statement = &stmts[idx];
+            match statement.kind() {
+                StmtKind::Yield(value) => {
+                    let v = match value {
+                        Some(e) => rt.eval(e, &self.frame)?,
+                        None => Val::nil(),
+                    };
+                    return Ok(Some(v));
+                }
+                StmtKind::Return(value) => {
+                    // evaluated for its side effects; a generator's return
+                    // value is discarded (the end is signalled by Uninit)
+                    if let Some(e) = value {
+                        rt.eval(e, &self.frame)?;
+                    }
+                    return Ok(None);
+                }
+                StmtKind::Break => loop {
+                    match frames.pop() {
+                        None => {
+                            return Err(RuntimeError::Other(
+                                "break statement outside of loop".into(),
+                            ));
+                        }
+                        Some(GenFrame::While { .. }) | Some(GenFrame::For { .. }) => break,
+                        Some(GenFrame::Block { .. }) => {}
+                    }
+                },
+                StmtKind::Continue => loop {
+                    match frames.last() {
+                        None => {
+                            return Err(RuntimeError::Other(
+                                "continue statement outside of loop".into(),
+                            ));
+                        }
+                        Some(GenFrame::While { .. }) | Some(GenFrame::For { .. }) => break,
+                        Some(GenFrame::Block { .. }) => {
+                            frames.pop();
+                        }
+                    }
+                },
+                StmtKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let cv = rt.eval_impl(cond, &self.frame, true)?;
+                    if !is_falsey(&cv) {
+                        frames.push(GenFrame::Block {
+                            stmts: then_branch.clone(),
+                            idx: 0,
+                        });
+                    } else if let Some(eb) = else_branch {
+                        frames.push(GenFrame::Block {
+                            stmts: eb.clone(),
+                            idx: 0,
+                        });
+                    }
+                }
+                StmtKind::While { .. } => {
+                    frames.push(GenFrame::While { stmts: stmts.clone(), idx });
+                }
+                StmtKind::For { iterable, .. } => {
+                    let iter_val = rt.eval_impl(iterable, &self.frame, true)?;
+                    let iter = ValsIter::new(&iter_val)?;
+                    frames.push(GenFrame::For {
+                        stmts: stmts.clone(),
+                        idx,
+                        iter,
+                    });
+                }
+                // everything else executes in one step - it can't suspend
+                _ => {
+                    rt.exec_stmt(statement, self.frame.clone())?;
+                }
+            }
+        }
+    }
 }
 
 /// Extension for `raft-ast` node types' `.rc_name()` (which returns
@@ -296,8 +587,11 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) => collect_reads_expr(e, out),
-        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) => collect_reads_expr(e, out),
+        StmtKind::Return(None)
+        | StmtKind::Yield(None)
+        | StmtKind::Break
+        | StmtKind::Continue => {}
         StmtKind::Fn { params, body, .. } => {
             out.extend(fn_outer_names(params, body));
         }
@@ -431,6 +725,7 @@ impl SlotTable {
             | StmtKind::AssignField { .. }
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
+            | StmtKind::Yield(_)
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -847,7 +1142,7 @@ impl Runtime {
     /// comment) - this is the cast `AstFn`/`vm::CompiledFn`'s
     /// `Function::call` reverses via `Host::as_raw`.
     #[inline]
-    fn as_host(&mut self) -> raft_core::rc::Host<'_> {
+    pub fn as_host(&mut self) -> raft_core::rc::Host<'_> {
         unsafe { raft_core::rc::Host::from_raw(self as *mut Runtime as *mut ffi::RawHost) }
     }
 
@@ -865,8 +1160,39 @@ impl Runtime {
     }
 
     #[cold]
+    #[inline]
     pub fn set_error(&mut self, err: RuntimeError) {
         self.status = Err(err);
+    }
+
+    #[inline]
+    pub fn try_<T>(&mut self, f: impl FnOnce() -> Result<T, RuntimeError>) -> Option<T> {
+        if self.status.is_err() {
+            return None;
+        }
+
+        match f() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.set_error(e);
+                None
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_with<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, RuntimeError>) -> Option<T> {
+        if self.status.is_err() {
+            return None;
+        }
+
+        match f(self) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.set_error(e);
+                None
+            }
+        }
     }
 
     /// Take (and clear) the pending error status, if any.
@@ -1175,7 +1501,7 @@ impl Runtime {
                 then_branch,
                 else_branch,
             } => {
-                let cv = self.eval_impl(cond, &frame, false)?;
+                let cv = self.eval_impl(cond, &frame, true)?;
                 if !is_falsey(&cv) {
                     self.exec_block(then_branch, frame.clone())
                 } else {
@@ -1191,7 +1517,7 @@ impl Runtime {
                 body,
                 else_branch,
             } => loop {
-                let cv = self.eval_impl(cond, &frame, false)?;
+                let cv = self.eval_impl(cond, &frame, true)?;
                 if is_falsey(&cv) {
                     if let Some(eb) = else_branch {
                         break self.exec_block(eb, frame.clone());
@@ -1211,10 +1537,16 @@ impl Runtime {
                 body,
                 else_branch,
             } => {
-                let iter_val = self.eval_impl(iterable, &frame, false)?;
-                let values = iter_val.iter()?;
+                let iter_val = self.eval_impl(iterable, &frame, true)?;
+                let mut values = ValsIter::new(&iter_val)?;
 
-                for value in values {
+                loop {
+                    let Some(value) = values.next(&mut self.as_host()) else {
+                        // a generator step that failed also reports
+                        // exhaustion - surface its pending error instead
+                        self.status.clone()?;
+                        break;
+                    };
                     self.bind_pattern(target, &value, &frame)?;
 
                     match self.exec_block(body, frame.clone())? {
@@ -1236,26 +1568,60 @@ impl Runtime {
                 let v = self.eval_impl(expr, &frame, false)?;
                 Ok(Exec::Return(v))
             }
+            StmtKind::Yield(_) => Err(RuntimeError::Other(
+                "yield statement outside of generator".into(),
+            )),
             StmtKind::Break => Ok(Exec::Break),
             StmtKind::Continue => Ok(Exec::Continue),
-            StmtKind::Fn { name, params, body } => {
+            StmtKind::Fn {
+                cat,
+                name,
+                params,
+                body,
+            } => {
                 let name = self.ctx.string(name.name());
                 frame.set_var(name, Val::nil());
 
-                let fval = if self.compile_fns {
-                    match vm::compile_fn(
-                        self,
-                        params.clone(),
-                        body,
-                        vm::CompileParent::Walked(frame.clone()),
-                        &[],
-                    ) {
-                        Ok((compiled, _schema)) => compiled.into_function(),
-                        // constructs the compiler rejects still run on the AST walker
-                        Err(_) => fn_from_ast(params.clone(), body.clone(), frame.clone()),
+                let fval = match cat {
+                    FnCat::Normal => {
+                        if self.compile_fns {
+                            match vm::compile_fn(
+                                self,
+                                params.clone(),
+                                body,
+                                vm::CompileParent::Walked(frame.clone()),
+                                &[],
+                            ) {
+                                Ok((compiled, _schema)) => compiled.into_function(),
+                                // constructs the compiler rejects still run on the AST walker
+                                Err(_) => fn_from_ast(params.clone(), body.clone(), frame.clone()),
+                            }
+                        } else {
+                            fn_from_ast(params.clone(), body.clone(), frame.clone())
+                        }
                     }
-                } else {
-                    fn_from_ast(params.clone(), body.clone(), frame.clone())
+                    FnCat::Generator => {
+                        if self.compile_fns {
+                            match vm::compile_gen_fn(
+                                self,
+                                params.clone(),
+                                body,
+                                vm::CompileParent::Walked(frame.clone()),
+                            ) {
+                                Ok(compiled) => compiled,
+                                Err(_) => {
+                                    gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                                }
+                            }
+                        } else {
+                            gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                        }
+                    }
+                    FnCat::Async | FnCat::AsyncGenerator => {
+                        return Err(RuntimeError::Other(
+                            "async functions are not implemented yet".into(),
+                        ));
+                    }
                 };
 
                 frame.set_var(name, fval);

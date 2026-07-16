@@ -2,8 +2,8 @@ use alloc::rc::Rc;
 use core::fmt;
 
 use crate::{
-    Atom, BinOp, BinOpKind, Expr, ExprKind, ExprRecordField, Ident, Lit, Module, Pat, PatKind,
-    PatRecordField, Span, Stmt, StmtKind, UnOp, UnOpKind, Export,
+    Atom, BinOp, BinOpKind, Export, Expr, ExprKind, ExprRecordField, FnCat, Ident, Lit, Module,
+    Pat, PatKind, PatRecordField, Span, Stmt, StmtKind, UnOp, UnOpKind,
 };
 
 use raft_lexer::{Spacing, SpannedSource, Token};
@@ -82,6 +82,10 @@ pub enum Keyword {
     In,
     Fn,
     Export,
+    Yield,
+    Gen,
+    Async,
+    Await,
 }
 
 impl Keyword {
@@ -97,6 +101,10 @@ impl Keyword {
             "in" => Some(Keyword::In),
             "fn" => Some(Keyword::Fn),
             "export" => Some(Keyword::Export),
+            "yield" => Some(Keyword::Yield),
+            "gen" => Some(Keyword::Gen),
+            "async" => Some(Keyword::Async),
+            "await" => Some(Keyword::Await),
             _ => None,
         }
     }
@@ -1321,6 +1329,23 @@ impl Stmt {
                         kind: StmtKind::Return(Some(expr)),
                     });
                 }
+                Keyword::Yield => {
+                    stream.advance();
+                    stream.skip_comments();
+
+                    if let Some(Token::Newline(_)) | None = stream.peek() {
+                        return Ok(Stmt {
+                            span: kw_span,
+                            kind: StmtKind::Yield(None),
+                        });
+                    }
+
+                    let expr = Expr::parse(stream)?;
+                    return Ok(Stmt {
+                        span: kw_span.join(expr.span),
+                        kind: StmtKind::Yield(Some(expr)),
+                    });
+                }
                 Keyword::Break => {
                     stream.advance();
                     return Ok(Stmt {
@@ -1361,6 +1386,22 @@ impl Stmt {
                         kind: StmtKind::Return(Some(expr)),
                     });
                 }
+                Keyword::Yield => {
+                    stream.advance();
+                    stream.skip_comments();
+                    if let Some(Token::Newline(_)) | None = stream.peek() {
+                        return Ok(Stmt {
+                            span: kw_span,
+                            kind: StmtKind::Yield(None),
+                        });
+                    }
+
+                    let expr = Expr::parse(stream)?;
+                    return Ok(Stmt {
+                        span: kw_span.join(expr.span),
+                        kind: StmtKind::Yield(Some(expr)),
+                    });
+                }
                 Keyword::Break => {
                     stream.advance();
                     return Ok(Stmt {
@@ -1389,7 +1430,15 @@ impl Stmt {
                 }
                 Keyword::Fn => {
                     stream.advance();
-                    return Self::parse_fn(stream, kw_span);
+                    return Self::parse_fn(stream, FnCat::Normal, kw_span);
+                }
+                Keyword::Gen => {
+                    stream.advance();
+                    return Self::parse_gen(stream, false, kw_span);
+                }
+                Keyword::Async => {
+                    stream.advance();
+                    return Self::parse_async(stream, kw_span);
                 }
                 _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }
@@ -1552,7 +1601,7 @@ impl Stmt {
         })
     }
 
-    pub fn parse_fn(stream: &mut TokenStream, fn_span: Span) -> ParseResult<Self> {
+    pub fn parse_fn(stream: &mut TokenStream, fn_cat: FnCat, fn_span: Span) -> ParseResult<Self> {
         let name = Ident::parse(stream)?;
         let mut params = Vec::new();
 
@@ -1581,11 +1630,84 @@ impl Stmt {
         Ok(Stmt {
             span,
             kind: StmtKind::Fn {
+                cat: fn_cat,
                 name,
                 params: params.into(),
                 body: body.into(),
             },
         })
+    }
+
+    pub fn parse_gen(
+        stream: &mut TokenStream,
+        is_async: bool,
+        gen_span: Span,
+    ) -> ParseResult<Self> {
+        match Keyword::peek(stream) {
+            Some((Keyword::Fn, fn_span)) => {
+                stream.advance();
+                Self::parse_fn(
+                    stream,
+                    if is_async {
+                        FnCat::AsyncGenerator
+                    } else {
+                        FnCat::Generator
+                    },
+                    gen_span.join(fn_span),
+                )
+            }
+            Some((_, kw_span)) => {
+                return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));
+            }
+            None => {
+                match stream.peek() {
+                    None => {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedEndOfInput,
+                            stream.end_span(),
+                        ));
+                    }
+                    Some(tok) => {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            tok.span(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn parse_async(stream: &mut TokenStream, async_span: Span) -> ParseResult<Self> {
+        match Keyword::peek(stream) {
+            Some((Keyword::Fn, fn_span)) => {
+                stream.advance();
+                Self::parse_fn(stream, FnCat::Async, async_span.join(fn_span))
+            }
+            Some((Keyword::Gen, gen_span)) => {
+                stream.advance();
+                Self::parse_gen(stream, true, async_span.join(gen_span))
+            }
+            Some((_, kw_span)) => {
+                return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));
+            }
+            None => {
+                match stream.peek() {
+                    None => {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedEndOfInput,
+                            stream.end_span(),
+                        ));
+                    }
+                    Some(tok) => {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            tok.span(),
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 

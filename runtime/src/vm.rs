@@ -43,7 +43,7 @@ use alloc::{
 use core::{cell::RefCell, fmt};
 use smallvec::SmallVec;
 
-use raft_ast::{BinOpKind, Expr, ExprKind, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
+use raft_ast::{BinOpKind, Expr, ExprKind, FnCat, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
 
 use crate::{
     Atom, ConstId, Context, FixedHashMap, Frame, Number, PatId, RcStrName, Runtime,
@@ -51,7 +51,7 @@ use crate::{
     atom_val, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
     new_list, new_record,
 };
-use raft_core::{Function, RcFn, RcStr, rc};
+use raft_core::{Function, Generator, RcFn, RcGen, RcStr, ValsIter, rc};
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
 /// (never a global pool - a nested `fn` is only ever referenced from the
@@ -124,6 +124,10 @@ pub enum Instr {
     IterPop,
     /// `v →` - pop the return value and leave the function.
     Return,
+    /// `v →` - suspend the enclosing generator frame, handing `v` to
+    /// whoever resumed it. Only ever emitted into `gen fn` bodies; the
+    /// resume continues right after this instruction.
+    Yield,
     /// `→` - unconditional jump to code index `t`.
     Jump(u32),
     /// `c →` - pop; jump to `t` if the value is falsey.
@@ -244,9 +248,10 @@ mod opcode {
     pub const ITER_INIT: u8 = SET_INDEX + 1;
     pub const ITER_POP: u8 = ITER_INIT + 1;
     pub const RETURN: u8 = ITER_POP + 1;
+    pub const YIELD: u8 = RETURN + 1;
 
     /// Fixed 4-byte little-endian byte-offset operand.
-    pub const JUMP: u8 = RETURN + 1;
+    pub const JUMP: u8 = YIELD + 1;
     pub const JUMP_IF_FALSE: u8 = JUMP + 1;
     pub const ITER_NEXT: u8 = JUMP_IF_FALSE + 1;
 
@@ -579,7 +584,8 @@ fn instr_len(i: &Instr) -> usize {
         | Instr::SetIndex
         | Instr::IterInit
         | Instr::IterPop
-        | Instr::Return => 0,
+        | Instr::Return
+        | Instr::Yield => 0,
     }
 }
 
@@ -675,6 +681,7 @@ pub fn encode(instrs: &[Instr]) -> Code {
             }
             Instr::IterPop => bytes.push(opcode::ITER_POP),
             Instr::Return => bytes.push(opcode::RETURN),
+            Instr::Yield => bytes.push(opcode::YIELD),
             Instr::LoadCap(slot) => push_op(&mut bytes, opcode::LOAD_CAP, slot.0),
             Instr::StoreCap(slot) => push_op(&mut bytes, opcode::STORE_CAP, slot.0),
             Instr::MakeClosure(t) => push_wop(&mut bytes, opcode::MAKE_CLOSURE, t.0),
@@ -816,6 +823,7 @@ impl Code {
                 opcode::ITER_INIT => Instr::IterInit,
                 opcode::ITER_POP => Instr::IterPop,
                 opcode::RETURN => Instr::Return,
+                opcode::YIELD => Instr::Yield,
                 opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
                 opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
                 opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
@@ -1252,6 +1260,10 @@ pub struct FnTemplate {
     /// attaches that frame directly or skips straight past it to whatever
     /// the defining function's own `outer` already is.
     needs_own_frame: bool,
+    /// Whether this template is a `gen fn` - `Instr::MakeClosure` then
+    /// wraps the instantiated [`CompiledFn`] as a gen-fn value (calling it
+    /// builds a suspended [`VmGenerator`]) instead of a plain function.
+    is_gen: bool,
     /// This function's own nested `fn`s, carried through so the
     /// instantiated [`CompiledFn`] has them too (see `CompiledFn::consts`/
     /// `CompiledFn::templates`) - shared, not copied, across every
@@ -1272,6 +1284,17 @@ impl CompiledFn {
     #[inline]
     pub fn into_function(self) -> Val {
         Val::from(ValEnum::Fn(RcFn::new(self)))
+    }
+
+    /// Wrap into a first-class gen-fn value: same currying/partial
+    /// application as [`into_function`](CompiledFn::into_function), but a
+    /// full application builds a suspended [`VmGenerator`] over this code
+    /// instead of running it.
+    #[inline]
+    pub fn into_gen_function(self) -> Val {
+        Val::from(ValEnum::Fn(RcFn::new(CompiledGenFn {
+            f: rc::Rc::new(self),
+        })))
     }
 
     /// Resolve slot `slot` against this function's own enclosing scope -
@@ -1437,6 +1460,32 @@ pub fn compile_fn(
     parent: CompileParent,
     force_captured: &[RcStr],
 ) -> Result<(CompiledFn, Rc<Schema>), CompileError> {
+    compile_fn_impl(rt, params, body, parent, force_captured, false)
+}
+
+/// Compile a `gen fn` to bytecode and wrap it as a first-class gen-fn
+/// value: calling it with a full argument set builds a suspended
+/// [`VmGenerator`] instead of running the body. Falls back (via the
+/// returned error) to the walker's [`AstGenFn`]-equivalent on any
+/// construct the compiler rejects, exactly like ordinary functions.
+pub fn compile_gen_fn(
+    rt: &mut Runtime,
+    params: Rc<[Pat]>,
+    body: &[Stmt],
+    parent: CompileParent,
+) -> Result<Val, CompileError> {
+    let (compiled, _schema) = compile_fn_impl(rt, params, body, parent, &[], true)?;
+    Ok(compiled.into_gen_function())
+}
+
+fn compile_fn_impl(
+    rt: &mut Runtime,
+    params: Rc<[Pat]>,
+    body: &[Stmt],
+    parent: CompileParent,
+    force_captured: &[RcStr],
+    is_gen: bool,
+) -> Result<(CompiledFn, Rc<Schema>), CompileError> {
     let arity = params.len() as u32;
     let mut slots = SlotTable::with_params(&params);
     slots.add_stmts(body);
@@ -1514,6 +1563,7 @@ pub fn compile_fn(
         nested_consts: Vec::new(),
         nested_templates: Vec::new(),
         template_refs: Vec::new(),
+        is_gen,
     };
 
     // prologue: unpack destructuring parameters out of their argument
@@ -1537,6 +1587,14 @@ pub fn compile_fn(
                 c.emit(Instr::Bind(pattern));
             }
         }
+    }
+
+    // a generator's parameter binding must run (and fail) at creation
+    // time, like the walker's and the transpiler's - end the prologue with
+    // a marker yield the creation call primes to and discards
+    if is_gen {
+        c.emit(Instr::Nil);
+        c.emit(Instr::Yield);
     }
 
     // the body is compiled in tail position: exactly one value - the
@@ -1732,6 +1790,10 @@ struct Compiler<'a> {
     /// `nested_templates` by local (unshifted) index, patched to the final
     /// flat index once `nested_consts` stops growing.
     template_refs: Vec<usize>,
+    /// Whether this body is a `gen fn`'s - the only place `yield` compiles;
+    /// anywhere else it's a compile error (and, through the walker
+    /// fallback, a runtime error).
+    is_gen: bool,
 }
 
 impl Compiler<'_> {
@@ -2063,6 +2125,24 @@ impl Compiler<'_> {
                 }
                 self.emit(Instr::Return);
             }
+            StmtKind::Yield(value) => {
+                if !self.is_gen {
+                    return Err(CompileError::new(
+                        statement.span(),
+                        "yield statement outside of generator",
+                    ));
+                }
+                match value {
+                    Some(e) => self.compile_expr(e, true)?,
+                    None => {
+                        self.emit(Instr::Nil);
+                    }
+                }
+                self.emit(Instr::Yield);
+                if tail {
+                    self.emit(Instr::Nil); // a yield statement's own value is nil
+                }
+            }
             StmtKind::Break => {
                 let Some((in_for, loop_tail)) = self.loops.last().map(|l| (l.in_for, l.tail))
                 else {
@@ -2092,7 +2172,22 @@ impl Compiler<'_> {
                 };
                 self.emit(Instr::Jump(continue_to));
             }
-            StmtKind::Fn { name, params, body } => {
+            StmtKind::Fn {
+                cat,
+                name,
+                params,
+                body,
+            } => {
+                let child_is_gen = match cat {
+                    FnCat::Normal => false,
+                    FnCat::Generator => true,
+                    FnCat::Async | FnCat::AsyncGenerator => {
+                        return Err(CompileError::new(
+                            statement.span(),
+                            "async functions are not implemented yet",
+                        ));
+                    }
+                };
                 // does the nested fn (or something nested *inside* it,
                 // transitively - `fn_outer_names` already recurses)
                 // actually read one of *this* function's own names? Owning
@@ -2121,7 +2216,7 @@ impl Compiler<'_> {
                     self.ancestors.clone()
                 };
 
-                let (compiled, _schema) = compile_fn(
+                let (compiled, _schema) = compile_fn_impl(
                     self.rt,
                     params.clone(),
                     body,
@@ -2130,6 +2225,7 @@ impl Compiler<'_> {
                         walked_tail: self.walked_tail,
                     },
                     &[],
+                    child_is_gen,
                 )?;
 
                 // does the nested fn read anything not bound within
@@ -2152,6 +2248,7 @@ impl Compiler<'_> {
                         fallback: compiled.fallback,
                         owns_frame: compiled.owns_frame,
                         needs_own_frame: needs_own_schema,
+                        is_gen: child_is_gen,
                         consts: compiled.consts,
                         templates: compiled.templates,
                     };
@@ -2166,7 +2263,11 @@ impl Compiler<'_> {
                     // consts occupy the flat range 0..consts.len() and
                     // never move, so this index is final immediately
                     let idx = self.nested_consts.len() as u32;
-                    self.nested_consts.push(compiled.into_function());
+                    self.nested_consts.push(if child_is_gen {
+                        compiled.into_gen_function()
+                    } else {
+                        compiled.into_function()
+                    });
                     self.emit(Instr::MakeClosure(FnId(idx)));
                 }
 
@@ -2354,6 +2455,20 @@ fn make_own_frame(f: &CompiledFn) -> Rc<CompiledFrame> {
     })
 }
 
+/// How a frame left [`run_frame`]: an ordinary return (the result is on
+/// the stack, the frame's slots are gone), or a `yield` out of a generator
+/// frame (the yielded value is on top of the *intact* frame, and `pc` is
+/// where a resume continues).
+enum FrameExit {
+    Return,
+    Yield { pc: usize },
+}
+
+/// The live `for`-iterator stack of one frame. Owned by the caller (not a
+/// `run_frame` local) so a suspending generator frame can carry its open
+/// iterators across yields.
+type IterStack = SmallVec<[ValsIter; 2]>;
+
 pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     // the caller's arguments are already on the stack and become the
     // frame's first slots; reserve the rest for body-introduced locals
@@ -2366,9 +2481,23 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     // - none of this function's calls share captured state with another
     let own = f.owns_frame.then(|| make_own_frame(f));
 
-    let result = run_frame(rt, &f.code.bytes, base, f, own.as_ref());
+    let mut iters = IterStack::new();
+    let result = run_frame(rt, &f.code.bytes, base, f, own.as_ref(), 0, &mut iters)
+        .map(expect_return)?;
     debug_assert!(rt.stack().len() >= base);
     result
+}
+
+/// A non-generator frame can only leave through `Return` - `Instr::Yield`
+/// is never emitted outside a `gen fn` body, and gen-fn code only ever
+/// runs inside [`VmGenerator::resume`].
+fn expect_return(exit: FrameExit) -> Result<(), RuntimeError> {
+    match exit {
+        FrameExit::Return => Ok(()),
+        FrameExit::Yield { .. } => Err(RuntimeError::Other(
+            "vm: yield outside of a generator frame".into(),
+        )),
+    }
 }
 
 /// Run a compiled module body (a zero-arg [`CompiledFn`] whose `export`
@@ -2384,7 +2513,8 @@ pub fn run_module(rt: &mut Runtime, f: &CompiledFn) -> Result<Option<Rc<Compiled
 
     let own = f.owns_frame.then(|| make_own_frame(f));
 
-    run_frame(rt, &f.code.bytes, base, f, own.as_ref())?;
+    let mut iters = IterStack::new();
+    run_frame(rt, &f.code.bytes, base, f, own.as_ref(), 0, &mut iters).map(expect_return)??;
     rt.stack().pop();
     debug_assert_eq!(rt.stack().len(), base);
     Ok(own)
@@ -2408,20 +2538,176 @@ pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<()
 
     let own = f.owns_frame.then(|| make_own_frame(f));
 
-    let result = run_frame(rt, code, base, f, own.as_ref());
+    let mut iters = IterStack::new();
+    let result =
+        run_frame(rt, code, base, f, own.as_ref(), 0, &mut iters).map(expect_return)?;
     debug_assert!(rt.stack().len() >= base);
     result
 }
 
+/// A compiled `gen fn` as a first-class function value. Calling it with a
+/// full argument set never runs the body: it captures the arguments (plus
+/// room for the body's locals) as a suspended frame image and pushes a
+/// [`VmGenerator`] over them. Partial application is handled by the
+/// generic dispatch before `call`, exactly as for [`CompiledFn`].
+struct CompiledGenFn {
+    f: rc::Rc<CompiledFn>,
+}
+
+impl Function for CompiledGenFn {
+    #[inline]
+    fn min_args(&self) -> usize {
+        self.f.arity()
+    }
+
+    #[inline]
+    fn max_args(&self) -> Option<usize> {
+        Some(self.f.arity())
+    }
+
+    fn call(&self, host: &mut rc::Host, args: usize) {
+        debug_assert_eq!(args, self.f.arity());
+
+        // SAFETY: as `AstFn::call`'s.
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+
+        // move the arguments off the operand stack into the generator's
+        // saved frame image (same bottom-to-top order a live frame has),
+        // and reserve the body's locals - the first resume then enters at
+        // pc 0 exactly like a fresh call frame
+        let mut stack =
+            alloc::vec![Val::from(ValEnum::Uninit); args + self.f.frame_size as usize];
+        rt.stack().drain_top_into(&mut stack[..args]);
+
+        // the reified frame for captured locals is per-generator, not
+        // per-resume: closures made before a yield keep seeing the same
+        // captured state after it
+        let own = self.f.owns_frame.then(|| make_own_frame(&self.f));
+
+        let generator = VmGenerator {
+            f: self.f.clone(),
+            own,
+            state: RefCell::new(VmGenState::Suspended {
+                pc: 0,
+                stack,
+                iters: IterStack::new(),
+            }),
+        };
+
+        // prime to the prologue's marker yield: parameter binding runs
+        // (and fails) now, at creation, matching the walker/transpiler
+        generator.resume(&mut rt.as_host());
+        let marker = rt.stack().pop();
+        debug_assert!(
+            rt.status.is_err() || matches!(marker.unpack(), ValEnum::Atom(Atom::Nil)),
+            "gen prologue must yield the Nil marker"
+        );
+        if rt.status.is_err() {
+            // a failed callee pushes no result (see `Function::call`)
+            return;
+        }
+
+        rt.stack()
+            .push(Val::from(ValEnum::Gen(RcGen::new(generator))));
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen fn {}>", self.f.arity())
+    }
+}
+
+enum VmGenState {
+    /// Between resumes: where to continue, the frame image (slots plus
+    /// operand temporaries live at the yield), and the open `for`
+    /// iterators.
+    Suspended {
+        pc: usize,
+        stack: Vec<Val>,
+        iters: IterStack,
+    },
+    /// Finished (returned, ran off the end, failed), or currently
+    /// executing - a re-entrant resume through the body's own calls sees
+    /// `Done` and reports exhaustion instead of aliasing the live state.
+    Done,
+}
+
+/// A live generator over compiled code: on each resume the saved frame
+/// image is pushed back onto the shared operand stack, the dispatch loop
+/// re-enters at the saved `pc`, and a `Yield` exit peels the frame back
+/// off into the state for the next resume.
+struct VmGenerator {
+    f: rc::Rc<CompiledFn>,
+    own: Option<Rc<CompiledFrame>>,
+    state: RefCell<VmGenState>,
+}
+
+impl Generator for VmGenerator {
+    fn resume(&self, host: &mut rc::Host) {
+        // SAFETY: as `AstFn::call`'s.
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+
+        let state = core::mem::replace(&mut *self.state.borrow_mut(), VmGenState::Done);
+        let VmGenState::Suspended {
+            pc,
+            stack,
+            mut iters,
+        } = state
+        else {
+            rt.stack().push(Val::from(ValEnum::Uninit));
+            return;
+        };
+
+        let base = rt.stack().len();
+        rt.stack().extend(stack);
+
+        match run_frame(
+            rt,
+            &self.f.code.bytes,
+            base,
+            &self.f,
+            self.own.as_ref(),
+            pc,
+            &mut iters,
+        ) {
+            Ok(FrameExit::Yield { pc }) => {
+                // top of stack: the yielded value; under it, the intact
+                // frame image to save for the next resume
+                let yielded = rt.stack().pop();
+                let mut stack = alloc::vec![Val::from(ValEnum::Uninit); rt.stack().len() - base];
+                rt.stack().drain_top_into(&mut stack);
+                *self.state.borrow_mut() = VmGenState::Suspended { pc, stack, iters };
+                rt.stack().push(yielded);
+            }
+            Ok(FrameExit::Return) => {
+                // Return already truncated the frame; its value is
+                // discarded - a generator's end is signalled by Uninit
+                rt.stack().pop();
+                rt.stack().push(Val::from(ValEnum::Uninit));
+            }
+            Err(e) => {
+                rt.stack().truncate(base);
+                rt.set_error(e);
+                rt.stack().push(Val::from(ValEnum::Uninit));
+            }
+        }
+    }
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen {}>", self.f.arity())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_frame(
     rt: &mut Runtime,
     code: &[u8],
     base: usize,
     f: &CompiledFn,
     own: Option<&Rc<CompiledFrame>>,
-) -> Result<(), RuntimeError> {
-    let mut iters = SmallVec::<[_; 4]>::new();
-    let mut pc: usize = 0;
+    entry_pc: usize,
+    iters: &mut IterStack,
+) -> Result<FrameExit, RuntimeError> {
+    let mut pc: usize = entry_pc;
 
     loop {
         // `pc` is a byte offset; each opcode decodes its own operands
@@ -2556,7 +2842,11 @@ fn run_frame(
                         consts: template.consts.clone(),
                         templates: template.templates.clone(),
                     };
-                    rt.stack().push(child.into_function());
+                    rt.stack().push(if template.is_gen {
+                        child.into_gen_function()
+                    } else {
+                        child.into_function()
+                    });
                 }
             }
             opcode::BIND..opcode::BIND_END => {
@@ -2829,7 +3119,7 @@ fn run_frame(
             }
             opcode::ITER_INIT => {
                 let v = rt.stack().pop();
-                iters.push(v.iter()?.into_iter());
+                iters.push(ValsIter::new(&v)?);
             }
             opcode::ITER_NEXT => {
                 let t = read_u32(code, &mut pc)?;
@@ -2837,9 +3127,12 @@ fn run_frame(
                     core::hint::cold_path();
                     RuntimeError::Other("vm: no active iterator".into())
                 })?;
-                match iter.next() {
+                match iter.next(&mut rt.as_host()) {
                     Some(item) => rt.stack().push(item),
                     None => {
+                        // a generator step that failed also reports
+                        // exhaustion - surface its pending error instead
+                        rt.status.clone()?;
                         iters.pop();
                         pc = t as usize;
                     }
@@ -2854,7 +3147,12 @@ fn run_frame(
                     rt.stack().truncate(base);
                     rt.stack().push(ret);
                 }
-                return Ok(());
+                return Ok(FrameExit::Return);
+            }
+            opcode::YIELD => {
+                // the yielded value stays on top of the intact frame; the
+                // resume continues right after this instruction
+                return Ok(FrameExit::Yield { pc });
             }
             _ => return Err(RuntimeError::Other("vm: unknown opcode".into())),
         }
@@ -4022,5 +4320,254 @@ export { middle }
             panic!("expected value");
         };
         assert_eq!(format!("{v}"), "42");
+    }
+
+    // -----------------------------------------------------------------
+    // Generators
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn generator_yields_in_a_loop() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn count n:
+    i = 0
+    while i < n:
+        yield i
+        i = i + 1
+total = 0
+for x in (count 5):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 10);
+    }
+
+    #[test]
+    fn generator_ends_on_return_and_skips_the_rest() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn g:
+    yield 1
+    yield 2
+    return 99
+    yield 3
+total = 0
+for x in (g):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 3);
+    }
+
+    #[test]
+    fn generator_runs_off_the_end() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn g:
+    yield 7
+    x = 1
+total = 0
+for v in (g):
+    total = total + v
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 7);
+    }
+
+    #[test]
+    fn bare_yield_produces_nil() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn g:
+    yield
+    yield 2
+count = 0
+seen_nil = False
+for v in (g):
+    count = count + 1
+    if v == Nil:
+        seen_nil = True
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "count"), 2);
+        assert_eq!(atom_var(&mut rt, &frame, "seen_nil"), "True");
+    }
+
+    #[test]
+    fn generator_locals_persist_across_yields() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn fib_gen n:
+    a = 0
+    b = 1
+    i = 0
+    while i < n:
+        yield a
+        t = a + b
+        a = b
+        b = t
+        i = i + 1
+last = 0 - 1
+for v in (fib_gen 8):
+    last = v
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "last"), 13);
+    }
+
+    #[test]
+    fn break_out_of_an_infinite_generator() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn naturals:
+    i = 0
+    while True:
+        yield i
+        i = i + 1
+total = 0
+for x in (naturals):
+    if x > 4:
+        break
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 10);
+    }
+
+    #[test]
+    fn yield_inside_for_and_nested_control_flow() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn evens list:
+    for x in list:
+        if (x & 1) == 0:
+            yield x
+        else:
+            continue
+nums = [1, 2, 3, 4, 5, 6]
+total = 0
+for e in (evens nums):
+    total = total + e
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 12);
+    }
+
+    #[test]
+    fn generator_partial_application_and_two_instances() {
+        // under-applying a gen fn curries like any function; two full
+        // applications produce independent generators
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn range a b:
+    i = a
+    while i < b:
+        yield i
+        i = i + 1
+from3 = range 3
+sum1 = 0
+for x in (from3 6):
+    sum1 = sum1 + x
+sum2 = 0
+for x in (from3 5):
+    sum2 = sum2 + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "sum1"), 12);
+        assert_eq!(int_var(&mut rt, &frame, "sum2"), 7);
+    }
+
+    #[test]
+    fn nested_generator_iterating_another_generator() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn inner n:
+    i = 0
+    while i < n:
+        yield i
+        i = i + 1
+gen fn doubled n:
+    for v in (inner n):
+        yield v * 2
+total = 0
+for x in (doubled 4):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 12);
+    }
+
+    #[test]
+    fn generator_defined_inside_a_function_captures_its_locals() {
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make limit:
+    gen fn upto:
+        i = 0
+        while i < limit:
+            yield i
+            i = i + 1
+    return upto
+total = 0
+g = make 4
+for x in (g):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 6);
+    }
+
+    #[test]
+    fn yield_outside_generator_errors_in_both_modes() {
+        for compiled in [false, true] {
+            let (mut rt, frame) = run_mode(
+                "fn f:\n    yield 1\n",
+                compiled,
+            )
+            .expect("defining f itself succeeds");
+            let stmts = ast_from_str("f\n");
+            let err = rt
+                .exec_stmt(&stmts[0], frame.clone())
+                .expect_err("calling a plain fn containing yield must fail");
+            assert!(
+                format!("{err}").contains("yield"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_param_binding_runs_at_creation_in_both_modes() {
+        for compiled in [false, true] {
+            // destructuring a matching argument works...
+            let (mut rt, frame) = run_mode(
+                "gen fn firsts [a, b]:\n    yield a\n    yield b\npair = [7, 9]\ntotal = 0\nfor v in (firsts pair):\n    total = total + v\n",
+                compiled,
+            )
+            .expect("matching destructured gen param works");
+            assert_eq!(int_var(&mut rt, &frame, "total"), 16);
+
+            // ...and a mismatch fails at the creation call itself, before
+            // any iteration
+            let (mut rt, frame) = run_mode(
+                "gen fn firsts [a, b]:\n    yield a\n",
+                compiled,
+            )
+            .expect("defining the generator succeeds");
+            let stmts = ast_from_str("h = firsts 5\n");
+            assert!(
+                rt.exec_stmt(&stmts[0], frame.clone()).is_err(),
+                "creation must fail on a pattern mismatch (compiled={compiled})"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_generator_stays_exhausted() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn g:
+    yield 1
+h = (g)
+first = 0
+for x in h:
+    first = first + x
+second = 0
+for x in h:
+    second = second + 100
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "first"), 1);
+        assert_eq!(int_var(&mut rt, &frame, "second"), 0);
     }
 }

@@ -140,10 +140,8 @@ fn bench_python(c: &mut Criterion, group: &str, defs: &str, call: &str) {
     g.finish();
 }
 
-const FIB: &str = "fn fib n:\n  if n < 2: return n\n  fib (n - 1) + fib (n - 2)\n";
-
-const FIB_PY: &str =
-    "def fib(n):\n  if n < 2:\n    return n\n  return (fib (n - 1)) + (fib (n - 2))\n";
+const FIB: &str = "fn fib n:\n  if n < 2: return 1\n  fib (n - 1) + fib (n - 2)\n";
+const FIB_PY: &str = "def fib(n):\n  if n < 2:\n    return 1\n  return (fib (n - 1)) + (fib (n - 2))\n";
 
 const LOOP_1000: &str = "fn count n:\n  i = 0\n  total = 0\n  while i < n:\n    total = total + i * 2 - i\n    i = i + 1\n  total\n";
 const LOOP_1000_PY: &str = "def count(n):\n  i = 0\n  total = 0\n  while i < n:\n    total = total + i * 2 - i\n    i = i + 1\n  return total\n";
@@ -442,6 +440,92 @@ fn pipeline(c: &mut Criterion) {
     bench_python(c, "pipeline-10", PIPELINE_PY, "crunch(10)\n");
 }
 
+/// Generator create/resume overhead with real per-step work: a Fibonacci
+/// `gen fn` carrying state across yields, consumed by a `for` - one
+/// resume per item, plus one generator creation per call.
+const GENERATOR: &str = "gen fn fib_gen n:
+    a = 0
+    b = 1
+    i = 0
+    while i < n:
+        yield a
+        t = a + b
+        a = b
+        b = t
+        i = i + 1
+
+fn consume n:
+    total = 0
+    for x in (fib_gen n):
+        total = total + x
+    total
+";
+
+const GENERATOR_PY: &str = "def fib_gen(n):
+    a = 0
+    b = 1
+    i = 0
+    while i < n:
+        yield a
+        t = a + b
+        a = b
+        b = t
+        i = i + 1
+
+def consume(n):
+    total = 0
+    for x in fib_gen(n):
+        total = total + x
+    return total
+";
+
+fn generator(c: &mut Criterion) {
+    // sanity: all execution modes must agree on the result being timed
+    let results: Vec<String> = [
+        runtime_with(GENERATOR, false),
+        runtime_with(GENERATOR, true),
+        runtime_oxidized("gen-check", GENERATOR),
+    ]
+    .into_iter()
+    .map(|(mut rt, frame)| {
+        for stmt in &parse("r = consume 50\n") {
+            rt.exec_stmt(stmt, frame.clone()).unwrap();
+        }
+        format!("{}", frame.get_var("r", &mut rt))
+    })
+    .collect();
+    assert_eq!(results[0], results[1], "walker/VM disagree on generator");
+    assert_eq!(
+        results[0], results[2],
+        "walker/oxidized disagree on generator"
+    );
+
+    bench_modes(c, "gen-fib-50", GENERATOR, "consume 50\n");
+    bench_python(c, "gen-fib-50", GENERATOR_PY, "consume(50)\n");
+
+    fn consume(n: usize) -> i64 {
+        // Rust's own lazy-iterator counterpart of the Fibonacci generator
+        struct Fib {
+            a: i64,
+            b: i64,
+        }
+        impl Iterator for Fib {
+            type Item = i64;
+
+            fn next(&mut self) -> Option<i64> {
+                let out = self.a;
+                let t = self.a + self.b;
+                self.a = self.b;
+                self.b = t;
+                Some(out)
+            }
+        }
+        Fib { a: 0, b: 1 }.take(n).sum()
+    }
+
+    bench_rust(c, "gen-fib-50", black_box(&consume), 50);
+}
+
 /// Full application vs a curried chain of partial applications.
 fn calls(c: &mut Criterion) {
     let defs = "fn add3 a b c:\n    return a + b + c\n";
@@ -528,6 +612,6 @@ fn compile(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches, fib, fib_module, tight_loop, collatz, pipeline, calls, binding, compile
+    benches, fib, fib_module, tight_loop, collatz, pipeline, generator, calls, binding, compile
 );
 criterion_main!(benches);

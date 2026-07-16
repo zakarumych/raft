@@ -154,6 +154,7 @@ fn assigned_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             | StmtKind::AssignField { .. }
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
+            | StmtKind::Yield(_)
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -268,8 +269,11 @@ fn stmt_reads(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) => expr_reads(e, out),
-        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) => expr_reads(e, out),
+        StmtKind::Return(None)
+        | StmtKind::Yield(None)
+        | StmtKind::Break
+        | StmtKind::Continue => {}
         StmtKind::Fn { params, body, .. } => {
             out.extend(fn_free_names(params, body));
         }
@@ -370,6 +374,11 @@ enum BodyKind {
     Fn,
 }
 
+/// How generated code inside a generator body names the live host: a
+/// fresh, statement-scoped view derived from the co (never a binding held
+/// across an await - see `bundle_support`'s `co_host`).
+const GEN_HOST: &str = "(&mut support::co_host(&__co))";
+
 /// Emission state for one Rust function body being generated.
 struct Body {
     buf: String,
@@ -379,6 +388,13 @@ struct Body {
     /// One entry per enclosing Raft loop; `Some(flag)` when the loop has
     /// an `else` branch and Raft `break` must set its skip flag.
     loops: Vec<Option<String>>,
+    /// The spelling of "a `&mut Host` for the current statement" - the
+    /// `host` parameter for ordinary bodies, [`GEN_HOST`] inside a
+    /// generator's async body.
+    host: &'static str,
+    /// Whether this is a `gen fn`'s async body - the only place `yield`
+    /// generates; anywhere else it's a transpile error.
+    is_gen: bool,
 }
 
 impl Body {
@@ -389,6 +405,8 @@ impl Body {
             tmp: 0,
             kind,
             loops: Vec::new(),
+            host: "host",
+            is_gen: false,
         }
     }
 
@@ -531,7 +549,7 @@ impl BundleGenerator {
         let _ = writeln!(src, "use raft_core::rc::Host;");
         let _ = writeln!(
             src,
-            "use raft_core::{{ffi, AtomId, Function, Number, RcFn, RcStr, RuntimeError, Val, ValEnum}};"
+            "use raft_core::{{ffi, AtomId, Function, Generator, Number, RcFn, RcGen, RcStr, RuntimeError, Val, ValEnum, ValsIter}};"
         );
         let _ = writeln!(src);
         let _ = writeln!(
@@ -830,7 +848,8 @@ impl ModuleCx<'_> {
 
         let t = if chain.is_empty() {
             let idx = self.name_idx(name);
-            b.temp(format!("support::global_get(host, {idx})"))
+            let host = b.host;
+            b.temp(format!("support::global_get({host}, {idx})"))
         } else {
             let t = b.fresh("_t");
             let mut sources = chain.into_iter();
@@ -840,8 +859,9 @@ impl ModuleCx<'_> {
             }
             if !definite_end {
                 let idx = self.name_idx(name);
+                let host = b.host;
                 b.line(format!(
-                    "if !{t}.is_init() {{ {t} = support::global_get(host, {idx}); }}"
+                    "if !{t}.is_init() {{ ::core::hint::cold_path(); {t} = support::global_get({host}, {idx}); }}"
                 ));
             }
             t
@@ -850,7 +870,7 @@ impl ModuleCx<'_> {
             return t;
         }
         b.temp(format!(
-            "{t}.init_or_else(|| RuntimeError::UnboundIdentifier(RcStr::new({name:?})))?"
+            "{t}.init_or_else(|| {{ ::core::hint::cold_path(); RuntimeError::UnboundIdentifier(RcStr::new({name:?})) }})?"
         ))
     }
 
@@ -983,7 +1003,12 @@ impl ModuleCx<'_> {
                 });
                 let t_iter = self.gen_expr(b, iterable, false)?;
                 let item = b.fresh("_item");
-                b.line(format!("for {item} in {t_iter}.iter()? {{"));
+                let it = b.fresh("_it");
+                b.line(format!("let mut {it} = support::iter_new(&{t_iter})?;"));
+                let host = b.host;
+                b.line(format!(
+                    "while let Some({item}) = support::iter_next({host}, &mut {it})? {{"
+                ));
                 b.indent += 1;
                 b.loops.push(flag.clone());
                 self.gen_bind(b, target, &item)?;
@@ -1019,6 +1044,17 @@ impl ModuleCx<'_> {
                     ),
                 }
             }
+            StmtKind::Yield(expr) => {
+                if !b.is_gen {
+                    return Err(GenError::new("yield statement outside of generator"));
+                }
+                let t = match expr {
+                    Some(e) => self.gen_expr(b, e, false)?,
+                    None => b.temp("Val::nil()"),
+                };
+                b.line(format!("support::gen_yield(&__co, {t}).await;"));
+                b.line("last = Val::nil();");
+            }
             StmtKind::Break => match b.loops.last() {
                 Some(Some(flag)) => {
                     let flag = flag.clone();
@@ -1037,10 +1073,23 @@ impl ModuleCx<'_> {
                     BodyKind::Module => "return Err(RuntimeError::Other(\"break/continue/return at module top level\".into()));",
                 }),
             },
-            StmtKind::Fn { name, params, body } => {
+            StmtKind::Fn { name, cat: raft_ast::FnCat::Normal, params, body } => {
                 let t = self.gen_fn_closure(b, params, body)?;
                 self.gen_write(b, name.name(), &t);
                 b.line("last = Val::nil();");
+            }
+            StmtKind::Fn { name, cat: raft_ast::FnCat::Generator, params, body } => {
+                let t = self.gen_gen_closure(b, params, body)?;
+                self.gen_write(b, name.name(), &t);
+                b.line("last = Val::nil();");
+            }
+            StmtKind::Fn {
+                cat: raft_ast::FnCat::Async | raft_ast::FnCat::AsyncGenerator,
+                ..
+            } => {
+                return Err(GenError::new(
+                    "async fn transpilation is not yet implemented",
+                ));
             }
         }
         Ok(())
@@ -1096,6 +1145,84 @@ impl ModuleCx<'_> {
         Ok(t)
     }
 
+    /// Generate a nested Raft `gen fn` as a creation closure: a normal
+    /// `support::fn_val` function value whose full application pops its
+    /// arguments and builds a suspended generator over an `async move`
+    /// state machine (see `bundle_support`'s generator section). The body
+    /// is generated by the same `gen_stmt` machinery as any function -
+    /// only the host spelling ([`GEN_HOST`]) and the `yield` statement
+    /// differ - so nested closures, captures and control flow all work
+    /// unchanged inside it.
+    fn gen_gen_closure(
+        &mut self,
+        b: &mut Body,
+        params: &[Pat],
+        stmts: &[Stmt],
+    ) -> Result<String, GenError> {
+        let mut param_binds = BTreeSet::new();
+        for p in params {
+            pat_binds(p, &mut param_binds);
+        }
+        let mut locals = param_binds.clone();
+        assigned_names(stmts, &mut locals);
+
+        // the async body: scope locals (and the capture struct, if any)
+        // live inside the future, persisting across yields
+        let mut fb = Body::new(BodyKind::Fn, b.indent + 3);
+        fb.is_gen = true;
+        fb.host = GEN_HOST;
+        self.open_scope(&mut fb, &locals, param_binds, stmts);
+
+        // bind the argument values moved into the future; runs during
+        // creation (gen_create polls to the gen_start suspension), so a
+        // pattern-match failure is a creation-time error
+        for (i, param) in params.iter().enumerate() {
+            let arg = format!("_arg{i}");
+            self.gen_bind(&mut fb, param, &arg)?;
+        }
+        fb.line("support::gen_start().await;");
+        fb.line("let mut last = Val::nil();");
+        for s in stmts.iter() {
+            self.gen_stmt(&mut fb, s)?;
+        }
+        fb.line("Ok(last)");
+
+        let scope = self.scopes.pop().expect("gen fn scope");
+
+        let t = b.fresh("_t");
+        b.line(format!("let {t} = {{"));
+        b.indent += 1;
+        for cap_var in &scope.used_caps {
+            b.line(format!("let {cap_var} = Rc::clone(&{cap_var});"));
+        }
+        b.line(format!(
+            "support::fn_val({}usize, move |host: &mut Host<'_>| -> Result<Val, RuntimeError> {{",
+            params.len()
+        ));
+        b.indent += 1;
+        // creation: pop the arguments (first argument on top) into temps
+        // the async block takes ownership of
+        for i in 0..params.len() {
+            b.line(format!("let _arg{i} = host.stack().pop();"));
+        }
+        b.line("let __co = support::gen_co();");
+        b.line("let __co_outer = Rc::clone(&__co);");
+        // each creation builds a fresh future: re-clone the capture
+        // handles this closure holds into the async block
+        for cap_var in &scope.used_caps {
+            b.line(format!("let {cap_var} = Rc::clone(&{cap_var});"));
+        }
+        b.line("let __fut = Box::pin(async move {");
+        b.buf.push_str(&fb.buf);
+        b.line("});");
+        b.line("support::gen_create(host, __co_outer, __fut)");
+        b.indent -= 1;
+        b.line("})");
+        b.indent -= 1;
+        b.line("};");
+        Ok(t)
+    }
+
     /// Lower an expression to statements, returning the temp holding its
     /// value. `call_pos` marks statement/parenthesized position, where a
     /// bare reference to a zero-argument callable invokes it.
@@ -1106,7 +1233,8 @@ impl ModuleCx<'_> {
             ExprKind::Ident(id) => {
                 let t = self.gen_read(b, id.name());
                 if call_pos {
-                    b.temp(format!("support::call_bare(host, {t})?"))
+                    let host = b.host;
+                    b.temp(format!("support::call_bare({host}, {t})?"))
                 } else {
                     t
                 }
@@ -1153,10 +1281,12 @@ impl ModuleCx<'_> {
                     .collect::<Result<_, _>>()?;
                 // calling convention: first argument on top of the stack
                 for t in temps.iter().rev() {
-                    b.line(format!("host.stack().push({t});"));
+                    let host = b.host;
+                    b.line(format!("{host}.stack().push({t});"));
                 }
+                let host = b.host;
                 b.temp(format!(
-                    "support::apply(host, {t_fn}, {}usize)?",
+                    "support::apply({host}, {t_fn}, {}usize)?",
                     temps.len()
                 ))
             }
@@ -1531,6 +1661,40 @@ mod tests {
         assert!(src.contains("ValEnum::List("));
         assert!(src.contains("ValEnum::Record("));
         assert!(src.contains("get_field(\"value\")"));
+    }
+
+    #[test]
+    fn generators_transpile_to_async_state_machines() {
+        let module = parse_module(
+            "gen fn count n:\n    i = 0\n    while i < n:\n        yield i\n        i = i + 1\nfn sum n:\n    total = 0\n    for x in (count n):\n        total = total + x\n    return total\nexport { count, sum }\n",
+        );
+        let mut generator = BundleGenerator::new();
+        let src = generator.add_module("gens", &module).unwrap().to_owned();
+
+        // creation closure builds and primes an async state machine
+        assert!(src.contains("let __co = support::gen_co();"));
+        assert!(src.contains("let __fut = Box::pin(async move {"));
+        assert!(src.contains("support::gen_start().await;"));
+        assert!(src.contains("support::gen_create(host, __co_outer, __fut)"));
+        // yield awaits the poll-once future
+        assert!(src.contains("support::gen_yield(&__co, "));
+        // generator bodies re-derive the host per statement, never holding
+        // one across an await
+        assert!(src.contains("(&mut support::co_host(&__co))"));
+        // for loops go through the host-aware iteration protocol
+        assert!(src.contains("support::iter_new(&"));
+        assert!(src.contains("support::iter_next(host, &mut "));
+    }
+
+    #[test]
+    fn yield_outside_generator_is_a_transpile_error() {
+        let module = parse_module("fn f x:\n    yield x\nexport { f }\n");
+        let mut generator = BundleGenerator::new();
+        assert!(generator.add_module("bad", &module).is_err());
+
+        let module = parse_module("yield 1\nexport { }\n");
+        let mut generator = BundleGenerator::new();
+        assert!(generator.add_module("bad2", &module).is_err());
     }
 
     #[test]

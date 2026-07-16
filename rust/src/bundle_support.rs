@@ -53,6 +53,7 @@ pub fn init(host: &ffi::RaftFFIHost) {
     }
 }
 
+#[inline]
 fn host() -> ffi::RaftFFIHost {
     STATE
         .host
@@ -61,12 +62,14 @@ fn host() -> ffi::RaftFFIHost {
 }
 
 /// The `Val` for the bundle's custom atom index `idx`.
+#[inline]
 pub fn atom(idx: u32) -> Val {
     // SAFETY: single-threaded; written only during `init`.
     Val::new_atom(AtomId(unsafe { (*STATE.atom_ids.get())[idx as usize] }))
 }
 
 /// Read host global by bundle name index. Uninit when unbound.
+#[inline]
 pub fn global_get(host_view: &mut Host<'_>, idx: u32) -> Val {
     let h = host();
     // SAFETY: single-threaded id-table read (written only during `init`),
@@ -84,6 +87,8 @@ pub fn global_get(host_view: &mut Host<'_>, idx: u32) -> Val {
 /// walker's `Runtime::set_error`. Called at a `Function::call` boundary
 /// when a transpiled body fails (the failing call pushes no result; the
 /// caller detects the pending error via `check_host_error`).
+#[cold]
+#[inline(never)]
 pub fn report_error(host_view: &mut Host<'_>, e: &RuntimeError) {
     let h = host();
     let msg = Val::string(&format!("{e}"));
@@ -95,6 +100,7 @@ pub fn report_error(host_view: &mut Host<'_>, e: &RuntimeError) {
 /// Did the last dispatched call leave the host in an error state? Takes
 /// (clears) the pending error - the propagating `Err` re-reports it at the
 /// next `Function::call` boundary, so nothing is lost.
+#[inline]
 fn check_host_error(host_view: &mut Host<'_>) -> Result<(), RuntimeError> {
     let h = host();
     // SAFETY: crossing into the host's `TakeErrorFn` ABI with the live
@@ -126,16 +132,19 @@ impl<F> Function for TranspiledFn<F>
 where
     F: Fn(&mut Host<'_>) -> Result<Val, RuntimeError> + 'static,
 {
+    #[inline]
     fn min_args(&self) -> usize {
         self.arity
     }
 
+    #[inline]
     fn max_args(&self) -> Option<usize> {
         // consumes exactly its parameter count; the dispatch clamps
         // over-application and re-applies the leftovers to the result
         Some(self.arity)
     }
 
+    #[inline]
     fn call(&self, host: &mut Host, args: usize) {
         debug_assert_eq!(args, self.arity);
         match (self.body)(host) {
@@ -148,6 +157,7 @@ where
 }
 
 /// Wrap a generated closure as a `Val::Fn`.
+#[inline]
 pub fn fn_val<F>(arity: usize, body: F) -> Val
 where
     F: Fn(&mut Host<'_>) -> Result<Val, RuntimeError> + 'static,
@@ -156,10 +166,203 @@ where
 }
 
 // ---------------------------------------------------------------------
+// Generators: a transpiled `gen fn` body is an `async move` block - the
+// Rust compiler builds the suspendable state machine - and `yield` is an
+// await on a poll-once future. One resume = one poll with a noop waker,
+// running the body to its next yield. The body never holds a `Host`
+// across an await: it re-derives a fresh, statement-scoped view from the
+// co's live pointer (`co_host`, set at the top of every poll) at each
+// use, so no `&mut RawHost` outlives the resume that produced it.
+// ---------------------------------------------------------------------
+
+/// The channel between a suspended generator body and its `resume`: the
+/// value the pending yield produced, and the live host pointer of the
+/// resume currently polling (null between resumes).
+pub struct GenCo {
+    yielded: Cell<Option<Val>>,
+    host: Cell<*mut ffi::RawHost>,
+}
+
+pub fn gen_co() -> Rc<GenCo> {
+    Rc::new(GenCo {
+        yielded: Cell::new(None),
+        host: Cell::new(core::ptr::null_mut()),
+    })
+}
+
+/// A fresh view of the live host, valid for the current statement.
+/// Generator bodies name the host through this - never a binding held
+/// across an await.
+#[inline]
+pub fn co_host(co: &GenCo) -> Host<'_> {
+    let raw = co.host.get();
+    debug_assert!(!raw.is_null(), "generator body ran outside a resume");
+    // SAFETY: only reachable while a `poll_gen` is on the stack (it set
+    // the pointer just before polling and clears it after), where the
+    // host is valid and exclusively this generator's for the duration.
+    unsafe { Host::from_raw(raw) }
+}
+
+/// The future behind a `yield` statement: first poll parks the value in
+/// the co and suspends; the next poll (the next resume) completes.
+pub struct GenYield<'a> {
+    co: &'a GenCo,
+    value: Option<Val>,
+}
+
+impl core::future::Future for GenYield<'_> {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        // no self-references - `GenYield` is trivially `Unpin`
+        let this = self.get_mut();
+        match this.value.take() {
+            Some(v) => {
+                this.co.yielded.set(Some(v));
+                core::task::Poll::Pending
+            }
+            None => core::task::Poll::Ready(()),
+        }
+    }
+}
+
+pub fn gen_yield<'a>(co: &'a Rc<GenCo>, value: Val) -> GenYield<'a> {
+    GenYield {
+        co,
+        value: Some(value),
+    }
+}
+
+/// The implicit suspension right after parameter binding: `gen_create`
+/// polls up to here, so a parameter pattern-match failure surfaces at
+/// creation time (matching the walker/VM), before the first real resume.
+pub struct GenStart {
+    polled: bool,
+}
+
+impl core::future::Future for GenStart {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        if this.polled {
+            core::task::Poll::Ready(())
+        } else {
+            this.polled = true;
+            core::task::Poll::Pending
+        }
+    }
+}
+
+pub fn gen_start() -> GenStart {
+    GenStart { polled: false }
+}
+
+type GenFut = core::pin::Pin<Box<dyn core::future::Future<Output = Result<Val, RuntimeError>>>>;
+
+/// One poll of a generator body with the co's host pointer live for its
+/// duration.
+fn poll_gen(
+    co: &GenCo,
+    host: &mut Host,
+    fut: &mut GenFut,
+) -> core::task::Poll<Result<Val, RuntimeError>> {
+    co.host.set(host.as_raw());
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    let r = fut.as_mut().poll(&mut cx);
+    co.host.set(core::ptr::null_mut());
+    r
+}
+
+/// A live transpiled generator. `fut` is `None` once finished - and also
+/// while a resume is polling, so a re-entrant resume through the body's
+/// own calls reports exhaustion instead of polling recursively.
+pub struct TranspiledGen {
+    co: Rc<GenCo>,
+    fut: RefCell<Option<GenFut>>,
+}
+
+impl Generator for TranspiledGen {
+    fn resume(&self, host: &mut Host) {
+        let taken = self.fut.borrow_mut().take();
+        let Some(mut fut) = taken else {
+            host.stack().push(Val::new_uninit());
+            return;
+        };
+        match poll_gen(&self.co, host, &mut fut) {
+            core::task::Poll::Pending => {
+                let v = self.co.yielded.take().unwrap_or_else(Val::nil);
+                *self.fut.borrow_mut() = Some(fut);
+                host.stack().push(v);
+            }
+            core::task::Poll::Ready(Ok(_)) => {
+                // a generator's return value is discarded; the end is
+                // signalled by the uninit value
+                host.stack().push(Val::new_uninit());
+            }
+            core::task::Poll::Ready(Err(e)) => {
+                report_error(host, &e);
+                host.stack().push(Val::new_uninit());
+            }
+        }
+    }
+}
+
+/// Prime a freshly-built generator body (run parameter binding, up to the
+/// implicit [`gen_start`] suspension) and wrap it as a `Val::Gen`. A bind
+/// failure comes back as this call's error, matching walker/VM creation.
+pub fn gen_create(host: &mut Host, co: Rc<GenCo>, fut: GenFut) -> Result<Val, RuntimeError> {
+    let mut fut = fut;
+    match poll_gen(&co, host, &mut fut) {
+        core::task::Poll::Pending => Ok(Val::from(ValEnum::Gen(RcGen::new(TranspiledGen {
+            co,
+            fut: RefCell::new(Some(fut)),
+        })))),
+        core::task::Poll::Ready(Err(e)) => Err(e),
+        // ran to completion while priming (empty body): already exhausted
+        core::task::Poll::Ready(Ok(_)) => Ok(Val::from(ValEnum::Gen(RcGen::new(TranspiledGen {
+            co,
+            fut: RefCell::new(None),
+        })))),
+    }
+}
+
+// ---------------------------------------------------------------------
+// `for` iteration - `raft_core::ValsIter` (lists, records, generators),
+// with the host-error check a generator step needs folded in.
+// ---------------------------------------------------------------------
+
+#[inline]
+pub fn iter_new(v: &Val) -> Result<ValsIter, RuntimeError> {
+    ValsIter::new(v)
+}
+
+/// The next item, or `Ok(None)` at a clean end. A generator step that
+/// failed reports exhaustion with the host error pending - taken and
+/// propagated here.
+#[inline]
+pub fn iter_next(host: &mut Host, iter: &mut ValsIter) -> Result<Option<Val>, RuntimeError> {
+    match iter.next(host) {
+        Some(v) => Ok(Some(v)),
+        None => {
+            check_host_error(host)?;
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Application - the walker's `apply_value_ast`/`call_ast`, with the
 // host-status check replaced by the FFI `take_error` round trip.
 // ---------------------------------------------------------------------
 
+#[inline]
 fn callee(val: &Val) -> Option<RcFn> {
     match val.unpack() {
         ValEnum::Fn(f) => Some(f),
@@ -172,6 +375,7 @@ fn callee(val: &Val) -> Option<RcFn> {
     }
 }
 
+#[inline]
 fn truncate_args(host: &mut Host, args: usize) {
     let mut stack = host.stack();
     let len = stack.len();
@@ -234,35 +438,43 @@ pub fn call_bare(host: &mut Host, fval: Val) -> Result<Val, RuntimeError> {
 // operators.
 // ---------------------------------------------------------------------
 
+#[inline(always)]
 pub fn pat_fail() -> RuntimeError {
     RuntimeError::Other("pattern match failed".into())
 }
 
 /// Raft `==` as a plain bool (for pattern matching).
+#[inline(always)]
 pub fn same(a: &Val, b: &Val) -> bool {
     a.cmp(b) == Some(Ordering::Equal)
 }
 
+#[inline(always)]
 pub fn eq(a: &Val, b: &Val) -> Val {
     Val::bool_(a.cmp(b) == Some(Ordering::Equal))
 }
 
+#[inline(always)]
 pub fn ne(a: &Val, b: &Val) -> Val {
     Val::bool_(a.cmp(b) != Some(Ordering::Equal))
 }
 
+#[inline(always)]
 pub fn lt(a: &Val, b: &Val) -> Val {
     Val::bool_(a.cmp(b) == Some(Ordering::Less))
 }
 
+#[inline(always)]
 pub fn le(a: &Val, b: &Val) -> Val {
     Val::bool_(matches!(a.cmp(b), Some(Ordering::Less | Ordering::Equal)))
 }
 
+#[inline(always)]
 pub fn gt(a: &Val, b: &Val) -> Val {
     Val::bool_(a.cmp(b) == Some(Ordering::Greater))
 }
 
+#[inline(always)]
 pub fn ge(a: &Val, b: &Val) -> Val {
     Val::bool_(matches!(
         a.cmp(b),
@@ -271,6 +483,7 @@ pub fn ge(a: &Val, b: &Val) -> Val {
 }
 
 /// `value.field` - read a record field.
+#[inline]
 pub fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
     match v.unpack() {
         ValEnum::Record(record) => record
@@ -281,6 +494,7 @@ pub fn field_of(v: &Val, field: &str) -> Result<Val, RuntimeError> {
 }
 
 /// `value[index]` - read a list element.
+#[inline]
 pub fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => match usize::try_from(i) {
@@ -299,6 +513,7 @@ pub fn index_of(objv: &Val, idxv: &Val) -> Result<Val, RuntimeError> {
 }
 
 /// `target.field = value` - write a record field.
+#[inline]
 pub fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError> {
     match objv.unpack() {
         ValEnum::Record(record) => {
@@ -310,6 +525,7 @@ pub fn assign_field(objv: Val, field: &str, val: Val) -> Result<(), RuntimeError
 }
 
 /// `target[index] = value` - write a list element.
+#[inline]
 pub fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> {
     match (objv.unpack(), idxv.unpack()) {
         (ValEnum::List(list), ValEnum::Number(Number::Integer(i))) => {
@@ -351,6 +567,7 @@ pub enum NumberPat {
     Never,
 }
 
+#[inline]
 pub fn match_number(pat: &NumberPat, v: &Val) -> bool {
     let ValEnum::Number(actual) = v.unpack() else {
         return false;

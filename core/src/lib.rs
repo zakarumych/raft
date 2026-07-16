@@ -24,12 +24,18 @@ use raft_ffi::{LenVal, RcInner, Str, Void};
 use alloc::{alloc::Layout, string::String, vec::Vec};
 
 use core::{
-    cell::UnsafeCell, cmp::Ordering, fmt, hash::{Hash, Hasher}, mem::ManuallyDrop, ops::Deref, ptr::NonNull,
+    cell::UnsafeCell,
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+    mem::ManuallyDrop,
+    ops::Deref,
+    ptr::NonNull,
 };
 
 use smallvec::SmallVec;
 
-use crate::rc::{Callable, DynRc, Rc, erase, erase_fn};
+use crate::rc::{Callable, DynRc, Rc, Resumable, erase, erase_fn, erase_gen};
 
 /// Projects any concrete vtable down to the common `clone`/`drop`-shaped
 /// [`ffi::AnyVTable`] prefix every vtable embeds - what [`DynRc`] needs to
@@ -67,6 +73,13 @@ impl AnyVTable for raft_ffi::ListVTable {
 }
 
 impl AnyVTable for raft_ffi::FnVTable {
+    #[inline(always)]
+    fn any(&self) -> &raft_ffi::AnyVTable {
+        &self.any
+    }
+}
+
+impl AnyVTable for raft_ffi::GenVTable {
     #[inline(always)]
     fn any(&self) -> &raft_ffi::AnyVTable {
         &self.any
@@ -434,7 +447,9 @@ impl Val {
         // refcount; wrapping in `ManuallyDrop` means only the `.clone()`
         // below (a real, correct refcount bump for heap kinds) has any
         // effect - dropping the `ManuallyDrop` peek is a no-op.
-        let peek = ManuallyDrop::new(Val { raw: unsafe { core::ptr::read(raw) } });
+        let peek = ManuallyDrop::new(Val {
+            raw: unsafe { core::ptr::read(raw) },
+        });
         (*peek).clone()
     }
 
@@ -470,12 +485,13 @@ impl Val {
             ffi::MASK_TAG_FN => ValEnum::Fn(RcFn {
                 ptr: self.clone_heap::<raft_ffi::FnVTable, Void>(),
             }),
+            ffi::MASK_TAG_GEN => ValEnum::Gen(RcGen {
+                ptr: self.clone_heap::<raft_ffi::GenVTable, Void>(),
+            }),
             ffi::MASK_TAG_OPAQUE => ValEnum::Opaque(RcOpaque {
                 ptr: self.clone_heap::<raft_ffi::AnyVTable, Void>(),
             }),
-            _ => unsafe {
-                core::hint::unreachable_unchecked()
-            },
+            _ => unsafe { core::hint::unreachable_unchecked() },
         }
     }
 
@@ -499,6 +515,7 @@ impl Val {
             ffi::MASK_TAG_RECORD => ValKind::Record,
             ffi::MASK_TAG_LIST => ValKind::List,
             ffi::MASK_TAG_FN => ValKind::Fn,
+            ffi::MASK_TAG_GEN => ValKind::Gen,
             ffi::MASK_TAG_OPAQUE => ValKind::Opaque,
             _ => unsafe { core::hint::unreachable_unchecked() },
         }
@@ -615,6 +632,7 @@ pub enum ValKind {
     List,
     Record,
     Fn,
+    Gen,
     Opaque,
 }
 
@@ -642,6 +660,7 @@ impl From<ValEnum> for Val {
             ValEnum::Record(r) => Val::pack_heap(ffi::MASK_TAG_RECORD, r.ptr),
             ValEnum::List(l) => Val::pack_heap(ffi::MASK_TAG_LIST, l.ptr),
             ValEnum::Fn(f) => Val::pack_heap(ffi::MASK_TAG_FN, f.ptr),
+            ValEnum::Gen(g) => Val::pack_heap(ffi::MASK_TAG_GEN, g.ptr),
             ValEnum::Opaque(o) => Val::pack_heap(ffi::MASK_TAG_OPAQUE, o.ptr),
         }
     }
@@ -664,6 +683,7 @@ impl Clone for Val {
             | ffi::MASK_TAG_RECORD
             | ffi::MASK_TAG_LIST
             | ffi::MASK_TAG_FN
+            | ffi::MASK_TAG_GEN
             | ffi::MASK_TAG_OPAQUE => {
                 // SAFETY: heap tag confirmed; `RcInner<T>::strong` is
                 // `#[repr(C)]`'s first field regardless of `T` - the same
@@ -680,7 +700,9 @@ impl Clone for Val {
         // refcount by itself - for heap kinds, the bump above already made
         // this an independent, correctly-counted owning reference; for
         // scalars there was never a count to touch.
-        Val { raw: unsafe { core::ptr::read(&self.raw) } }
+        Val {
+            raw: unsafe { core::ptr::read(&self.raw) },
+        }
     }
 }
 
@@ -695,6 +717,7 @@ impl Drop for Val {
                 self.drop_heap::<raft_ffi::ListVTable, UnsafeCell<ffi::ListVal>>()
             }
             ffi::MASK_TAG_FN => self.drop_heap::<raft_ffi::FnVTable, Void>(),
+            ffi::MASK_TAG_GEN => self.drop_heap::<raft_ffi::GenVTable, Void>(),
             ffi::MASK_TAG_OPAQUE => self.drop_heap::<raft_ffi::AnyVTable, Void>(),
             _ => {}
         }
@@ -711,6 +734,7 @@ pub enum ValEnum {
     List(RcList),
     Record(RcRecord),
     Fn(RcFn),
+    Gen(RcGen),
     Opaque(RcOpaque),
     /// Internal sentinel: a local slot that has not been assigned yet
     /// (reads of it fall back to the global scope), or "not found" from
@@ -736,6 +760,7 @@ impl fmt::Debug for Val {
             ValEnum::List(l) => write!(f, "List({:?})", l),
             ValEnum::Record(r) => write!(f, "Record({:?})", r),
             ValEnum::Fn(_) => write!(f, "<fn>"),
+            ValEnum::Gen(_) => write!(f, "<gen>"),
             ValEnum::Opaque(o) => write!(f, "Opaque({:p})", DynRc::data_ptr(&o.ptr).as_ptr()),
             ValEnum::Uninit => write!(f, "<uninit>"),
         }
@@ -752,6 +777,7 @@ impl fmt::Display for Val {
             ValEnum::List(l) => write!(f, "{}", l),
             ValEnum::Record(r) => write!(f, "{}", r),
             ValEnum::Fn(_) => write!(f, "<fn>"),
+            ValEnum::Gen(_) => write!(f, "<gen>"),
             ValEnum::Opaque(o) => write!(f, "{:p}", DynRc::data_ptr(&o.ptr).as_ptr()),
             ValEnum::Uninit => write!(f, "<uninit>"),
         }
@@ -811,12 +837,12 @@ impl Val {
     }
 
     #[inline]
-    pub fn list(elements: Vec<Val>) -> Val {
+    pub fn list(elements: impl IntoIterator<Item = Val>) -> Val {
         Val::from(ValEnum::List(RcList::new(elements)))
     }
 
     #[inline]
-    pub fn record(fields: Vec<(RcStr, Val)>) -> Val {
+    pub fn record(fields: impl IntoIterator<Item = (RcStr, Val)>) -> Val {
         Val::from(ValEnum::Record(RcRecord::new(fields)))
     }
 
@@ -964,6 +990,9 @@ impl Val {
             (ValEnum::Fn(f1), ValEnum::Fn(f2)) => {
                 DynRc::ptr_eq(&f1.ptr, &f2.ptr).then_some(Ordering::Equal)
             }
+            (ValEnum::Gen(g1), ValEnum::Gen(g2)) => {
+                DynRc::ptr_eq(&g1.ptr, &g2.ptr).then_some(Ordering::Equal)
+            }
             (ValEnum::Opaque(o1), ValEnum::Opaque(o2)) => {
                 DynRc::ptr_eq(&o1.ptr, &o2.ptr).then_some(Ordering::Equal)
             }
@@ -1080,7 +1109,7 @@ impl Val {
                     ValIter::Record(r, pos) => {
                         let (key, value) = r.entry_at(*pos)?;
                         *pos += 1;
-                        Some(Val::record(alloc::vec![(RcStr::new(key), value)]))
+                        Some(Val::record([(RcStr::new(key), value)].into_iter()))
                     }
                 }
             }
@@ -1293,7 +1322,8 @@ unsafe extern "C" fn list_destroy(ptr: raft_ffi::RcPtr<Void>) {
     let inner: &mut RcInner<UnsafeCell<ffi::ListVal>> = unsafe { &mut *ptr.as_ptr() };
     let header = inner.value.get_mut();
     // SAFETY: `header`'s ptr/size/capacity are valid `Vec<Val>` raw parts.
-    let elements = unsafe { Vec::from_raw_parts(header.ptr as *mut Val, header.size, header.capacity) };
+    let elements =
+        unsafe { Vec::from_raw_parts(header.ptr as *mut Val, header.size, header.capacity) };
     drop(elements); // drops each `Val` (real teardown), then frees the buffer
     // SAFETY: deallocating the exact allocation `RcList::new` made.
     unsafe {
@@ -1308,7 +1338,8 @@ unsafe extern "C" fn list_get_shim(data: raft_ffi::VoidPtr, index: usize) -> ffi
     // SAFETY: `data` is a live `ffi::ListVal` for the duration of this call.
     let header: &ffi::ListVal = unsafe { &*(data.as_ptr() as *const ffi::ListVal) };
     // SAFETY: `header.ptr`/`size` describe a valid `[Val]`.
-    let slice: &[Val] = unsafe { core::slice::from_raw_parts(header.ptr as *const Val, header.size) };
+    let slice: &[Val] =
+        unsafe { core::slice::from_raw_parts(header.ptr as *const Val, header.size) };
     match slice.get(index) {
         Some(v) => v.clone().into_raw(),
         None => Val::from(ValEnum::Uninit).into_raw(),
@@ -1374,7 +1405,8 @@ pub struct RcList {
 }
 
 impl RcList {
-    pub fn new(elements: Vec<Val>) -> Self {
+    pub fn new(elements: impl IntoIterator<Item = Val>) -> Self {
+        let elements: Vec<Val> = elements.into_iter().collect();
         let len = elements.len();
         let cap = elements.capacity();
         let mut elements = ManuallyDrop::new(elements);
@@ -1568,7 +1600,10 @@ unsafe extern "C" fn record_get_by_name_shim(
 ) -> ffi::RawVal {
     let header: &ffi::RecordVal = unsafe { &*(data.as_ptr() as *const ffi::RecordVal) };
     let key: &str = unsafe { key_view(name_ptr, name_len) };
-    match record_fields_slice(header).iter().find(|f| key_str(&f.name) == key) {
+    match record_fields_slice(header)
+        .iter()
+        .find(|f| key_str(&f.name) == key)
+    {
         Some(f) => unsafe { Val::clone_raw(&f.val).into_raw() },
         None => Val::from(ValEnum::Uninit).into_raw(),
     }
@@ -1705,14 +1740,16 @@ pub struct RcRecord {
 }
 
 impl RcRecord {
-    pub fn new(fields: Vec<(RcStr, Val)>) -> Self {
-        let mut vec: Vec<ffi::RawFieldVal> = Vec::with_capacity(fields.len());
-        for (key, val) in fields {
-            vec.push(ffi::RawFieldVal {
+    pub fn new(fields: impl IntoIterator<Item = (RcStr, Val)>) -> Self {
+        let fields = fields.into_iter();
+
+        let vec = fields
+            .map(|(key, val)| ffi::RawFieldVal {
                 name: alloc_key_bytes(key.as_str()),
                 val: val.into_raw(),
-            });
-        }
+            })
+            .collect::<Vec<_>>();
+
         let mut vec = ManuallyDrop::new(vec);
         let header = ffi::RecordVal {
             ptr: vec.as_mut_ptr(),
@@ -1811,9 +1848,7 @@ pub struct RcOpaque {
 
 impl RcOpaque {
     pub fn new<T: 'static>(value: T) -> Self {
-        RcOpaque {
-            ptr: erase(value),
-        }
+        RcOpaque { ptr: erase(value) }
     }
 }
 
@@ -1862,11 +1897,23 @@ pub trait Function: Sized + 'static {
     }
 }
 
+pub trait Generator: Sized + 'static {
+    /// Resumes execution of the generator.
+    /// On yield pushes the yielded value onto the stack and returns.
+    /// On return pushes an uninit value onto the stack and returns.
+    fn resume(&self, host: &mut rc::Host);
+
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen>")
+    }
+}
+
 fn call_dispatch<F: Function>(rc: &Rc<F>, host: &mut rc::Host, args: usize) -> usize {
     let min_args = rc.min_args();
     if args < min_args {
         if args == 0 {
-            host.stack().push(Val::from(ValEnum::Fn(RcFn::from_rc(rc.clone()))));
+            host.stack()
+                .push(Val::from(ValEnum::Fn(RcFn::from_rc(rc.clone()))));
             return 0;
         }
         let mut preapplied: SmallVec<[Val; 4]> =
@@ -1878,7 +1925,8 @@ fn call_dispatch<F: Function>(rc: &Rc<F>, host: &mut rc::Host, args: usize) -> u
             max_args: rc.max_args().map(|max| max - args),
             preapplied,
         });
-        host.stack().push(Val::from(ValEnum::Fn(RcFn::from_rc(partial))));
+        host.stack()
+            .push(Val::from(ValEnum::Fn(RcFn::from_rc(partial))));
         return args;
     }
 
@@ -2037,5 +2085,132 @@ impl RcFn {
 impl fmt::Debug for RcFn {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(_f, "<fn>")
+    }
+}
+
+// ---------------------------------------------------------------------
+// Generator/RcGen: Val::Gen's backing. Mirrors the Function/RcFn pair:
+// `Generator` is the public trait generator objects implement, bridged
+// into `rc::Resumable` (the minimal bound `rc::gen_vtable`/`erase_gen`
+// need). A generator object is what calling a `gen fn` with a full
+// argument set returns; each `resume` runs the body to its next `yield`.
+// ---------------------------------------------------------------------
+
+impl<G: Generator> Resumable for G {
+    #[inline]
+    unsafe fn resume_raw(this: raft_ffi::RcPtr<G>, host: &mut rc::Host) {
+        // SAFETY: `this` is the live, whole-provenance `RcInner<G>` box
+        // (caller's contract) - viewing it as a borrowed `Rc<G>` (in
+        // `ManuallyDrop`, so no double-decrement) for the call's duration.
+        let rc = ManuallyDrop::new(unsafe { Rc::<G>::from_raw_box(this.cast()) });
+        rc.resume(host);
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct RcGen {
+    ptr: DynRc<raft_ffi::GenVTable, Void>,
+}
+
+impl RcGen {
+    #[inline]
+    pub fn new<G: Generator>(g: G) -> Self {
+        Self::from_rc(Rc::new(g))
+    }
+
+    #[inline]
+    pub fn from_rc<G: Generator>(rc: Rc<G>) -> Self {
+        RcGen { ptr: erase_gen(rc) }
+    }
+
+    /// Resume the generator: pushes exactly one value onto the host stack -
+    /// the yielded value, or the uninit value when the generator finished
+    /// (returned, ran off the end of its body, or failed - a failure
+    /// additionally leaves the host's pending-error state set, which
+    /// callers check after every resume).
+    #[inline]
+    pub fn resume(&self, host: &mut rc::Host) {
+        let vtable = DynRc::vtable(&self.ptr);
+        // SAFETY: as `RcFn::call`'s - raw place projection from the live
+        // box pointer keeps whole-box provenance on `data`.
+        let data = unsafe {
+            raft_ffi::VoidPtr::new_unchecked(&raw mut (*DynRc::data_ptr(&self.ptr).as_ptr()).value)
+        };
+        // SAFETY: crossing into the `extern "C"` `ResumeFn` ABI;
+        // `host.as_raw()` is the exact valid, exclusively-borrowed
+        // `RawHost` `host` wraps.
+        unsafe { (vtable.resume)(data, host.as_raw()) }
+    }
+}
+
+impl fmt::Debug for RcGen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<gen>")
+    }
+}
+
+/// The `for` statement's iteration protocol, shared by every execution
+/// mode: lists yield their elements, records yield one single-field record
+/// per entry, and generator objects are resumed once per step (needing the
+/// live host, which is why this isn't a plain `Iterator` - see
+/// [`ValsIter::next`]).
+pub enum ValsIter {
+    List(RcList, usize),
+    Record(RcRecord, usize),
+    Gen(RcGen),
+}
+
+impl ValsIter {
+    pub fn new(v: &Val) -> Result<ValsIter, RuntimeError> {
+        match v.unpack() {
+            ValEnum::List(l) => Ok(ValsIter::List(l, 0)),
+            ValEnum::Record(r) => Ok(ValsIter::Record(r, 0)),
+            ValEnum::Gen(g) => Ok(ValsIter::Gen(g)),
+            _ => Err(RuntimeError::TypeError(
+                "iteration on non-heap value".into(),
+            )),
+        }
+    }
+
+    /// The next item, or `None` when exhausted. A generator step that
+    /// *fails* also comes back `None` (its resume pushed the uninit value)
+    /// with the host's pending-error state set - callers must check that
+    /// state after every `next` before treating `None` as a clean end.
+    pub fn next(&mut self, host: &mut rc::Host) -> Option<Val> {
+        match self {
+            ValsIter::List(l, pos) => {
+                let item = l.get(*pos)?;
+                *pos += 1;
+                Some(item)
+            }
+            ValsIter::Record(r, pos) => {
+                let (key, value) = r.entry_at(*pos)?;
+                *pos += 1;
+                Some(Val::record([(RcStr::new(key), value)]))
+            }
+            ValsIter::Gen(g) => {
+                g.resume(host);
+                let v = host.stack().pop();
+                if v.is_init() { Some(v) } else { None }
+            }
+        }
+    }
+
+    pub fn iter<'a, 'b>(&'a mut self, host: &'a mut rc::Host<'b>) -> IterVals<'a, 'b> {
+        IterVals { host, iter: self }
+    }
+}
+
+pub struct IterVals<'a, 'b> {
+    host: &'a mut rc::Host<'b>,
+    iter: &'a mut ValsIter,
+}
+
+impl Iterator for IterVals<'_, '_> {
+    type Item = Val;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next(self.host)
     }
 }

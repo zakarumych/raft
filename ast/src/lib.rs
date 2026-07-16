@@ -330,6 +330,14 @@ impl Pat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FnCat {
+    Normal,
+    Generator,
+    Async,
+    AsyncGenerator,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StmtKind {
     Expr(Expr),
@@ -364,9 +372,14 @@ pub enum StmtKind {
         else_branch: Option<Rc<[Stmt]>>,
     },
     Return(Option<Expr>),
+    /// `yield <expr>` / bare `yield` - suspend the enclosing generator,
+    /// producing the value (`Nil` when omitted). Only meaningful inside a
+    /// `gen fn` body; the runtimes reject it anywhere else.
+    Yield(Option<Expr>),
     Break,
     Continue,
     Fn {
+        cat: FnCat,
         name: Ident,
         params: Rc<[Pat]>,
         body: Rc<[Stmt]>,
@@ -382,7 +395,7 @@ pub struct Stmt {
 
 impl Stmt {
     pub fn new(kind: StmtKind, span: Span) -> Self {
-        Self { kind, span }
+        Stmt { kind, span }
     }
 
     pub fn kind(&self) -> &StmtKind {

@@ -1,7 +1,7 @@
 use std::{io::Write, rc::Rc};
 
 use raft_ast::{lexer::LexErrorKind, parser::ParseErrorKind};
-use raft_runtime::{Exec, Val};
+use raft_runtime::{Exec, Val, ValsIter};
 
 fn main() {
     std::io::stdout().write_all(b"Raft REPL\n").unwrap();
@@ -83,6 +83,20 @@ fn main() {
                 }
             }
         }
+    );
+
+    rt.register_function(
+        "list",
+        1, Some(1), move |rt, args| {
+            assert!(args == 1);
+            let mut stack = rt.stack();
+            let top = stack.pop();
+            let Some(mut vals_iter) = rt.try_(|| ValsIter::new(&top)) else { return Val::nil(); };
+            let mut host = rt.as_host();
+            let iter = vals_iter.iter(&mut host);
+
+            Val::list(iter)
+        },
     );
 
     let mut lines = String::new();

@@ -925,3 +925,66 @@ fn stmt_for_inline_else_next_line() {
         _ => panic!("expected for statement with else"),
     }
 }
+
+#[test]
+fn stmt_fn_categories() {
+    use crate::FnCat;
+
+    let cases: [(&str, FnCat); 4] = [
+        ("fn f x:\n    x", FnCat::Normal),
+        ("gen fn f x:\n    yield x", FnCat::Generator),
+        ("async fn f x:\n    x", FnCat::Async),
+        ("async gen fn f x:\n    yield x", FnCat::AsyncGenerator),
+    ];
+
+    for (src, expected) in cases {
+        let statement = tokens_from_str(src).parse_stmt().unwrap();
+        match statement.kind() {
+            StmtKind::Fn { cat, name, params, .. } => {
+                assert_eq!(*cat, expected, "category for {src:?}");
+                assert_eq!(name.name(), "f");
+                assert_eq!(params.len(), 1);
+            }
+            _ => panic!("expected fn statement for {src:?}"),
+        }
+    }
+
+    // `gen`/`async` must be followed by a fn form
+    assert!(tokens_from_str("gen x = 1").parse_stmt().is_err());
+    assert!(tokens_from_str("async x = 1").parse_stmt().is_err());
+    assert!(tokens_from_str("async gen x = 1").parse_stmt().is_err());
+}
+
+#[test]
+fn stmt_yield_with_value() {
+    let statement = tokens_from_str("yield a + 1").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::Yield(Some(e)) => {
+            assert!(matches!(e.kind(), ExprKind::Binary(..)));
+        }
+        _ => panic!("expected yield statement with a value"),
+    }
+}
+
+#[test]
+fn stmt_yield_bare() {
+    let statement = tokens_from_str("yield").parse_stmt().unwrap();
+    assert!(matches!(statement.kind(), StmtKind::Yield(None)));
+}
+
+#[test]
+fn yield_parses_inline_and_in_blocks() {
+    let src = "gen fn g n:\n    if n > 0: yield n\n    while n < 3:\n        yield\n        n = n + 1";
+    let statement = tokens_from_str(src).parse_stmt().unwrap();
+    let StmtKind::Fn { body, .. } = statement.kind() else {
+        panic!("expected fn statement");
+    };
+    let StmtKind::If { then_branch, .. } = body[0].kind() else {
+        panic!("expected if statement");
+    };
+    assert!(matches!(then_branch[0].kind(), StmtKind::Yield(Some(_))));
+    let StmtKind::While { body: wbody, .. } = body[1].kind() else {
+        panic!("expected while statement");
+    };
+    assert!(matches!(wbody[0].kind(), StmtKind::Yield(None)));
+}

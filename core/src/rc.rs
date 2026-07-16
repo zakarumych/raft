@@ -286,6 +286,16 @@ pub fn erase_fn<F: Callable>(rc: Rc<F>) -> DynRc<raft_ffi::FnVTable, Void> {
     }
 }
 
+/// As [`erase_fn`], for the `Gen` tag: `G` gets its own monomorphized
+/// [`raft_ffi::GenVTable`] whose `resume` shim dispatches to this exact
+/// generator type.
+pub fn erase_gen<G: Resumable>(rc: Rc<G>) -> DynRc<raft_ffi::GenVTable, Void> {
+    DynRc {
+        ptr: Rc::into_raw_box(rc).cast::<RcInner<Void>>(),
+        vtable: gen_vtable::<G>(),
+    }
+}
+
 /// Minimal callable bound for building a per-concrete-type
 /// [`raft_ffi::FnVTable`] - deliberately smaller than `raft-core`'s own
 /// `Function` trait (no min/max-args or partial-application semantics
@@ -306,6 +316,32 @@ pub trait Callable: 'static + Sized {
     /// the whole allocation, whose strong count is kept alive by the
     /// caller for the duration of the call.
     unsafe fn call_raw(this: RcPtr<Self>, args: usize, host: &mut Host) -> usize;
+}
+
+/// Minimal resumable bound for building a per-concrete-type
+/// [`raft_ffi::GenVTable`] - the [`Callable`] of generator objects.
+/// `raft-core`'s own `Generator` trait bridges into this.
+pub trait Resumable: 'static + Sized {
+    /// Resume the generator inside `this` - pushes exactly one value onto
+    /// the host stack (the yielded value, or the uninit value when the
+    /// generator finished).
+    ///
+    /// # Safety
+    /// As [`Callable::call_raw`]'s.
+    unsafe fn resume_raw(this: RcPtr<Self>, host: &mut Host);
+}
+
+unsafe extern "C" fn resume_shim<G: Resumable>(data: raft_ffi::VoidPtr, host: *mut raft_ffi::RawHost) {
+    // SAFETY: as `call_shim`'s - `data` points at the `value` field of a
+    // live `RcInner<G>` with whole-box provenance.
+    let offset = core::mem::offset_of!(RcInner<G>, value);
+    let box_ptr = unsafe { data.as_ptr().cast::<u8>().sub(offset) } as *mut RcInner<G>;
+    // SAFETY: `host`, per `raft_ffi::ResumeFn`'s contract, is a valid,
+    // exclusively-held `RawHost` for the duration of this call.
+    let mut host = unsafe { Host::from_raw(host) };
+    // SAFETY: derived from `data` per the contract above; non-null since
+    // `data` was.
+    unsafe { G::resume_raw(NonNull::new_unchecked(box_ptr), &mut host) }
 }
 
 unsafe extern "C" fn call_shim<F: Callable>(
@@ -342,7 +378,7 @@ pub struct Host<'a> {
 impl<'a> Host<'a> {
     /// # Safety
     /// `raw` must point at a valid `RawHost`, exclusively borrowed for `'a`.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn from_raw(raw: *mut raft_ffi::RawHost) -> Self {
         Host {
             raw: unsafe { &mut *raw },
@@ -356,12 +392,12 @@ impl<'a> Host<'a> {
     /// only sound caller - it can cast this back to its own type. Ordinary
     /// `Function` implementations never need this; `Host`'s other methods
     /// cover everything they should touch.
-    #[inline]
+    #[inline(always)]
     pub fn as_raw(&mut self) -> *mut raft_ffi::RawHost {
         self.raw
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn stack(&mut self) -> Stack<'_> {
         // SAFETY: struct invariant (`from_raw`'s contract).
         Stack {
@@ -482,12 +518,13 @@ impl<'a> Stack<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn extend(&mut self, values: impl IntoIterator<Item = Val>) {
         let iter = values.into_iter();
 
         let reserve = match iter.size_hint() {
             (lower, Some(upper)) if (upper / 2) < lower => upper,
+            (lower, Some(_upper)) => lower.next_power_of_two(),
             (lower, _) => lower,
         };
 
@@ -499,6 +536,7 @@ impl<'a> Stack<'a> {
 
     /// Push a batch of values in order (the first ends up deepest),
     /// cloning each one out of `values`.
+    #[inline]
     pub fn extend_from_slice(&mut self, values: &[Val]) {
         unsafe { raw_vec_reserve(self.raw, values.len()) };
         for v in values {
@@ -545,6 +583,7 @@ impl<'a> Stack<'a> {
         }
     }
 
+    #[inline]
     pub fn drain_top_into(&mut self, out: &mut [Val]) {
         let n = out.len();
         debug_assert!(self.raw.size >= n);
@@ -564,7 +603,7 @@ impl<'a> Stack<'a> {
         unsafe { raw_vec_truncate_no_drop(&mut self.raw, start) };
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn truncate(&mut self, len: usize) {
         unsafe {
             for i in len..self.raw.size {
@@ -577,7 +616,7 @@ impl<'a> Stack<'a> {
     }
 
     /// Read frame slot `slot` of the frame based at `base`.
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, idx: usize) -> &Val {
         if self.raw.size <= idx {
             stack_out_of_bounds();
@@ -588,7 +627,7 @@ impl<'a> Stack<'a> {
     }
 
     /// Write frame slot `slot` of the frame based at `base`.
-    #[inline]
+    #[inline(always)]
     pub fn set(&mut self, idx: usize, v: Val) {
         if self.raw.size <= idx {
             stack_out_of_bounds();
@@ -603,7 +642,7 @@ impl<'a> Stack<'a> {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn raw_val_uninit() -> raft_ffi::RawVal {
     // SAFETY: `MASK_TAG_UNINIT` is a nonzero constant, never dereferenced
     // as a real pointer.
@@ -754,6 +793,21 @@ pub fn fn_vtable<F: Callable>() -> &'static raft_ffi::FnVTable {
         };
     }
     &Holder::<F>::VTABLE
+}
+
+/// One shared, monomorphized `&'static GenVTable` per concrete `G` - same
+/// idea as [`fn_vtable`], with `resume` in place of `call`.
+pub fn gen_vtable<G: Resumable>() -> &'static raft_ffi::GenVTable {
+    struct Holder<G>(PhantomData<G>);
+    impl<G: Resumable> Holder<G> {
+        const VTABLE: raft_ffi::GenVTable = raft_ffi::GenVTable {
+            any: raft_ffi::AnyVTable {
+                destroy: destroy_shim::<G>,
+            },
+            resume: resume_shim::<G>,
+        };
+    }
+    &Holder::<G>::VTABLE
 }
 
 /// A `T`-typed [`raft_ffi::DestroyFn`]: reclaims a box previously handed
