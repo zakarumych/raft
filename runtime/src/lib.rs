@@ -5,15 +5,19 @@ extern crate alloc;
 use alloc::{rc::Rc, vec::Vec};
 use raft_core::rc::Stack;
 
-use core::{cell::RefCell, cmp::Ordering, fmt, mem::ManuallyDrop};
+use core::{cell::RefCell, cmp::Ordering, fmt, mem::ManuallyDrop, task::Poll};
 
 use smallvec::SmallVec;
 
 use raft_ast::{BinOpKind, Expr, ExprKind, FnCat, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
 
-use crate::vm::CompiledPat;
+use crate::{tasks::ReadyQueue, vm::CompiledPat};
 
 pub mod vm;
+
+mod tasks;
+
+pub use tasks::{TaskId, async_val};
 
 #[cfg(feature = "bundle")]
 mod bundle;
@@ -158,19 +162,21 @@ fn fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
     })))
 }
 
-/// A `gen fn` executed by walking its AST body. Calling it with a full
-/// argument set doesn't run the body - it binds the arguments into a fresh
-/// frame and returns a generator object ([`AstGenerator`]) suspended at
-/// the body's first statement. Partial application works exactly as for
-/// ordinary functions (handled by the generic dispatch before `call`).
-struct AstGenFn {
+/// A `gen fn`/`async fn` executed by walking its AST body. Calling it
+/// with a full argument set doesn't run the body - it binds the arguments
+/// into a fresh frame and returns a coroutine object ([`AstCoroutine`] of
+/// the matching kind) suspended at the body's first statement. Partial
+/// application works exactly as for ordinary functions (handled by the
+/// generic dispatch before `call`).
+struct AstCoroFn {
+    kind: CoroKind,
     params: Rc<[Pat]>,
     body: Rc<[Stmt]>,
     /// Parent frame.
     parent: Rc<Frame>,
 }
 
-impl Function for AstGenFn {
+impl Function for AstCoroFn {
     fn min_args(&self) -> usize {
         self.params.len()
     }
@@ -197,24 +203,46 @@ impl Function for AstGenFn {
             }
         }
 
-        let generator = AstGenerator {
+        let coro = AstCoroutine {
+            kind: self.kind,
             frame,
-            state: RefCell::new(GenState::Suspended(alloc::vec![GenFrame::Block {
-                stmts: self.body.clone(),
-                idx: 0,
-            }])),
+            state: RefCell::new(GenState::initial(self.body.clone())),
         };
         rt.stack()
-            .push(Val::from(ValEnum::Gen(RcGen::new(generator))));
+            .push(Val::from(ValEnum::Coro(RcCoro::new(self.kind, coro))));
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen fn {:?} {{ ... }}>", self.params)
+        let cat = match self.kind {
+            CoroKind::Gen => "gen",
+            CoroKind::Async => "async",
+            CoroKind::AsyncGen => "async gen",
+        };
+        write!(f, "<{cat} fn {:?} {{ ... }}>", self.params)
     }
 }
 
 fn gen_fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
-    Val::from(ValEnum::Fn(RcFn::new(AstGenFn {
+    Val::from(ValEnum::Fn(RcFn::new(AstCoroFn {
+        kind: CoroKind::Gen,
+        params,
+        body,
+        parent,
+    })))
+}
+
+fn async_fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
+    Val::from(ValEnum::Fn(RcFn::new(AstCoroFn {
+        kind: CoroKind::Async,
+        params,
+        body,
+        parent,
+    })))
+}
+
+fn async_gen_fn_from_ast(params: Rc<[Pat]>, body: Rc<[Stmt]>, parent: Rc<Frame>) -> Val {
+    Val::from(ValEnum::Fn(RcFn::new(AstCoroFn {
+        kind: CoroKind::AsyncGen,
         params,
         body,
         parent,
@@ -241,69 +269,141 @@ enum GenFrame {
         idx: usize,
         iter: ValsIter,
     },
+    /// An active `yield from` - each step yields the delegate iterator's
+    /// next value directly; exhaustion pops the frame and continues.
+    Delegate { iter: ValsIter },
+    /// An active `await` - `stmts[idx]` is the awaiting statement (a bare
+    /// `await` expression statement, or an assignment whose whole RHS is
+    /// one). Each step re-resumes `future`: `Pending` suspends the
+    /// machine, `Yielded` delivers the resolution (followed by the
+    /// mandatory final `Done` resume), which binds/records the value and
+    /// pops the frame.
+    Await {
+        stmts: Rc<[Stmt]>,
+        idx: usize,
+        future: RcCoro,
+    },
 }
 
 enum GenState {
-    Suspended(Vec<GenFrame>),
+    Suspended {
+        frames: Vec<GenFrame>,
+        /// The value of the last executed statement - an async body's
+        /// implicit result when it runs off the end (generators ignore it).
+        last: Val,
+    },
     /// Finished (returned, ran off the end, failed), or currently
     /// executing - a re-entrant resume through the body's own calls sees
     /// `Done` and reports exhaustion instead of aliasing the live state.
     Done,
 }
 
-/// A live generator created by calling an [`AstGenFn`]: the locals frame
-/// (arguments bound, persists across resumes) and the suspended
-/// continuation.
-struct AstGenerator {
+impl GenState {
+    fn initial(body: Rc<[Stmt]>) -> Self {
+        GenState::Suspended {
+            frames: alloc::vec![GenFrame::Block {
+                stmts: body,
+                idx: 0,
+            }],
+            last: Val::nil(),
+        }
+    }
+}
+
+/// What suspends or ends one [`machine_step`] run.
+enum MachineStep {
+    /// A `yield` produced a value (generator machines only).
+    Yielded(Val),
+    /// An awaited future is pending (async machines only) - the frames
+    /// are intact, re-stepping later re-polls it.
+    Pending,
+    /// The body finished: an explicit `return`'s value, or the last
+    /// executed statement's.
+    Done(Val),
+}
+
+/// A live coroutine created by calling an [`AstCoroFn`]: the locals frame
+/// (arguments bound, persists across resumes), the suspended
+/// continuation, and the kind deciding how the machine's steps map onto
+/// the [`CoroStatus`] protocol.
+struct AstCoroutine {
+    kind: CoroKind,
     frame: Rc<Frame>,
     state: RefCell<GenState>,
 }
 
-impl Generator for AstGenerator {
-    fn resume(&self, host: &mut raft_core::rc::Host) {
+impl Coroutine for AstCoroutine {
+    fn resume(&self, host: &mut raft_core::rc::Host, args: usize) -> CoroStatus {
         // SAFETY: as `AstFn::call`'s.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
 
+        debug_assert_eq!(args, 0, "gen/async coroutines take no resume arguments");
+
         let state = core::mem::replace(&mut *self.state.borrow_mut(), GenState::Done);
-        let GenState::Suspended(mut frames) = state else {
-            rt.stack().push(Val::from(ValEnum::Uninit));
-            return;
+        let GenState::Suspended {
+            mut frames,
+            mut last,
+        } = state
+        else {
+            // finished (or re-entrantly resumed): keeps reporting Done
+            return CoroStatus::Done;
         };
 
-        match self.step(rt, &mut frames) {
-            Ok(Some(v)) => {
-                *self.state.borrow_mut() = GenState::Suspended(frames);
+        match machine_step(rt, &self.frame, &mut frames, &mut last, self.kind) {
+            Ok(MachineStep::Yielded(v)) => {
+                *self.state.borrow_mut() = GenState::Suspended { frames, last };
                 rt.stack().push(v);
+                CoroStatus::Yielded
             }
-            // finished - state stays Done
-            Ok(None) => rt.stack().push(Val::from(ValEnum::Uninit)),
+            Ok(MachineStep::Pending) => {
+                *self.state.borrow_mut() = GenState::Suspended { frames, last };
+                CoroStatus::Pending
+            }
+            Ok(MachineStep::Done(v)) => match self.kind {
+                // a generator's result is discarded - the end itself is
+                // the signal
+                CoroKind::Gen | CoroKind::AsyncGen => CoroStatus::Done,
+                // an async body's result is delivered as the one Yielded
+                // step; state stays Done, so the mandatory follow-up
+                // resume reports the final Done
+                CoroKind::Async => {
+                    rt.stack().push(v);
+                    CoroStatus::Yielded
+                }
+            },
             Err(e) => {
                 rt.set_error(e);
-                rt.stack().push(Val::from(ValEnum::Uninit));
+                CoroStatus::Done
             }
         }
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen {{ ... }}>")
+        match self.kind {
+            CoroKind::Gen => write!(f, "<gen {{ ... }}>"),
+            CoroKind::Async => write!(f, "<async {{ ... }}>"),
+            CoroKind::AsyncGen => write!(f, "<async gen {{ ... }}>"),
+        }
     }
 }
 
-impl AstGenerator {
-    /// Run until the next `yield` (`Ok(Some(value))`) or the generator's
-    /// end (`Ok(None)`): an explicit statement machine over `frames`, so
-    /// suspension is a plain early return with the continuation intact.
-    /// Control statements are stepped here; everything that can't suspend
-    /// (expressions, assignments, nested `fn` definitions) delegates to
-    /// the ordinary walker.
-    fn step(
-        &self,
-        rt: &mut Runtime,
-        frames: &mut Vec<GenFrame>,
-    ) -> Result<Option<Val>, RuntimeError> {
+/// Run a suspended body machine until it yields (`Gen`), an awaited
+/// future is pending (`Async`), or the body finishes: an explicit
+/// statement machine over `frames`, so suspension is a plain early return
+/// with the continuation intact. Control statements are stepped here;
+/// everything that can't suspend (expressions, assignments, nested `fn`
+/// definitions) delegates to the ordinary walker.
+fn machine_step(
+    rt: &mut Runtime,
+    frame: &Rc<Frame>,
+    frames: &mut Vec<GenFrame>,
+    last: &mut Val,
+    kind: CoroKind,
+) -> Result<MachineStep, RuntimeError> {
+    {
         loop {
             let (stmts, idx) = match frames.last_mut() {
-                None => return Ok(None),
+                None => return Ok(MachineStep::Done(last.clone())),
                 Some(GenFrame::Block { stmts, idx }) => {
                     if *idx >= stmts.len() {
                         frames.pop();
@@ -320,7 +420,7 @@ impl AstGenerator {
                     } = stmts[at].kind() else {
                         unreachable!("GenFrame::While must point at a while statement")
                     };
-                    let cv = rt.eval(cond, &self.frame)?;
+                    let cv = rt.eval(cond, frame)?;
                     if is_falsey(&cv) {
                         frames.pop();
                         if let Some(eb) = else_branch {
@@ -337,6 +437,48 @@ impl AstGenerator {
                     }
                     continue;
                 }
+                Some(GenFrame::Delegate { iter }) => {
+                    match iter.step(&mut rt.as_host())? {
+                        ValsIterStep::Item(item) => return Ok(MachineStep::Yielded(item)),
+                        ValsIterStep::End => {
+                            // a coroutine step that failed also reports
+                            // exhaustion - surface its pending error instead
+                            rt.status.clone()?;
+                            frames.pop();
+                        }
+                        // an async-gen delegate must wait - suspend the
+                        // machine (the frame stays; re-stepping re-steps
+                        // the iterator)
+                        ValsIterStep::Pending => {
+                            if kind == CoroKind::Gen {
+                                return Err(RuntimeError::TypeError(
+                                    "cannot iterate an async generator outside an async context"
+                                        .into(),
+                                ));
+                            }
+                            return Ok(MachineStep::Pending);
+                        }
+                    }
+                    continue;
+                }
+                Some(GenFrame::Await { stmts, idx, future }) => {
+                    let future = future.clone();
+                    let (stmts, at) = (stmts.clone(), *idx);
+                    let v = match await_step(rt, &future)? {
+                        Poll::Pending => return Ok(MachineStep::Pending),
+                        Poll::Ready(v) => v,
+                    };
+                    frames.pop();
+                    match stmts[at].kind() {
+                        StmtKind::Expr(_) => *last = v,
+                        StmtKind::AssignPat { target, .. } => {
+                            rt.bind_pattern(target, &v, frame)?;
+                            *last = Val::nil();
+                        }
+                        _ => unreachable!("GenFrame::Await must point at an awaiting statement"),
+                    }
+                    continue;
+                }
                 Some(GenFrame::For { stmts, idx, iter }) => {
                     let (stmts, at) = (stmts.clone(), *idx);
                     let StmtKind::For {
@@ -344,16 +486,16 @@ impl AstGenerator {
                     } = stmts[at].kind() else {
                         unreachable!("GenFrame::For must point at a for statement")
                     };
-                    match iter.next(&mut rt.as_host()) {
-                        Some(item) => {
-                            rt.bind_pattern(target, &item, &self.frame)?;
+                    match iter.step(&mut rt.as_host())? {
+                        ValsIterStep::Item(item) => {
+                            rt.bind_pattern(target, &item, frame)?;
                             frames.push(GenFrame::Block {
                                 stmts: body.clone(),
                                 idx: 0,
                             });
                         }
-                        None => {
-                            // a generator step that failed also reports
+                        ValsIterStep::End => {
+                            // a coroutine step that failed also reports
                             // exhaustion - surface its pending error instead
                             rt.status.clone()?;
                             frames.pop();
@@ -364,6 +506,18 @@ impl AstGenerator {
                                 });
                             }
                         }
+                        // an async-gen iterable must wait - suspend the
+                        // machine (the frame stays; re-stepping re-steps
+                        // the iterator)
+                        ValsIterStep::Pending => {
+                            if kind == CoroKind::Gen {
+                                return Err(RuntimeError::TypeError(
+                                    "cannot iterate an async generator outside an async context"
+                                        .into(),
+                                ));
+                            }
+                            return Ok(MachineStep::Pending);
+                        }
                     }
                     continue;
                 }
@@ -372,19 +526,61 @@ impl AstGenerator {
             let statement = &stmts[idx];
             match statement.kind() {
                 StmtKind::Yield(value) => {
+                    if kind == CoroKind::Async {
+                        return Err(RuntimeError::Other(
+                            "yield statement outside of generator".into(),
+                        ));
+                    }
                     let v = match value {
-                        Some(e) => rt.eval(e, &self.frame)?,
+                        Some(e) => rt.eval(e, frame)?,
                         None => Val::nil(),
                     };
-                    return Ok(Some(v));
+                    return Ok(MachineStep::Yielded(v));
+                }
+                StmtKind::YieldFrom(expr) => {
+                    if kind == CoroKind::Async {
+                        return Err(RuntimeError::Other(
+                            "yield statement outside of generator".into(),
+                        ));
+                    }
+                    let iter_val = rt.eval(expr, frame)?;
+                    let iter = ValsIter::new(&iter_val)?;
+                    frames.push(GenFrame::Delegate { iter });
+                }
+                // `await e` / `x = await e` - suspension points, stepped
+                // here rather than delegated to the walker
+                StmtKind::Expr(e) if matches!(e.kind(), ExprKind::Await(_)) => {
+                    let ExprKind::Await(inner) = e.kind() else {
+                        unreachable!()
+                    };
+                    let future = eval_await_operand(rt, frame, inner, kind)?;
+                    frames.push(GenFrame::Await {
+                        stmts: stmts.clone(),
+                        idx,
+                        future,
+                    });
+                }
+                StmtKind::AssignPat { value, .. }
+                    if matches!(value.kind(), ExprKind::Await(_)) =>
+                {
+                    let ExprKind::Await(inner) = value.kind() else {
+                        unreachable!()
+                    };
+                    let future = eval_await_operand(rt, frame, inner, kind)?;
+                    frames.push(GenFrame::Await {
+                        stmts: stmts.clone(),
+                        idx,
+                        future,
+                    });
                 }
                 StmtKind::Return(value) => {
-                    // evaluated for its side effects; a generator's return
-                    // value is discarded (the end is signalled by Uninit)
-                    if let Some(e) = value {
-                        rt.eval(e, &self.frame)?;
-                    }
-                    return Ok(None);
+                    let v = match value {
+                        Some(e) => rt.eval(e, frame)?,
+                        None => Val::nil(),
+                    };
+                    // an async body resolves to this; a generator's result
+                    // is discarded by its wrapper
+                    return Ok(MachineStep::Done(v));
                 }
                 StmtKind::Break => loop {
                     match frames.pop() {
@@ -394,7 +590,11 @@ impl AstGenerator {
                             ));
                         }
                         Some(GenFrame::While { .. }) | Some(GenFrame::For { .. }) => break,
-                        Some(GenFrame::Block { .. }) => {}
+                        // nothing nests lexically under a Delegate/Await
+                        // frame, but treat them like blocks defensively
+                        Some(GenFrame::Block { .. })
+                        | Some(GenFrame::Delegate { .. })
+                        | Some(GenFrame::Await { .. }) => {}
                     }
                 },
                 StmtKind::Continue => loop {
@@ -405,7 +605,9 @@ impl AstGenerator {
                             ));
                         }
                         Some(GenFrame::While { .. }) | Some(GenFrame::For { .. }) => break,
-                        Some(GenFrame::Block { .. }) => {
+                        Some(GenFrame::Block { .. })
+                        | Some(GenFrame::Delegate { .. })
+                        | Some(GenFrame::Await { .. }) => {
                             frames.pop();
                         }
                     }
@@ -415,7 +617,7 @@ impl AstGenerator {
                     then_branch,
                     else_branch,
                 } => {
-                    let cv = rt.eval_impl(cond, &self.frame, true)?;
+                    let cv = rt.eval_impl(cond, frame, true)?;
                     if !is_falsey(&cv) {
                         frames.push(GenFrame::Block {
                             stmts: then_branch.clone(),
@@ -432,7 +634,7 @@ impl AstGenerator {
                     frames.push(GenFrame::While { stmts: stmts.clone(), idx });
                 }
                 StmtKind::For { iterable, .. } => {
-                    let iter_val = rt.eval_impl(iterable, &self.frame, true)?;
+                    let iter_val = rt.eval_impl(iterable, frame, true)?;
                     let iter = ValsIter::new(&iter_val)?;
                     frames.push(GenFrame::For {
                         stmts: stmts.clone(),
@@ -442,9 +644,60 @@ impl AstGenerator {
                 }
                 // everything else executes in one step - it can't suspend
                 _ => {
-                    rt.exec_stmt(statement, self.frame.clone())?;
+                    if let Exec::Value(v) = rt.exec_stmt(statement, frame.clone())? {
+                        *last = v;
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Evaluate an `await`'s operand to the async coroutine it resumes -
+/// erroring on `await` in a generator body, or on a non-async operand.
+fn eval_await_operand(
+    rt: &mut Runtime,
+    frame: &Rc<Frame>,
+    inner: &Expr,
+    kind: CoroKind,
+) -> Result<RcCoro, RuntimeError> {
+    if kind == CoroKind::Gen {
+        return Err(RuntimeError::Other(
+            "await outside of async function".into(),
+        ));
+    }
+    let fv = rt.eval(inner, frame)?;
+    match fv.unpack() {
+        ValEnum::Coro(c) if c.kind() == Some(CoroKind::Async) => Ok(c),
+        _ => Err(RuntimeError::TypeError("await on non-async value".into())),
+    }
+}
+
+/// One protocol-checked `await` step against an async-kind coroutine:
+/// `Ok(None)` when it reported [`CoroStatus::Pending`], `Ok(Some(v))`
+/// when it delivered its resolution (`Yielded`, followed by the mandatory
+/// final `Done` resume). A `Done` before any yield surfaces the
+/// coroutine's own pending error if it set one, else is a protocol error.
+pub(crate) fn await_step(rt: &mut Runtime, future: &RcCoro) -> Result<Poll<Val>, RuntimeError> {
+    match future.resume(&mut rt.as_host(), 0) {
+        CoroStatus::Pending => Ok(Poll::Pending),
+        CoroStatus::Yielded => {
+            let v = rt.stack().pop();
+            match future.resume(&mut rt.as_host(), 0) {
+                CoroStatus::Done => {
+                    rt.status.clone()?;
+                    Ok(Poll::Ready(v))
+                }
+                _ => Err(RuntimeError::Other(
+                    "async coroutine yielded more than once".into(),
+                )),
+            }
+        }
+        CoroStatus::Done => {
+            rt.status.clone()?;
+            Err(RuntimeError::Other(
+                "async coroutine finished without a result".into(),
+            ))
         }
     }
 }
@@ -513,6 +766,7 @@ fn collect_reads_expr(expr: &Expr, out: &mut Vec<RcStr>) {
             collect_reads_expr(idx, out);
         }
         ExprKind::Parenthesized(e) => collect_reads_expr(e, out),
+        ExprKind::Await(e) => collect_reads_expr(e, out),
     }
 }
 
@@ -587,7 +841,9 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) => collect_reads_expr(e, out),
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom(e) => {
+            collect_reads_expr(e, out)
+        }
         StmtKind::Return(None)
         | StmtKind::Yield(None)
         | StmtKind::Break
@@ -726,6 +982,7 @@ impl SlotTable {
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
             | StmtKind::Yield(_)
+            | StmtKind::YieldFrom(_)
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -1057,6 +1314,16 @@ pub struct Runtime {
     /// function are plain `Any::Fn` values and can call each other freely.
     compile_fns: bool,
 
+    /// Task ids ready to be polled again - shared with every task waker
+    /// (weakly), drained by [`Runtime::block_on`].
+    ready: tasks::ReadyQueue,
+
+    /// Live (spawned, unresolved) tasks.
+    tasks: HashMap<TaskId, tasks::TaskEntry>,
+
+    /// Next task id to hand out.
+    next_task: u64,
+
     /// Bundle cdylibs linked into this runtime (see [`Runtime::link_bundle`]).
     /// Values produced by a bundle carry vtable and code pointers into its
     /// library, so the libraries must outlive every `Val` this runtime
@@ -1108,6 +1375,7 @@ impl Runtime {
                     size: 0,
                     capacity: empty.capacity(),
                 },
+                waker: core::ptr::null_mut(),
             },
             ctx: Context::default(),
             global: HashMap::default(),
@@ -1115,6 +1383,9 @@ impl Runtime {
             loading: Vec::new(),
             status: Ok(()),
             compile_fns: false,
+            ready: ReadyQueue::new(),
+            tasks: HashMap::default(),
+            next_task: 0,
             #[cfg(feature = "bundle")]
             libraries: Vec::new(),
         }
@@ -1350,6 +1621,11 @@ impl Runtime {
                 index_of(&objv, &idxv)
             }
             ExprKind::Parenthesized(expr) => self.eval_impl(expr, frame, true),
+            // awaits only execute inside an async fn's own machine (which
+            // intercepts them before evaluation) - anywhere else is misuse
+            ExprKind::Await(_) => Err(RuntimeError::Other(
+                "await outside of async function".into(),
+            )),
         }
     }
 
@@ -1541,7 +1817,7 @@ impl Runtime {
                 let mut values = ValsIter::new(&iter_val)?;
 
                 loop {
-                    let Some(value) = values.next(&mut self.as_host()) else {
+                    let Some(value) = values.next(&mut self.as_host())? else {
                         // a generator step that failed also reports
                         // exhaustion - surface its pending error instead
                         self.status.clone()?;
@@ -1568,7 +1844,7 @@ impl Runtime {
                 let v = self.eval_impl(expr, &frame, false)?;
                 Ok(Exec::Return(v))
             }
-            StmtKind::Yield(_) => Err(RuntimeError::Other(
+            StmtKind::Yield(_) | StmtKind::YieldFrom(_) => Err(RuntimeError::Other(
                 "yield statement outside of generator".into(),
             )),
             StmtKind::Break => Ok(Exec::Break),
@@ -1617,10 +1893,39 @@ impl Runtime {
                             gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
                         }
                     }
-                    FnCat::Async | FnCat::AsyncGenerator => {
-                        return Err(RuntimeError::Other(
-                            "async functions are not implemented yet".into(),
-                        ));
+                    FnCat::Async => {
+                        if self.compile_fns {
+                            match vm::compile_async_fn(
+                                self,
+                                params.clone(),
+                                body,
+                                vm::CompileParent::Walked(frame.clone()),
+                            ) {
+                                Ok(compiled) => compiled,
+                                Err(_) => {
+                                    async_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                                }
+                            }
+                        } else {
+                            async_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                        }
+                    }
+                    FnCat::AsyncGenerator => {
+                        if self.compile_fns {
+                            match vm::compile_async_gen_fn(
+                                self,
+                                params.clone(),
+                                body,
+                                vm::CompileParent::Walked(frame.clone()),
+                            ) {
+                                Ok(compiled) => compiled,
+                                Err(_) => {
+                                    async_gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                                }
+                            }
+                        } else {
+                            async_gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
+                        }
                     }
                 };
 

@@ -988,3 +988,58 @@ fn yield_parses_inline_and_in_blocks() {
     };
     assert!(matches!(wbody[0].kind(), StmtKind::Yield(None)));
 }
+
+#[test]
+fn stmt_yield_from() {
+    let statement = tokens_from_str("yield from source").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::YieldFrom(e) => {
+            assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "source"));
+        }
+        _ => panic!("expected yield from statement"),
+    }
+
+    // bare `yield from` is a parse error - an iterable is required
+    assert!(tokens_from_str("yield from").parse_stmt().is_err());
+    // plain yields unaffected
+    assert!(matches!(
+        tokens_from_str("yield").parse_stmt().unwrap().kind(),
+        StmtKind::Yield(None)
+    ));
+    assert!(matches!(
+        tokens_from_str("yield x").parse_stmt().unwrap().kind(),
+        StmtKind::Yield(Some(_))
+    ));
+    // `from` is reserved now: rejected in statement position
+    assert!(tokens_from_str("from = 1").parse_stmt().is_err());
+}
+
+#[test]
+fn stmt_await_positions() {
+    // whole statement
+    let statement = tokens_from_str("await task").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::Expr(e) => {
+            let ExprKind::Await(inner) = e.kind() else {
+                panic!("expected await expression statement");
+            };
+            assert!(matches!(inner.kind(), ExprKind::Ident(i) if i.name() == "task"));
+        }
+        _ => panic!("expected expression statement"),
+    }
+
+    // assignment right-hand side
+    let statement = tokens_from_str("x = await (fetch url)").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::AssignPat { target, value } => {
+            assert!(matches!(target.kind(), PatKind::Ident(i) if i.name() == "x"));
+            assert!(matches!(value.kind(), ExprKind::Await(_)));
+        }
+        _ => panic!("expected assignment"),
+    }
+
+    // bare `await` is a parse error - an operand is required
+    assert!(tokens_from_str("await").parse_stmt().is_err());
+    // `await` is reserved in statement position
+    assert!(tokens_from_str("await = 1").parse_stmt().is_err());
+}

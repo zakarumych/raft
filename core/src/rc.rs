@@ -9,7 +9,7 @@ use alloc::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc},
     boxed::Box,
 };
-use core::{cell::Cell, marker::PhantomData, ops::Deref, ptr::NonNull};
+use core::{cell::Cell, marker::PhantomData, ops::Deref, ptr::NonNull, sync::atomic::Ordering};
 
 use raft_ffi::{RawVal, RawVec, RcInner, RcPtr, Void};
 
@@ -286,13 +286,15 @@ pub fn erase_fn<F: Callable>(rc: Rc<F>) -> DynRc<raft_ffi::FnVTable, Void> {
     }
 }
 
-/// As [`erase_fn`], for the `Gen` tag: `G` gets its own monomorphized
-/// [`raft_ffi::GenVTable`] whose `resume` shim dispatches to this exact
-/// generator type.
-pub fn erase_gen<G: Resumable>(rc: Rc<G>) -> DynRc<raft_ffi::GenVTable, Void> {
+/// As [`erase_fn`], for the `Coro` tag: `C` gets its own monomorphized
+/// [`raft_ffi::CoroVTable`] whose `resume` shim dispatches to this exact
+/// coroutine type. `C`'s payload must start with a
+/// [`raft_ffi::CoroHeader`] (see `raft-core`'s `CoroBox`) - consumers
+/// read the kind straight off the value.
+pub fn erase_coro<C: Resumable>(rc: Rc<C>) -> DynRc<raft_ffi::CoroVTable, Void> {
     DynRc {
         ptr: Rc::into_raw_box(rc).cast::<RcInner<Void>>(),
-        vtable: gen_vtable::<G>(),
+        vtable: coro_vtable::<C>(),
     }
 }
 
@@ -319,29 +321,35 @@ pub trait Callable: 'static + Sized {
 }
 
 /// Minimal resumable bound for building a per-concrete-type
-/// [`raft_ffi::GenVTable`] - the [`Callable`] of generator objects.
-/// `raft-core`'s own `Generator` trait bridges into this.
+/// [`raft_ffi::CoroVTable`] - the [`Callable`] of coroutine objects.
+/// `raft-core`'s own `Coroutine` trait bridges into this (through its
+/// header-carrying `CoroBox` wrapper).
 pub trait Resumable: 'static + Sized {
-    /// Resume the generator inside `this` - pushes exactly one value onto
-    /// the host stack (the yielded value, or the uninit value when the
-    /// generator finished).
+    /// Resume the coroutine inside `this` with `args` arguments on the
+    /// stack (0 for today's generator and async kinds), returning the raw
+    /// status byte ([`raft_ffi::CORO_DONE`]/[`raft_ffi::CORO_YIELD`]/
+    /// [`raft_ffi::CORO_PENDING`]).
     ///
     /// # Safety
     /// As [`Callable::call_raw`]'s.
-    unsafe fn resume_raw(this: RcPtr<Self>, host: &mut Host);
+    unsafe fn resume_raw(this: RcPtr<Self>, args: usize, host: &mut Host) -> u8;
 }
 
-unsafe extern "C" fn resume_shim<G: Resumable>(data: raft_ffi::VoidPtr, host: *mut raft_ffi::RawHost) {
+unsafe extern "C" fn resume_shim<C: Resumable>(
+    data: raft_ffi::VoidPtr,
+    args: usize,
+    host: *mut raft_ffi::RawHost,
+) -> u8 {
     // SAFETY: as `call_shim`'s - `data` points at the `value` field of a
-    // live `RcInner<G>` with whole-box provenance.
-    let offset = core::mem::offset_of!(RcInner<G>, value);
-    let box_ptr = unsafe { data.as_ptr().cast::<u8>().sub(offset) } as *mut RcInner<G>;
-    // SAFETY: `host`, per `raft_ffi::ResumeFn`'s contract, is a valid,
+    // live `RcInner<C>` with whole-box provenance.
+    let offset = core::mem::offset_of!(RcInner<C>, value);
+    let box_ptr = unsafe { data.as_ptr().cast::<u8>().sub(offset) } as *mut RcInner<C>;
+    // SAFETY: `host`, per `raft_ffi::CoroResumeFn`'s contract, is a valid,
     // exclusively-held `RawHost` for the duration of this call.
     let mut host = unsafe { Host::from_raw(host) };
     // SAFETY: derived from `data` per the contract above; non-null since
     // `data` was.
-    unsafe { G::resume_raw(NonNull::new_unchecked(box_ptr), &mut host) }
+    unsafe { C::resume_raw(NonNull::new_unchecked(box_ptr), args, &mut host) }
 }
 
 unsafe extern "C" fn call_shim<F: Callable>(
@@ -402,6 +410,191 @@ impl<'a> Host<'a> {
         // SAFETY: struct invariant (`from_raw`'s contract).
         Stack {
             raw: &mut self.raw.stack,
+        }
+    }
+
+    /// The waker of the poll currently driving this host, cloned into an
+    /// owned handle - `None` outside any poll. A leaf async value stores
+    /// this and wakes it when its result becomes available.
+    pub fn waker(&self) -> Option<FfiWaker> {
+        NonNull::new(self.raw.waker).map(|ptr| {
+            // SAFETY: a non-null `RawHost::waker` is a live waker for the
+            // duration of the poll currently on the stack (the executor's
+            // contract); cloning through its vtable yields an owned
+            // reference independent of that window.
+            unsafe {
+                let w = ptr.as_ref();
+                w.strong.fetch_add(1, Ordering::Relaxed);
+            }
+            FfiWaker { ptr }
+        })
+    }
+
+    /// A real `core::task::Waker` for the current poll (a noop waker
+    /// outside any poll) - what adapting an ordinary Rust future needs.
+    pub fn rust_waker(&self) -> core::task::Waker {
+        match self.waker() {
+            Some(w) => w.into_waker(),
+            None => core::task::Waker::noop().clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// FfiWaker: an owned reference to a host waker crossing the FFI boundary
+// as a thin pointer (vtable in the allocation's prefix - see raft-ffi's
+// async section). Adapting to `core::task::Waker` is a thin round trip:
+// the RawWaker data pointer IS the header pointer.
+//
+// Single-threaded contract: despite `Waker`'s nominal `Send + Sync`, a
+// host waker must only be cloned/woken/dropped on the host's own thread.
+// ---------------------------------------------------------------------
+
+pub struct FfiWaker {
+    ptr: raft_ffi::WakerPtr,
+}
+
+impl FfiWaker {
+    /// # Safety
+    /// `ptr` must be an owned reference to a live FFI waker (its vtable's
+    /// `drop` must be safe to call exactly once for it).
+    #[inline]
+    pub unsafe fn from_raw(ptr: raft_ffi::WakerPtr) -> Self {
+        FfiWaker { ptr }
+    }
+
+    /// Hand the owned reference across a raw boundary - pair with
+    /// [`FfiWaker::from_raw`], or the vtable's own `wake`/`drop`.
+    #[inline]
+    pub fn into_raw(self) -> raft_ffi::WakerPtr {
+        let ptr = self.ptr;
+        core::mem::forget(self);
+        ptr
+    }
+
+    /// The raw pointer behind this reference, without giving it up - for
+    /// installing it as a host's ambient waker while still owning it.
+    #[inline]
+    pub fn as_raw(this: &Self) -> raft_ffi::WakerPtr {
+        this.ptr
+    }
+
+    #[inline]
+    fn vtable(&self) -> &raft_ffi::WakerVTable {
+        // SAFETY: struct invariant - `ptr` is a live waker whose header
+        // holds a valid, effectively-'static vtable.
+        unsafe { &*(*self.ptr.as_ptr()).vtable }
+    }
+
+    /// Wake the task this waker belongs to.
+    #[inline]
+    pub fn wake(&self) {
+        // SAFETY: struct invariant; `wake_by_ref` borrows.
+        unsafe { (self.vtable().wake)(self.ptr) }
+    }
+
+    /// Adapt into a real `core::task::Waker` (consuming this reference):
+    /// the `RawWaker` data pointer is the header pointer itself, and one
+    /// static vtable forwards every operation - no allocation per hop.
+    pub fn into_raw_waker(self) -> core::task::RawWaker {
+        let ptr = self.into_raw();
+
+        // SAFETY: `FFI_WAKER_VTABLE`'s fns uphold RawWaker's contract by
+        // forwarding to the header's own vtable, which owns the reference
+        // semantics.
+
+        core::task::RawWaker::new(ptr.cast().as_ptr(), &FFI_WAKER_VTABLE)
+    }
+
+    /// Adapt into a real `core::task::Waker` (consuming this reference):
+    /// the `RawWaker` data pointer is the header pointer itself, and one
+    /// static vtable forwards every operation - no allocation per hop.
+    pub fn into_waker(self) -> core::task::Waker {
+        // SAFETY: `FFI_WAKER_VTABLE`'s fns uphold RawWaker's contract by
+        // forwarding to the header's own vtable, which owns the reference
+        // semantics.
+        unsafe { core::task::Waker::from_raw(self.into_raw_waker()) }
+    }
+}
+
+impl Clone for FfiWaker {
+    fn clone(&self) -> Self {
+        unsafe {
+            let w = self.ptr.as_ref();
+            w.strong.fetch_add(1, Ordering::Relaxed);
+        }
+
+        FfiWaker { ptr: self.ptr }
+    }
+}
+
+impl Drop for FfiWaker {
+    fn drop(&mut self) {
+        let destroy = unsafe {
+            let w = self.ptr.as_ref();
+            w.strong.fetch_sub(1, Ordering::Release) == 1
+        };
+
+        if destroy {
+            let destroy_fn = self.vtable().destroy;
+            // SAFETY: struct invariant - this releases the one reference
+            // `self` owned.
+            unsafe { destroy_fn(self.ptr) }
+        }
+    }
+}
+
+static FFI_WAKER_VTABLE: core::task::RawWakerVTable = core::task::RawWakerVTable::new(
+    ffi_waker_clone,
+    ffi_waker_wake,
+    ffi_waker_wake_by_ref,
+    ffi_waker_drop,
+);
+
+/// # Safety (all four)
+/// `data` is a `WakerPtr` previously released by [`FfiWaker::into_waker`]
+/// or by `ffi_waker_clone` - a live, owned FFI waker reference.
+unsafe fn ffi_waker_clone(data: *const ()) -> core::task::RawWaker {
+    match NonNull::new(data as *mut ()) {
+        None => core::task::RawWaker::new(core::ptr::null_mut(), &FFI_WAKER_VTABLE),
+        Some(ptr) => unsafe {
+            let ptr = ptr.cast::<raft_ffi::WakerHeader>();
+            let w = ptr.as_ref();
+            w.strong.fetch_add(1, Ordering::Relaxed);
+            core::task::RawWaker::new(ptr.as_ptr() as *mut (), &FFI_WAKER_VTABLE)
+        },
+    }
+}
+
+unsafe fn ffi_waker_wake(data: *const ()) {
+    unsafe {
+        ffi_waker_wake_by_ref(data);
+        ffi_waker_drop(data);
+    }
+}
+
+unsafe fn ffi_waker_wake_by_ref(data: *const ()) {
+    if let Some(ptr) = NonNull::new(data as *mut ()) {
+        unsafe {
+            let ptr = ptr.cast::<raft_ffi::WakerHeader>();
+            let w = ptr.as_ref();
+            let wake = (&*w.vtable).wake;
+            wake(ptr);
+        }
+    }
+}
+
+unsafe fn ffi_waker_drop(data: *const ()) {
+    if let Some(ptr) = NonNull::new(data as *mut ()) {
+        unsafe {
+            let ptr = ptr.cast::<raft_ffi::WakerHeader>();
+            let (destroy, fun) = {
+                let w = ptr.as_ref();
+                (w.strong.fetch_sub(1, Ordering::Release) == 1, (&*w.vtable).destroy)
+            };
+            if destroy {
+                fun(ptr);
+            }
         }
     }
 }
@@ -795,19 +988,19 @@ pub fn fn_vtable<F: Callable>() -> &'static raft_ffi::FnVTable {
     &Holder::<F>::VTABLE
 }
 
-/// One shared, monomorphized `&'static GenVTable` per concrete `G` - same
-/// idea as [`fn_vtable`], with `resume` in place of `call`.
-pub fn gen_vtable<G: Resumable>() -> &'static raft_ffi::GenVTable {
-    struct Holder<G>(PhantomData<G>);
-    impl<G: Resumable> Holder<G> {
-        const VTABLE: raft_ffi::GenVTable = raft_ffi::GenVTable {
+/// One shared, monomorphized `&'static CoroVTable` per concrete `C` -
+/// same idea as [`fn_vtable`], with `resume` in place of `call`.
+pub fn coro_vtable<C: Resumable>() -> &'static raft_ffi::CoroVTable {
+    struct Holder<C>(PhantomData<C>);
+    impl<C: Resumable> Holder<C> {
+        const VTABLE: raft_ffi::CoroVTable = raft_ffi::CoroVTable {
             any: raft_ffi::AnyVTable {
-                destroy: destroy_shim::<G>,
+                destroy: destroy_shim::<C>,
             },
-            resume: resume_shim::<G>,
+            resume: resume_shim::<C>,
         };
     }
-    &Holder::<G>::VTABLE
+    &Holder::<C>::VTABLE
 }
 
 /// A `T`-typed [`raft_ffi::DestroyFn`]: reclaims a box previously handed

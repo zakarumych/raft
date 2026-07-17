@@ -40,18 +40,21 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{cell::RefCell, fmt};
+use core::{cell::RefCell, fmt, task::Poll};
 use smallvec::SmallVec;
 
-use raft_ast::{BinOpKind, Expr, ExprKind, FnCat, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind};
+use raft_ast::{
+    BinOpKind, Expr, ExprKind, FnCat, Lit, Pat, PatKind, Span, Stmt, StmtKind, UnOpKind,
+};
 
 use crate::{
-    Atom, ConstId, Context, FixedHashMap, Frame, Number, PatId, RcStrName, Runtime,
-    RuntimeError, SlotId, SlotTable, StringId, Val, ValEnum, assign_field, assign_index,
-    atom_val, eval_binary, eval_unary, field_of, index_of, is_falsey, literal_value,
-    new_list, new_record,
+    Atom, ConstId, Context, FixedHashMap, Frame, Number, PatId, RcStrName, Runtime, RuntimeError,
+    SlotId, SlotTable, StringId, Val, ValEnum, assign_field, assign_index, atom_val, eval_binary,
+    eval_unary, field_of, index_of, is_falsey, literal_value, new_list, new_record,
 };
-use raft_core::{Function, Generator, RcFn, RcGen, RcStr, ValsIter, rc};
+use raft_core::{
+    CoroKind, CoroStatus, Coroutine, Function, RcCoro, RcFn, RcStr, ValsIter, ValsIterStep, rc,
+};
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
 /// (never a global pool - a nested `fn` is only ever referenced from the
@@ -128,6 +131,12 @@ pub enum Instr {
     /// whoever resumed it. Only ever emitted into `gen fn` bodies; the
     /// resume continues right after this instruction.
     Yield,
+    /// `fut → v` *or* suspend - poll the async value on top of the stack
+    /// (the executor's waker is ambient on the host). Ready: replace it
+    /// with its resolution. Pending: suspend the enclosing async frame
+    /// with the future still on the stack; the next poll re-runs this
+    /// same instruction. Only ever emitted into `async fn` bodies.
+    Await,
     /// `→` - unconditional jump to code index `t`.
     Jump(u32),
     /// `c →` - pop; jump to `t` if the value is falsey.
@@ -249,9 +258,10 @@ mod opcode {
     pub const ITER_POP: u8 = ITER_INIT + 1;
     pub const RETURN: u8 = ITER_POP + 1;
     pub const YIELD: u8 = RETURN + 1;
+    pub const AWAIT: u8 = YIELD + 1;
 
     /// Fixed 4-byte little-endian byte-offset operand.
-    pub const JUMP: u8 = YIELD + 1;
+    pub const JUMP: u8 = AWAIT + 1;
     pub const JUMP_IF_FALSE: u8 = JUMP + 1;
     pub const ITER_NEXT: u8 = JUMP_IF_FALSE + 1;
 
@@ -585,7 +595,8 @@ fn instr_len(i: &Instr) -> usize {
         | Instr::IterInit
         | Instr::IterPop
         | Instr::Return
-        | Instr::Yield => 0,
+        | Instr::Yield
+        | Instr::Await => 0,
     }
 }
 
@@ -682,12 +693,11 @@ pub fn encode(instrs: &[Instr]) -> Code {
             Instr::IterPop => bytes.push(opcode::ITER_POP),
             Instr::Return => bytes.push(opcode::RETURN),
             Instr::Yield => bytes.push(opcode::YIELD),
+            Instr::Await => bytes.push(opcode::AWAIT),
             Instr::LoadCap(slot) => push_op(&mut bytes, opcode::LOAD_CAP, slot.0),
             Instr::StoreCap(slot) => push_op(&mut bytes, opcode::STORE_CAP, slot.0),
             Instr::MakeClosure(t) => push_wop(&mut bytes, opcode::MAKE_CLOSURE, t.0),
-            Instr::LoadParentByName(v) => {
-                push_wop(&mut bytes, opcode::LOAD_PARENT_BY_NAME, v.0)
-            }
+            Instr::LoadParentByName(v) => push_wop(&mut bytes, opcode::LOAD_PARENT_BY_NAME, v.0),
         }
     }
 
@@ -724,9 +734,9 @@ impl Code {
                 opcode::LOAD_SLOT..opcode::LOAD_SLOT_END => Instr::LoadSlot(SlotId(
                     decode_operand(op - opcode::LOAD_SLOT, code, &mut pc)?,
                 )),
-                opcode::LOAD_PARENT..opcode::LOAD_PARENT_END => {
-                    Instr::LoadParent(SlotId(decode_operand(op - opcode::LOAD_PARENT, code, &mut pc)?))
-                }
+                opcode::LOAD_PARENT..opcode::LOAD_PARENT_END => Instr::LoadParent(SlotId(
+                    decode_operand(op - opcode::LOAD_PARENT, code, &mut pc)?,
+                )),
                 opcode::LOAD_GLOBAL..opcode::LOAD_GLOBAL_END => Instr::LoadGlobal(StringId(
                     decode_wop(op - opcode::LOAD_GLOBAL, code, &mut pc)?,
                 )),
@@ -824,6 +834,7 @@ impl Code {
                 opcode::ITER_POP => Instr::IterPop,
                 opcode::RETURN => Instr::Return,
                 opcode::YIELD => Instr::Yield,
+                opcode::AWAIT => Instr::Await,
                 opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
                 opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
                 opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
@@ -835,9 +846,9 @@ impl Code {
                 opcode::STORE_CAP..opcode::STORE_CAP_END => Instr::StoreCap(SlotId(
                     decode_operand(op - opcode::STORE_CAP, code, &mut pc)?,
                 )),
-                opcode::MAKE_CLOSURE..opcode::MAKE_CLOSURE_END => Instr::MakeClosure(FnId(
-                    decode_wop(op - opcode::MAKE_CLOSURE, code, &mut pc)?,
-                )),
+                opcode::MAKE_CLOSURE..opcode::MAKE_CLOSURE_END => {
+                    Instr::MakeClosure(FnId(decode_wop(op - opcode::MAKE_CLOSURE, code, &mut pc)?))
+                }
                 opcode::LOAD_PARENT_BY_NAME..opcode::LOAD_PARENT_BY_NAME_END => {
                     Instr::LoadParentByName(StringId(decode_wop(
                         op - opcode::LOAD_PARENT_BY_NAME,
@@ -1260,10 +1271,11 @@ pub struct FnTemplate {
     /// attaches that frame directly or skips straight past it to whatever
     /// the defining function's own `outer` already is.
     needs_own_frame: bool,
-    /// Whether this template is a `gen fn` - `Instr::MakeClosure` then
-    /// wraps the instantiated [`CompiledFn`] as a gen-fn value (calling it
-    /// builds a suspended [`VmGenerator`]) instead of a plain function.
-    is_gen: bool,
+    /// What kind of fn this template is - `Instr::MakeClosure` wraps the
+    /// instantiated [`CompiledFn`] accordingly: plain function, gen-fn
+    /// (calls build a suspended [`VmGenerator`]) or async-fn (calls build
+    /// a suspended [`VmFuture`]).
+    mode: FnMode,
     /// This function's own nested `fn`s, carried through so the
     /// instantiated [`CompiledFn`] has them too (see `CompiledFn::consts`/
     /// `CompiledFn::templates`) - shared, not copied, across every
@@ -1286,14 +1298,15 @@ impl CompiledFn {
         Val::from(ValEnum::Fn(RcFn::new(self)))
     }
 
-    /// Wrap into a first-class gen-fn value: same currying/partial
+    /// Wrap into a first-class coroutine-fn value: same currying/partial
     /// application as [`into_function`](CompiledFn::into_function), but a
-    /// full application builds a suspended [`VmGenerator`] over this code
-    /// instead of running it.
+    /// full application builds (and primes) a suspended [`VmCoroutine`] of
+    /// `kind` over this code instead of running it.
     #[inline]
-    pub fn into_gen_function(self) -> Val {
-        Val::from(ValEnum::Fn(RcFn::new(CompiledGenFn {
+    pub fn into_coro_function(self, kind: CoroKind) -> Val {
+        Val::from(ValEnum::Fn(RcFn::new(CompiledCoroFn {
             f: rc::Rc::new(self),
+            kind,
         })))
     }
 
@@ -1453,6 +1466,31 @@ pub enum CompileParent {
     Walked(Rc<Frame>),
 }
 
+/// What kind of body a function compiles as - decides which suspension
+/// statements are legal (`yield`/`yield from` in `Gen`, `await` in
+/// `Async`) and how the compiled code is wrapped into a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FnMode {
+    Normal,
+    Gen,
+    Async,
+    AsyncGen,
+}
+
+impl FnMode {
+    /// `yield`/`yield from` allowed in this body?
+    #[inline]
+    fn yields(self) -> bool {
+        matches!(self, FnMode::Gen | FnMode::AsyncGen)
+    }
+
+    /// `await` allowed in this body?
+    #[inline]
+    fn awaits(self) -> bool {
+        matches!(self, FnMode::Async | FnMode::AsyncGen)
+    }
+}
+
 pub fn compile_fn(
     rt: &mut Runtime,
     params: Rc<[Pat]>,
@@ -1460,7 +1498,7 @@ pub fn compile_fn(
     parent: CompileParent,
     force_captured: &[RcStr],
 ) -> Result<(CompiledFn, Rc<Schema>), CompileError> {
-    compile_fn_impl(rt, params, body, parent, force_captured, false)
+    compile_fn_impl(rt, params, body, parent, force_captured, FnMode::Normal)
 }
 
 /// Compile a `gen fn` to bytecode and wrap it as a first-class gen-fn
@@ -1474,8 +1512,35 @@ pub fn compile_gen_fn(
     body: &[Stmt],
     parent: CompileParent,
 ) -> Result<Val, CompileError> {
-    let (compiled, _schema) = compile_fn_impl(rt, params, body, parent, &[], true)?;
-    Ok(compiled.into_gen_function())
+    let (compiled, _schema) = compile_fn_impl(rt, params, body, parent, &[], FnMode::Gen)?;
+    Ok(compiled.into_coro_function(CoroKind::Gen))
+}
+
+/// Compile an `async fn` to bytecode and wrap it as a first-class
+/// async-fn value: a full application builds a suspended [`VmFuture`]
+/// instead of running the body. Same walker fallback as the others.
+pub fn compile_async_fn(
+    rt: &mut Runtime,
+    params: Rc<[Pat]>,
+    body: &[Stmt],
+    parent: CompileParent,
+) -> Result<Val, CompileError> {
+    let (compiled, _schema) = compile_fn_impl(rt, params, body, parent, &[], FnMode::Async)?;
+    Ok(compiled.into_coro_function(CoroKind::Async))
+}
+
+/// Compile an `async gen fn` to bytecode and wrap it as a first-class
+/// async-gen-fn value: a full application builds a suspended
+/// [`VmCoroutine`] whose body may both `yield` and `await`. Same walker
+/// fallback as the others.
+pub fn compile_async_gen_fn(
+    rt: &mut Runtime,
+    params: Rc<[Pat]>,
+    body: &[Stmt],
+    parent: CompileParent,
+) -> Result<Val, CompileError> {
+    let (compiled, _schema) = compile_fn_impl(rt, params, body, parent, &[], FnMode::AsyncGen)?;
+    Ok(compiled.into_coro_function(CoroKind::AsyncGen))
 }
 
 fn compile_fn_impl(
@@ -1484,7 +1549,7 @@ fn compile_fn_impl(
     body: &[Stmt],
     parent: CompileParent,
     force_captured: &[RcStr],
-    is_gen: bool,
+    mode: FnMode,
 ) -> Result<(CompiledFn, Rc<Schema>), CompileError> {
     let arity = params.len() as u32;
     let mut slots = SlotTable::with_params(&params);
@@ -1563,7 +1628,7 @@ fn compile_fn_impl(
         nested_consts: Vec::new(),
         nested_templates: Vec::new(),
         template_refs: Vec::new(),
-        is_gen,
+        mode,
     };
 
     // prologue: unpack destructuring parameters out of their argument
@@ -1589,10 +1654,11 @@ fn compile_fn_impl(
         }
     }
 
-    // a generator's parameter binding must run (and fail) at creation
-    // time, like the walker's and the transpiler's - end the prologue with
-    // a marker yield the creation call primes to and discards
-    if is_gen {
+    // a generator's/async fn's parameter binding must run (and fail) at
+    // creation time, like the walker's and the transpiler's - end the
+    // prologue with a marker yield the creation call primes to and
+    // discards
+    if mode != FnMode::Normal {
         c.emit(Instr::Nil);
         c.emit(Instr::Yield);
     }
@@ -1739,9 +1805,7 @@ fn int_literal_of(expr: &Expr) -> Option<i64> {
         _ => return None,
     };
     match literal_value(lit).map(|v| v.unpack()) {
-        Ok(ValEnum::Number(Number::Integer(n))) => {
-            Some(if negated { n.wrapping_neg() } else { n })
-        }
+        Ok(ValEnum::Number(Number::Integer(n))) => Some(if negated { n.wrapping_neg() } else { n }),
         _ => None,
     }
 }
@@ -1790,10 +1854,10 @@ struct Compiler<'a> {
     /// `nested_templates` by local (unshifted) index, patched to the final
     /// flat index once `nested_consts` stops growing.
     template_refs: Vec<usize>,
-    /// Whether this body is a `gen fn`'s - the only place `yield` compiles;
-    /// anywhere else it's a compile error (and, through the walker
-    /// fallback, a runtime error).
-    is_gen: bool,
+    /// What kind of body this is - `yield`/`yield from` only compile in a
+    /// `Gen` body, `await` only in an `Async` one; anywhere else they're
+    /// compile errors (and, through the walker fallback, runtime errors).
+    mode: FnMode,
 }
 
 impl Compiler<'_> {
@@ -1959,6 +2023,34 @@ impl Compiler<'_> {
     /// statement must leave the stack untouched.
     fn compile_stmt(&mut self, statement: &Stmt, tail: bool) -> Result<(), CompileError> {
         match statement.kind() {
+            // `await e` / `x = await e` - the two grammatical positions an
+            // await can occupy, compiled here (in an async body) so the
+            // suspension lands at a statement boundary. Anywhere else the
+            // generic paths below reach compile_expr's Await arm, which
+            // rejects it.
+            StmtKind::Expr(e) if self.mode.awaits() && matches!(e.kind(), ExprKind::Await(_)) => {
+                let ExprKind::Await(inner) = e.kind() else {
+                    unreachable!()
+                };
+                self.compile_expr(inner, true)?;
+                self.emit(Instr::Await);
+                if !tail {
+                    self.emit(Instr::Pop);
+                }
+            }
+            StmtKind::AssignPat { target, value }
+                if self.mode.awaits() && matches!(value.kind(), ExprKind::Await(_)) =>
+            {
+                let ExprKind::Await(inner) = value.kind() else {
+                    unreachable!()
+                };
+                self.compile_expr(inner, true)?;
+                self.emit(Instr::Await);
+                self.compile_bind(target);
+                if tail {
+                    self.emit(Instr::Nil); // assignments yield nil
+                }
+            }
             StmtKind::Expr(e) => {
                 // Use expression value only in tail position.
                 // Otherwise compile only side effects.
@@ -2126,7 +2218,7 @@ impl Compiler<'_> {
                 self.emit(Instr::Return);
             }
             StmtKind::Yield(value) => {
-                if !self.is_gen {
+                if !self.mode.yields() {
                     return Err(CompileError::new(
                         statement.span(),
                         "yield statement outside of generator",
@@ -2139,6 +2231,28 @@ impl Compiler<'_> {
                     }
                 }
                 self.emit(Instr::Yield);
+                if tail {
+                    self.emit(Instr::Nil); // a yield statement's own value is nil
+                }
+            }
+            StmtKind::YieldFrom(expr) => {
+                if !self.mode.yields() {
+                    return Err(CompileError::new(
+                        statement.span(),
+                        "yield statement outside of generator",
+                    ));
+                }
+                // pure desugar - a bind-less `for` whose body is a yield:
+                // the open iterator rides the generator's persistent
+                // iterator stack, so it survives each suspension
+                self.compile_expr(expr, true)?;
+                self.emit(Instr::IterInit);
+                let head = self.here();
+                let next = self.emit(Instr::IterNext(0));
+                self.emit(Instr::Yield);
+                self.emit(Instr::Jump(head));
+                let exit = self.here();
+                self.patch(next, exit);
                 if tail {
                     self.emit(Instr::Nil); // a yield statement's own value is nil
                 }
@@ -2178,15 +2292,11 @@ impl Compiler<'_> {
                 params,
                 body,
             } => {
-                let child_is_gen = match cat {
-                    FnCat::Normal => false,
-                    FnCat::Generator => true,
-                    FnCat::Async | FnCat::AsyncGenerator => {
-                        return Err(CompileError::new(
-                            statement.span(),
-                            "async functions are not implemented yet",
-                        ));
-                    }
+                let child_mode = match cat {
+                    FnCat::Normal => FnMode::Normal,
+                    FnCat::Generator => FnMode::Gen,
+                    FnCat::Async => FnMode::Async,
+                    FnCat::AsyncGenerator => FnMode::AsyncGen,
                 };
                 // does the nested fn (or something nested *inside* it,
                 // transitively - `fn_outer_names` already recurses)
@@ -2225,7 +2335,7 @@ impl Compiler<'_> {
                         walked_tail: self.walked_tail,
                     },
                     &[],
-                    child_is_gen,
+                    child_mode,
                 )?;
 
                 // does the nested fn read anything not bound within
@@ -2248,7 +2358,7 @@ impl Compiler<'_> {
                         fallback: compiled.fallback,
                         owns_frame: compiled.owns_frame,
                         needs_own_frame: needs_own_schema,
-                        is_gen: child_is_gen,
+                        mode: child_mode,
                         consts: compiled.consts,
                         templates: compiled.templates,
                     };
@@ -2263,10 +2373,11 @@ impl Compiler<'_> {
                     // consts occupy the flat range 0..consts.len() and
                     // never move, so this index is final immediately
                     let idx = self.nested_consts.len() as u32;
-                    self.nested_consts.push(if child_is_gen {
-                        compiled.into_gen_function()
-                    } else {
-                        compiled.into_function()
+                    self.nested_consts.push(match child_mode {
+                        FnMode::Normal => compiled.into_function(),
+                        FnMode::Gen => compiled.into_coro_function(CoroKind::Gen),
+                        FnMode::Async => compiled.into_coro_function(CoroKind::Async),
+                        FnMode::AsyncGen => compiled.into_coro_function(CoroKind::AsyncGen),
                     });
                     self.emit(Instr::MakeClosure(FnId(idx)));
                 }
@@ -2409,6 +2520,14 @@ impl Compiler<'_> {
             }
             // parentheses put the inner expression in call position
             ExprKind::Parenthesized(inner) => self.compile_expr_callfn(inner, used)?,
+            // awaits compile only at their two statement-level positions
+            // (see compile_stmt) - reaching here means misuse
+            ExprKind::Await(_) => {
+                return Err(CompileError::new(
+                    expr.span(),
+                    "await outside of async function",
+                ));
+            }
         }
         Ok(())
     }
@@ -2456,12 +2575,15 @@ fn make_own_frame(f: &CompiledFn) -> Rc<CompiledFrame> {
 }
 
 /// How a frame left [`run_frame`]: an ordinary return (the result is on
-/// the stack, the frame's slots are gone), or a `yield` out of a generator
+/// the stack, the frame's slots are gone), a `yield` out of a generator
 /// frame (the yielded value is on top of the *intact* frame, and `pc` is
-/// where a resume continues).
+/// where a resume continues), or a pending `await` out of an async frame
+/// (the frame - awaited future included - is intact, and `pc` re-runs the
+/// `Await` instruction on the next poll).
 enum FrameExit {
     Return,
     Yield { pc: usize },
+    Pending { pc: usize },
 }
 
 /// The live `for`-iterator stack of one frame. Owned by the caller (not a
@@ -2482,20 +2604,24 @@ pub fn run(rt: &mut Runtime, f: &CompiledFn) -> Result<(), RuntimeError> {
     let own = f.owns_frame.then(|| make_own_frame(f));
 
     let mut iters = IterStack::new();
-    let result = run_frame(rt, &f.code.bytes, base, f, own.as_ref(), 0, &mut iters)
-        .map(expect_return)?;
+    let result =
+        run_frame(rt, &f.code.bytes, base, f, own.as_ref(), 0, &mut iters).map(expect_return)?;
     debug_assert!(rt.stack().len() >= base);
     result
 }
 
-/// A non-generator frame can only leave through `Return` - `Instr::Yield`
-/// is never emitted outside a `gen fn` body, and gen-fn code only ever
-/// runs inside [`VmGenerator::resume`].
+/// A plain frame can only leave through `Return` - `Instr::Yield`/
+/// `Instr::Await` are never emitted outside `gen fn`/`async fn` bodies,
+/// whose code only ever runs inside [`VmGenerator::resume`]/
+/// [`VmFuture`]'s poll.
 fn expect_return(exit: FrameExit) -> Result<(), RuntimeError> {
     match exit {
         FrameExit::Return => Ok(()),
         FrameExit::Yield { .. } => Err(RuntimeError::Other(
             "vm: yield outside of a generator frame".into(),
+        )),
+        FrameExit::Pending { .. } => Err(RuntimeError::Other(
+            "vm: await outside of an async frame".into(),
         )),
     }
 }
@@ -2506,7 +2632,10 @@ fn expect_return(exit: FrameExit) -> Result<(), RuntimeError> {
 /// of it. The body's own tail value (ordinarily `Nil`, since a module's
 /// last statement is rarely meaningful on its own) is discarded - `export`
 /// is structural, not part of the statement list `f` was compiled from.
-pub fn run_module(rt: &mut Runtime, f: &CompiledFn) -> Result<Option<Rc<CompiledFrame>>, RuntimeError> {
+pub fn run_module(
+    rt: &mut Runtime,
+    f: &CompiledFn,
+) -> Result<Option<Rc<CompiledFrame>>, RuntimeError> {
     debug_assert_eq!(f.arity(), 0);
     let base = rt.stack().len();
     rt.stack().extend_uninit(f.frame_size as usize);
@@ -2539,22 +2668,25 @@ pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<()
     let own = f.owns_frame.then(|| make_own_frame(f));
 
     let mut iters = IterStack::new();
-    let result =
-        run_frame(rt, code, base, f, own.as_ref(), 0, &mut iters).map(expect_return)?;
+    let result = run_frame(rt, code, base, f, own.as_ref(), 0, &mut iters).map(expect_return)?;
     debug_assert!(rt.stack().len() >= base);
     result
 }
 
-/// A compiled `gen fn` as a first-class function value. Calling it with a
-/// full argument set never runs the body: it captures the arguments (plus
-/// room for the body's locals) as a suspended frame image and pushes a
-/// [`VmGenerator`] over them. Partial application is handled by the
-/// generic dispatch before `call`, exactly as for [`CompiledFn`].
-struct CompiledGenFn {
+/// A compiled `gen fn`/`async fn` as a first-class function value.
+/// Calling it with a full argument set never runs the body: it captures
+/// the arguments (plus room for the body's locals) as a suspended frame
+/// image, primes it through the prologue's marker yield (parameter binds
+/// fail at creation, matching the walker/transpiler) and pushes a
+/// [`VmCoroutine`] of the matching kind over it. Partial application is
+/// handled by the generic dispatch before `call`, exactly as for
+/// [`CompiledFn`].
+struct CompiledCoroFn {
     f: rc::Rc<CompiledFn>,
+    kind: CoroKind,
 }
 
-impl Function for CompiledGenFn {
+impl Function for CompiledCoroFn {
     #[inline]
     fn min_args(&self) -> usize {
         self.f.arity()
@@ -2571,22 +2703,22 @@ impl Function for CompiledGenFn {
         // SAFETY: as `AstFn::call`'s.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
 
-        // move the arguments off the operand stack into the generator's
+        // move the arguments off the operand stack into the coroutine's
         // saved frame image (same bottom-to-top order a live frame has),
         // and reserve the body's locals - the first resume then enters at
         // pc 0 exactly like a fresh call frame
-        let mut stack =
-            alloc::vec![Val::from(ValEnum::Uninit); args + self.f.frame_size as usize];
+        let mut stack = alloc::vec![Val::from(ValEnum::Uninit); args + self.f.frame_size as usize];
         rt.stack().drain_top_into(&mut stack[..args]);
 
-        // the reified frame for captured locals is per-generator, not
-        // per-resume: closures made before a yield keep seeing the same
-        // captured state after it
+        // the reified frame for captured locals is per-coroutine, not
+        // per-resume: closures made before a suspension keep seeing the
+        // same captured state after it
         let own = self.f.owns_frame.then(|| make_own_frame(&self.f));
 
-        let generator = VmGenerator {
+        let coro = VmCoroutine {
             f: self.f.clone(),
             own,
+            kind: self.kind,
             state: RefCell::new(VmGenState::Suspended {
                 pc: 0,
                 stack,
@@ -2596,23 +2728,23 @@ impl Function for CompiledGenFn {
 
         // prime to the prologue's marker yield: parameter binding runs
         // (and fails) now, at creation, matching the walker/transpiler
-        generator.resume(&mut rt.as_host());
-        let marker = rt.stack().pop();
-        debug_assert!(
-            rt.status.is_err() || matches!(marker.unpack(), ValEnum::Atom(Atom::Nil)),
-            "gen prologue must yield the Nil marker"
-        );
-        if rt.status.is_err() {
+        if let Err(e) = coro.prime(rt) {
+            rt.set_error(e);
             // a failed callee pushes no result (see `Function::call`)
             return;
         }
 
         rt.stack()
-            .push(Val::from(ValEnum::Gen(RcGen::new(generator))));
+            .push(Val::from(ValEnum::Coro(RcCoro::new(self.kind, coro))));
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen fn {}>", self.f.arity())
+        let cat = match self.kind {
+            CoroKind::Gen => "gen",
+            CoroKind::Async => "async",
+            CoroKind::AsyncGen => "async gen",
+        };
+        write!(f, "<{cat} fn {}>", self.f.arity())
     }
 }
 
@@ -2631,21 +2763,35 @@ enum VmGenState {
     Done,
 }
 
-/// A live generator over compiled code: on each resume the saved frame
+/// A live coroutine over compiled code: on each resume the saved frame
 /// image is pushed back onto the shared operand stack, the dispatch loop
-/// re-enters at the saved `pc`, and a `Yield` exit peels the frame back
-/// off into the state for the next resume.
-struct VmGenerator {
+/// re-enters at the saved `pc`, and a suspending exit (`Yield`/`Pending`)
+/// peels the frame back off into the state for the next resume. The kind
+/// decides how frame exits map onto the [`CoroStatus`] protocol.
+struct VmCoroutine {
     f: rc::Rc<CompiledFn>,
     own: Option<Rc<CompiledFrame>>,
+    kind: CoroKind,
     state: RefCell<VmGenState>,
 }
 
-impl Generator for VmGenerator {
-    fn resume(&self, host: &mut rc::Host) {
-        // SAFETY: as `AstFn::call`'s.
-        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+/// How one [`VmCoroutine::drive`] run ended, with all frame bookkeeping
+/// already settled.
+enum DriveExit {
+    /// The body finished; its result is on top of the (torn-down) stack.
+    Return,
+    /// An awaited future is pending; the frame image was saved back.
+    Pending,
+    /// A `Yield` instruction fired. The value was popped and the frame
+    /// image saved back, suspended right after it.
+    Yielded(Val),
+}
 
+impl VmCoroutine {
+    /// Run the suspended frame image once, settling `self.state` for
+    /// every exit; the caller interprets the result. Must only be called
+    /// on a `Suspended` state (the caller checks).
+    fn drive(&self, rt: &mut Runtime) -> Result<DriveExit, RuntimeError> {
         let state = core::mem::replace(&mut *self.state.borrow_mut(), VmGenState::Done);
         let VmGenState::Suspended {
             pc,
@@ -2653,12 +2799,19 @@ impl Generator for VmGenerator {
             mut iters,
         } = state
         else {
-            rt.stack().push(Val::from(ValEnum::Uninit));
-            return;
+            return Err(RuntimeError::Other(
+                "vm: coroutine frame resumed while running".into(),
+            ));
         };
 
         let base = rt.stack().len();
         rt.stack().extend(stack);
+
+        let save = |rt: &mut Runtime, pc: usize, iters: IterStack, state: &RefCell<VmGenState>| {
+            let mut stack = alloc::vec![Val::from(ValEnum::Uninit); rt.stack().len() - base];
+            rt.stack().drain_top_into(&mut stack);
+            *state.borrow_mut() = VmGenState::Suspended { pc, stack, iters };
+        };
 
         match run_frame(
             rt,
@@ -2669,31 +2822,109 @@ impl Generator for VmGenerator {
             pc,
             &mut iters,
         ) {
-            Ok(FrameExit::Yield { pc }) => {
-                // top of stack: the yielded value; under it, the intact
-                // frame image to save for the next resume
-                let yielded = rt.stack().pop();
-                let mut stack = alloc::vec![Val::from(ValEnum::Uninit); rt.stack().len() - base];
-                rt.stack().drain_top_into(&mut stack);
-                *self.state.borrow_mut() = VmGenState::Suspended { pc, stack, iters };
-                rt.stack().push(yielded);
+            Ok(FrameExit::Return) => Ok(DriveExit::Return),
+            Ok(FrameExit::Pending { pc }) => {
+                // nothing was pushed past the frame - peel it back off
+                // into the state for the next resume
+                save(rt, pc, iters, &self.state);
+                Ok(DriveExit::Pending)
             }
-            Ok(FrameExit::Return) => {
-                // Return already truncated the frame; its value is
-                // discarded - a generator's end is signalled by Uninit
-                rt.stack().pop();
-                rt.stack().push(Val::from(ValEnum::Uninit));
+            Ok(FrameExit::Yield { pc }) => {
+                let v = rt.stack().pop();
+                save(rt, pc, iters, &self.state);
+                Ok(DriveExit::Yielded(v))
             }
             Err(e) => {
                 rt.stack().truncate(base);
+                Err(e)
+            }
+        }
+    }
+
+    /// Creation-time prime: run the parameter prologue to its marker
+    /// yield and discard the marker.
+    fn prime(&self, rt: &mut Runtime) -> Result<(), RuntimeError> {
+        match self.drive(rt)? {
+            DriveExit::Yielded(marker) => {
+                debug_assert!(
+                    matches!(marker.unpack(), ValEnum::Atom(Atom::Nil)),
+                    "coroutine prologue must yield the Nil marker"
+                );
+                let _ = marker;
+                Ok(())
+            }
+            _ => Err(RuntimeError::Other(
+                "vm: coroutine prologue did not reach its marker".into(),
+            )),
+        }
+    }
+}
+
+impl Coroutine for VmCoroutine {
+    fn resume(&self, host: &mut rc::Host, args: usize) -> CoroStatus {
+        // SAFETY: as `AstFn::call`'s.
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+
+        debug_assert_eq!(args, 0, "gen/async coroutines take no resume arguments");
+
+        if matches!(&*self.state.borrow(), VmGenState::Done) {
+            // finished (or re-entrantly resumed): keeps reporting Done
+            return CoroStatus::Done;
+        }
+
+        match self.drive(rt) {
+            Ok(DriveExit::Yielded(v)) => match self.kind {
+                CoroKind::Gen | CoroKind::AsyncGen => {
+                    rt.stack().push(v);
+                    CoroStatus::Yielded
+                }
+                CoroKind::Async => {
+                    // the compiler rejects `yield` in async bodies; the
+                    // creation prime consumed the prologue marker
+                    *self.state.borrow_mut() = VmGenState::Done;
+                    rt.set_error(RuntimeError::Other(
+                        "vm: yield inside an async frame".into(),
+                    ));
+                    CoroStatus::Done
+                }
+            },
+            Ok(DriveExit::Return) => match self.kind {
+                // a generator's result is discarded - the end itself is
+                // the signal (Return already tore the frame down)
+                CoroKind::Gen | CoroKind::AsyncGen => {
+                    rt.stack().pop();
+                    CoroStatus::Done
+                }
+                // an async body's result (already on top) is delivered as
+                // the one Yielded step; state is Done, so the mandatory
+                // follow-up resume reports the final Done
+                CoroKind::Async => CoroStatus::Yielded,
+            },
+            Ok(DriveExit::Pending) => match self.kind {
+                CoroKind::Gen => {
+                    // the compiler rejects `await` in generator bodies
+                    *self.state.borrow_mut() = VmGenState::Done;
+                    rt.set_error(RuntimeError::Other(
+                        "vm: await inside a generator frame".into(),
+                    ));
+                    CoroStatus::Done
+                }
+                CoroKind::Async | CoroKind::AsyncGen => CoroStatus::Pending,
+            },
+            Err(e) => {
                 rt.set_error(e);
-                rt.stack().push(Val::from(ValEnum::Uninit));
+                CoroStatus::Done
             }
         }
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen {}>", self.f.arity())
+        let cat = match self.kind {
+            CoroKind::Gen => "gen",
+            CoroKind::Async => "async",
+            CoroKind::AsyncGen => "async gen",
+        };
+        write!(f, "<{cat} {}>", self.f.arity())
     }
 }
 
@@ -2729,23 +2960,28 @@ fn run_frame(
             opcode::FALSE => rt.stack().push(Val::false_()),
             opcode::INT..opcode::INT_END => {
                 let n = SMALL_INTS[(op - opcode::INT) as usize];
-                rt.stack().push(Val::from(ValEnum::Number(Number::Integer(n))));
+                rt.stack()
+                    .push(Val::from(ValEnum::Number(Number::Integer(n))));
             }
             opcode::INT_8 => {
                 let n = read_u8(code, &mut pc)? as i8 as i64;
-                rt.stack().push(Val::from(ValEnum::Number(Number::Integer(n))));
+                rt.stack()
+                    .push(Val::from(ValEnum::Number(Number::Integer(n))));
             }
             opcode::INT_16 => {
                 let n = read_u16(code, &mut pc)? as i16 as i64;
-                rt.stack().push(Val::from(ValEnum::Number(Number::Integer(n))));
+                rt.stack()
+                    .push(Val::from(ValEnum::Number(Number::Integer(n))));
             }
             opcode::UINT_8 => {
                 let n = read_u8(code, &mut pc)? as i64;
-                rt.stack().push(Val::from(ValEnum::Number(Number::Integer(n))));
+                rt.stack()
+                    .push(Val::from(ValEnum::Number(Number::Integer(n))));
             }
             opcode::UINT_16 => {
                 let n = read_u16(code, &mut pc)? as i64;
-                rt.stack().push(Val::from(ValEnum::Number(Number::Integer(n))));
+                rt.stack()
+                    .push(Val::from(ValEnum::Number(Number::Integer(n))));
             }
             opcode::POP => {
                 rt.stack().pop();
@@ -2842,10 +3078,11 @@ fn run_frame(
                         consts: template.consts.clone(),
                         templates: template.templates.clone(),
                     };
-                    rt.stack().push(if template.is_gen {
-                        child.into_gen_function()
-                    } else {
-                        child.into_function()
+                    rt.stack().push(match template.mode {
+                        FnMode::Normal => child.into_function(),
+                        FnMode::Gen => child.into_coro_function(CoroKind::Gen),
+                        FnMode::Async => child.into_coro_function(CoroKind::Async),
+                        FnMode::AsyncGen => child.into_coro_function(CoroKind::AsyncGen),
                     });
                 }
             }
@@ -2915,7 +3152,11 @@ fn run_frame(
                     Val::from(ValEnum::Number(Number::Integer(x.wrapping_add(n))))
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Add, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Add,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2926,7 +3167,11 @@ fn run_frame(
                     Val::from(ValEnum::Number(Number::Integer(x.wrapping_sub(n))))
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Sub, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Sub,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2937,7 +3182,11 @@ fn run_frame(
                     Val::from(ValEnum::Number(Number::Integer(x & n)))
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::BitAnd, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::BitAnd,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2948,7 +3197,11 @@ fn run_frame(
                     Val::from(ValEnum::Number(Number::Integer(x | n)))
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::BitOr, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::BitOr,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2959,7 +3212,11 @@ fn run_frame(
                     Val::from(ValEnum::Number(Number::Integer(x ^ n)))
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::BitXor, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::BitXor,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2970,7 +3227,11 @@ fn run_frame(
                     Val::bool_(x == n)
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Eq, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Eq,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2980,7 +3241,11 @@ fn run_frame(
                 let v = if let ValEnum::Number(Number::Integer(x)) = a.unpack() {
                     Val::bool_(x != n)
                 } else {
-                    eval_binary(BinOpKind::Ne, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Ne,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -2991,7 +3256,11 @@ fn run_frame(
                     Val::bool_(x < n)
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Lt, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Lt,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -3002,7 +3271,11 @@ fn run_frame(
                     Val::bool_(x > n)
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Gt, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Gt,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -3013,7 +3286,11 @@ fn run_frame(
                     Val::bool_(x <= n)
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Le, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Le,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -3024,7 +3301,11 @@ fn run_frame(
                     Val::bool_(x >= n)
                 } else {
                     core::hint::cold_path();
-                    eval_binary(BinOpKind::Ge, &a, &Val::from(ValEnum::Number(Number::Integer(n))))?
+                    eval_binary(
+                        BinOpKind::Ge,
+                        &a,
+                        &Val::from(ValEnum::Number(Number::Integer(n))),
+                    )?
                 };
                 rt.stack().push(v);
             }
@@ -3089,11 +3370,9 @@ fn run_frame(
                 // `f`'s own box address, matching what `RcFn::as_ptr()`
                 // returns for the `Rc<CompiledFn>` that was wrapped into
                 // this same value's `RcFn` at `into_function` time.
-                let f_box_ptr = (f as *const CompiledFn as *const u8)
-                    .wrapping_sub(core::mem::offset_of!(
-                        raft_core::ffi::RcInner<CompiledFn>,
-                        value
-                    )) as *const ();
+                let f_box_ptr = (f as *const CompiledFn as *const u8).wrapping_sub(
+                    core::mem::offset_of!(raft_core::ffi::RcInner<CompiledFn>, value),
+                ) as *const ();
                 match fval.unpack() {
                     ValEnum::Fn(fval) if fval.as_ptr() == f_box_ptr && f.arity == n => {
                         // Calls self: discard the callee we just peeked (we
@@ -3127,14 +3406,21 @@ fn run_frame(
                     core::hint::cold_path();
                     RuntimeError::Other("vm: no active iterator".into())
                 })?;
-                match iter.next(&mut rt.as_host()) {
-                    Some(item) => rt.stack().push(item),
-                    None => {
-                        // a generator step that failed also reports
+                match iter.step(&mut rt.as_host())? {
+                    ValsIterStep::Item(item) => rt.stack().push(item),
+                    ValsIterStep::End => {
+                        // a coroutine step that failed also reports
                         // exhaustion - surface its pending error instead
                         rt.status.clone()?;
                         iters.pop();
                         pc = t as usize;
+                    }
+                    // an async-gen iterable must wait - suspend the
+                    // enclosing frame, re-running this instruction (opcode
+                    // byte + 4-byte target) on the next resume; the open
+                    // iterator rides the saved iterator stack
+                    ValsIterStep::Pending => {
+                        return Ok(FrameExit::Pending { pc: pc - 5 });
                     }
                 }
             }
@@ -3153,6 +3439,27 @@ fn run_frame(
                 // the yielded value stays on top of the intact frame; the
                 // resume continues right after this instruction
                 return Ok(FrameExit::Yield { pc });
+            }
+            opcode::AWAIT => {
+                // the awaited coroutine stays on the stack across a
+                // pending suspension - the next resume re-runs this
+                // instruction
+                let fval = rt.stack().peek().clone();
+                let future = match fval.unpack() {
+                    ValEnum::Coro(c) if c.kind() == Some(CoroKind::Async) => c,
+                    _ => {
+                        core::hint::cold_path();
+                        return Err(RuntimeError::TypeError("await on non-async value".into()));
+                    }
+                };
+                match crate::await_step(rt, &future)? {
+                    Poll::Ready(v) => {
+                        // replace the awaited coroutine with its resolution
+                        rt.stack().pop();
+                        rt.stack().push(v);
+                    }
+                    Poll::Pending => return Ok(FrameExit::Pending { pc: pc - 1 }),
+                }
             }
             _ => return Err(RuntimeError::Other("vm: unknown opcode".into())),
         }
@@ -3321,10 +3628,17 @@ r5 = sq pi
             .unwrap();
         // second load must come from the cache: same object
         assert!(
-            matches!((a.unpack(), b.unpack()), (ValEnum::Record(_), ValEnum::Record(_))),
+            matches!(
+                (a.unpack(), b.unpack()),
+                (ValEnum::Record(_), ValEnum::Record(_))
+            ),
             "modules are objects"
         );
-        assert_eq!(a.cmp(&b), Some(core::cmp::Ordering::Equal), "same cached module");
+        assert_eq!(
+            a.cmp(&b),
+            Some(core::cmp::Ordering::Equal),
+            "same cached module"
+        );
 
         // NOTE: this used to also assert that mutating a module's export
         // (`math.pi = 4`) errors - module immutability enforcement is a
@@ -3546,8 +3860,14 @@ export { f }
         };
         let mut rt = Runtime::new();
         let frame = Rc::new(Frame::new());
-        let (compiled, _) =
-            compile_fn(&mut rt, params.clone(), body, CompileParent::Walked(frame), &[]).unwrap();
+        let (compiled, _) = compile_fn(
+            &mut rt,
+            params.clone(),
+            body,
+            CompileParent::Walked(frame),
+            &[],
+        )
+        .unwrap();
         let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
         assert!(matches!(instrs.last(), Some(Instr::Return)));
         assert_eq!(compiled.arity(), 2);
@@ -4511,11 +4831,8 @@ for x in (g):
     #[test]
     fn yield_outside_generator_errors_in_both_modes() {
         for compiled in [false, true] {
-            let (mut rt, frame) = run_mode(
-                "fn f:\n    yield 1\n",
-                compiled,
-            )
-            .expect("defining f itself succeeds");
+            let (mut rt, frame) =
+                run_mode("fn f:\n    yield 1\n", compiled).expect("defining f itself succeeds");
             let stmts = ast_from_str("f\n");
             let err = rt
                 .exec_stmt(&stmts[0], frame.clone())
@@ -4540,12 +4857,405 @@ for x in (g):
 
             // ...and a mismatch fails at the creation call itself, before
             // any iteration
+            let (mut rt, frame) = run_mode("gen fn firsts [a, b]:\n    yield a\n", compiled)
+                .expect("defining the generator succeeds");
+            let stmts = ast_from_str("h = firsts 5\n");
+            assert!(
+                rt.exec_stmt(&stmts[0], frame.clone()).is_err(),
+                "creation must fail on a pattern mismatch (compiled={compiled})"
+            );
+        }
+    }
+
+    #[test]
+    fn yield_from_delegates_to_a_generator() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn inner n:
+    i = 0
+    while i < n:
+        yield i
+        i = i + 1
+gen fn outer n:
+    yield 100
+    yield from (inner n)
+    yield 200
+total = 0
+for x in (outer 3):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 303);
+    }
+
+    #[test]
+    fn yield_from_delegates_to_a_list() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn g:
+    items = [5, 6, 7]
+    yield from items
+total = 0
+for x in (g):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 18);
+    }
+
+    #[test]
+    fn yield_from_mixed_with_plain_yields_in_a_loop() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn pair a b:
+    yield a
+    yield b
+gen fn g n:
+    i = 0
+    while i < n:
+        yield i * 10
+        yield from (pair i (i + 1))
+        i = i + 1
+total = 0
+count = 0
+for x in (g 3):
+    total = total + x
+    count = count + 1
+",
+        );
+        // i=0: 0,0,1  i=1: 10,1,2  i=2: 20,2,3
+        assert_eq!(int_var(&mut rt, &frame, "total"), 39);
+        assert_eq!(int_var(&mut rt, &frame, "count"), 9);
+    }
+
+    #[test]
+    fn yield_from_two_level_delegation_chain() {
+        let (mut rt, frame) = assert_modes_agree(
+            "gen fn leaf:
+    yield 1
+    yield 2
+gen fn mid:
+    yield from (leaf)
+    yield 3
+gen fn top:
+    yield from (mid)
+    yield 4
+total = 0
+for x in (top):
+    total = total + x
+",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "total"), 10);
+    }
+
+    #[test]
+    fn yield_from_non_iterable_errors_in_both_modes() {
+        for compiled in [false, true] {
+            let (mut rt, frame) =
+                run_mode("gen fn g:\n    yield from 5\n", compiled).expect("defining g succeeds");
+            // creation succeeds; the failure surfaces on the first resume,
+            // when the yield from statement actually executes
+            let stmts = ast_from_str("total = 0\nfor x in (g):\n    total = total + x\n");
+            let mut result = Ok(());
+            for stmt in &stmts {
+                if let Err(e) = rt.exec_stmt(stmt, frame.clone()) {
+                    result = Err(e);
+                    break;
+                }
+            }
+            assert!(
+                result.is_err(),
+                "iterating must fail on non-iterable delegate (compiled={compiled})"
+            );
+        }
+    }
+
+    #[test]
+    fn yield_from_outside_generator_errors_in_both_modes() {
+        for compiled in [false, true] {
+            let (mut rt, frame) =
+                run_mode("items = [1, 2]\nfn f:\n    yield from items\n", compiled)
+                    .expect("defining f itself succeeds");
+            let stmts = ast_from_str("f\n");
+            let err = rt
+                .exec_stmt(&stmts[0], frame.clone())
+                .expect_err("calling a plain fn containing yield from must fail");
+            assert!(
+                format!("{err}").contains("yield"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Async functions
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn async_fn_chained_awaits_resolve_in_both_modes() {
+        for compiled in [false, true] {
             let (mut rt, frame) = run_mode(
-                "gen fn firsts [a, b]:\n    yield a\n",
+                "async fn add_async a b:\n    return a + b\nasync fn compose x:\n    y = await (add_async x 1)\n    z = await (add_async y 2)\n    return z\n",
                 compiled,
             )
-            .expect("defining the generator succeeds");
-            let stmts = ast_from_str("h = firsts 5\n");
+            .expect("definitions succeed");
+            let stmts = ast_from_str("fut = compose 5\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+
+            let v = smol::block_on(rt.eval_async(fut)).expect("block_on resolves");
+
+            assert_eq!(format!("{v}"), "8", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn async_fn_awaits_a_pending_host_leaf_through_the_waker() {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        /// Pending once; wakes its own task before suspending, so the
+        /// executor re-polls it - the full RtWaker → std Waker round trip.
+        struct YieldNow {
+            polled: bool,
+        }
+        impl Future for YieldNow {
+            type Output = Result<Val, RuntimeError>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.polled {
+                    Poll::Ready(Ok(Val::new_int(7)))
+                } else {
+                    self.polled = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        for compiled in [false, true] {
+            let (mut rt, frame) = run_mode(
+                "async fn f:\n    v = await (sleepy)\n    await (sleepy)\n    return v + 1\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            rt.register_function("sleepy", 0, Some(0), |_rt, _args| {
+                crate::async_val(YieldNow { polled: false })
+            });
+            let stmts = ast_from_str("fut = (f)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("block_on resolves");
+            assert_eq!(format!("{v}"), "8", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn await_misuse_errors_in_both_modes() {
+        for compiled in [false, true] {
+            // await inside a plain fn
+            let (mut rt, frame) =
+                run_mode("x = 1\nfn f:\n    await x\n", compiled).expect("defining f succeeds");
+            let stmts = ast_from_str("f\n");
+            let err = rt
+                .exec_stmt(&stmts[0], frame.clone())
+                .expect_err("await in a plain fn must fail");
+            assert!(format!("{err}").contains("await"), "unexpected: {err}");
+
+            // await on a non-async value inside an async fn
+            let (mut rt, frame) =
+                run_mode("async fn g:\n    await 5\n", compiled).expect("defining g succeeds");
+            let stmts = ast_from_str("fut = (g)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let err = smol::block_on(rt.eval_async(fut)).expect_err("await 5 must fail");
+            assert!(format!("{err}").contains("non-async"), "unexpected: {err}");
+
+            // yield inside an async fn
+            let (mut rt, frame) =
+                run_mode("async fn h:\n    yield 1\n", compiled).expect("defining h succeeds");
+            let stmts = ast_from_str("fut = (h)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let err = smol::block_on(rt.eval_async(fut)).expect_err("yield in async must fail");
+            assert!(format!("{err}").contains("yield"), "unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn async_gen_without_awaits_iterates_in_both_modes() {
+        for compiled in [false, true] {
+            let (mut rt, frame) = run_mode(
+                "async gen fn agen n:\n    i = 0\n    while i < n:\n        yield i * i\n        i = i + 1\nasync fn consume n:\n    s = 0\n    for x in (agen n):\n        s = s + x\n    return s\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("fut = consume 4\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("eval_async resolves");
+            assert_eq!(format!("{v}"), "14", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn async_gen_yields_across_pending_awaits_in_both_modes() {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        /// Pending once; wakes its own task before suspending (see
+        /// `async_fn_awaits_a_pending_host_leaf_through_the_waker`).
+        struct YieldNow {
+            polled: bool,
+        }
+        impl Future for YieldNow {
+            type Output = Result<Val, RuntimeError>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.polled {
+                    Poll::Ready(Ok(Val::new_int(7)))
+                } else {
+                    self.polled = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        for compiled in [false, true] {
+            // the async gen pends (awaiting the host leaf) between yields;
+            // the consuming async fn's `for` suspends on that pending and
+            // resumes through the waker
+            let (mut rt, frame) = run_mode(
+                "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (sleepy)\n        yield i + v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    for x in (agen n):\n        s = s + x\n    return s\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            rt.register_function("sleepy", 0, Some(0), |_rt, _args| {
+                crate::async_val(YieldNow { polled: false })
+            });
+            let stmts = ast_from_str("fut = consume 3\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("block_on resolves");
+            assert_eq!(format!("{v}"), "24", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn async_gen_delegation_via_yield_from_in_both_modes() {
+        for compiled in [false, true] {
+            let (mut rt, frame) = run_mode(
+                "async gen fn inner:\n    yield 2\n    yield 3\nasync gen fn outer:\n    yield 1\n    yield from (inner)\nasync fn consume:\n    s = 0\n    for x in (outer):\n        s = s + x\n    return s\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("fut = (consume)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("block_on resolves");
+            assert_eq!(format!("{v}"), "6", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn async_gen_misuse_errors_in_both_modes() {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct Never;
+        impl Future for Never {
+            type Output = Result<Val, RuntimeError>;
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        for compiled in [false, true] {
+            // iterating a pending async gen from a synchronous context
+            let (mut rt, frame) = run_mode(
+                "async gen fn agen:\n    x = await (never)\n    yield x\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            rt.register_function("never", 0, Some(0), |_rt, _args| crate::async_val(Never));
+            let stmts = ast_from_str("for x in (agen):\n    x\n");
+            let err = rt
+                .exec_stmt(&stmts[0], frame.clone())
+                .expect_err("sync iteration of a pending async gen must fail");
+            assert!(
+                format!("{err}").contains("async"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+
+            // awaiting an async gen is not awaiting an async
+            let (mut rt, frame) = run_mode(
+                "async gen fn agen:\n    yield 1\nasync fn bad:\n    x = await (agen)\n    return x\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("fut = (bad)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let err =
+                smol::block_on(rt.eval_async(fut)).expect_err("await on an async gen must fail");
+            assert!(
+                format!("{err}").contains("non-async"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+
+            // spawning an async gen is rejected
+            let (mut rt, frame) = run_mode("async gen fn agen:\n    yield 1\n", compiled)
+                .expect("definitions succeed");
+            let stmts = ast_from_str("g = (agen)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let g = frame.get_var("g", &mut rt);
+            let err = rt.spawn(g).expect_err("spawn of an async gen must fail");
+            assert!(
+                format!("{err}").contains("async"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+        }
+    }
+
+    #[test]
+    fn async_fn_defined_inside_a_function_captures_its_locals() {
+        // exercises the FnMode::Async template path (nested async fn with
+        // captures instantiated by MakeClosure) in compiled mode, and the
+        // equivalent closure in walked mode
+        for compiled in [false, true] {
+            let (mut rt, frame) = run_mode(
+                "fn make base:\n    async fn add x:\n        return base + x\n    return add\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("f = make 10\nfut = f 5\n");
+            for stmt in &stmts {
+                rt.exec_stmt(stmt, frame.clone()).unwrap();
+            }
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("resolves");
+            assert_eq!(format!("{v}"), "15", "compiled={compiled}");
+        }
+    }
+
+    #[test]
+    fn async_fn_result_is_tail_value_and_binds_at_creation() {
+        for compiled in [false, true] {
+            // no explicit return: resolves to the last statement's value
+            let (mut rt, frame) =
+                run_mode("async fn tailv x:\n    x * 2\n", compiled).expect("definitions succeed");
+            let stmts = ast_from_str("fut = tailv 21\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let v = smol::block_on(rt.eval_async(fut)).expect("resolves");
+            assert_eq!(format!("{v}"), "42", "compiled={compiled}");
+
+            // destructured param mismatch fails at the creation call
+            let (mut rt, frame) = run_mode("async fn firsts [a, b]:\n    return a\n", compiled)
+                .expect("definitions succeed");
+            let stmts = ast_from_str("fut = firsts 5\n");
             assert!(
                 rt.exec_stmt(&stmts[0], frame.clone()).is_err(),
                 "creation must fail on a pattern mismatch (compiled={compiled})"

@@ -86,6 +86,7 @@ pub enum Keyword {
     Gen,
     Async,
     Await,
+    From,
 }
 
 impl Keyword {
@@ -105,6 +106,7 @@ impl Keyword {
             "gen" => Some(Keyword::Gen),
             "async" => Some(Keyword::Async),
             "await" => Some(Keyword::Await),
+            "from" => Some(Keyword::From),
             _ => None,
         }
     }
@@ -1095,6 +1097,7 @@ fn expr_to_pattern(expr: &Expr) -> Option<Pat> {
         ExprKind::Binary(..) => None,
         ExprKind::Field(..) => None,
         ExprKind::Index(..) => None,
+        ExprKind::Await(..) => None,
     }
 }
 
@@ -1259,7 +1262,19 @@ impl Stmt {
         match stream.peek() {
             Some(Token::Punct(p)) if p.repr() == '=' => {
                 stream.advance();
-                let rhs = Expr::parse(stream)?;
+                // `x = await <expr>` - await is allowed as an assignment's
+                // entire right-hand side (and as a whole statement), never
+                // nested inside a larger expression
+                let rhs = if let Some((Keyword::Await, aw_span)) = Keyword::peek(stream) {
+                    stream.advance();
+                    let inner = Expr::parse(stream)?;
+                    Expr {
+                        span: aw_span.join(inner.span),
+                        kind: ExprKind::Await(Rc::new(inner)),
+                    }
+                } else {
+                    Expr::parse(stream)?
+                };
 
                 match &lhs.kind {
                     ExprKind::Field(obj, field_ident) => {
@@ -1333,6 +1348,17 @@ impl Stmt {
                     stream.advance();
                     stream.skip_comments();
 
+                    if let Some((Keyword::From, _)) = Keyword::peek(stream) {
+                        stream.advance();
+                        stream.skip_comments();
+                        // `yield from` requires an iterable expression
+                        let expr = Expr::parse(stream)?;
+                        return Ok(Stmt {
+                            span: kw_span.join(expr.span),
+                            kind: StmtKind::YieldFrom(expr),
+                        });
+                    }
+
                     if let Some(Token::Newline(_)) | None = stream.peek() {
                         return Ok(Stmt {
                             span: kw_span,
@@ -1344,6 +1370,20 @@ impl Stmt {
                     return Ok(Stmt {
                         span: kw_span.join(expr.span),
                         kind: StmtKind::Yield(Some(expr)),
+                    });
+                }
+                Keyword::Await => {
+                    stream.advance();
+                    stream.skip_comments();
+                    // `await` requires an async-value expression
+                    let expr = Expr::parse(stream)?;
+                    let span = kw_span.join(expr.span);
+                    return Ok(Stmt {
+                        span,
+                        kind: StmtKind::Expr(Expr {
+                            span,
+                            kind: ExprKind::Await(Rc::new(expr)),
+                        }),
                     });
                 }
                 Keyword::Break => {
@@ -1389,6 +1429,18 @@ impl Stmt {
                 Keyword::Yield => {
                     stream.advance();
                     stream.skip_comments();
+
+                    if let Some((Keyword::From, _)) = Keyword::peek(stream) {
+                        stream.advance();
+                        stream.skip_comments();
+                        // `yield from` requires an iterable expression
+                        let expr = Expr::parse(stream)?;
+                        return Ok(Stmt {
+                            span: kw_span.join(expr.span),
+                            kind: StmtKind::YieldFrom(expr),
+                        });
+                    }
+
                     if let Some(Token::Newline(_)) | None = stream.peek() {
                         return Ok(Stmt {
                             span: kw_span,
@@ -1400,6 +1452,20 @@ impl Stmt {
                     return Ok(Stmt {
                         span: kw_span.join(expr.span),
                         kind: StmtKind::Yield(Some(expr)),
+                    });
+                }
+                Keyword::Await => {
+                    stream.advance();
+                    stream.skip_comments();
+                    // `await` requires an async-value expression
+                    let expr = Expr::parse(stream)?;
+                    let span = kw_span.join(expr.span);
+                    return Ok(Stmt {
+                        span,
+                        kind: StmtKind::Expr(Expr {
+                            span,
+                            kind: ExprKind::Await(Rc::new(expr)),
+                        }),
                     });
                 }
                 Keyword::Break => {

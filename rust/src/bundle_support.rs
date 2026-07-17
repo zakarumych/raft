@@ -236,7 +236,7 @@ pub fn gen_yield<'a>(co: &'a Rc<GenCo>, value: Val) -> GenYield<'a> {
     }
 }
 
-/// The implicit suspension right after parameter binding: `gen_create`
+/// The implicit suspension right after parameter binding: `coro_create`
 /// polls up to here, so a parameter pattern-match failure surfaces at
 /// creation time (matching the walker/VM), before the first real resume.
 pub struct GenStart {
@@ -266,70 +266,185 @@ pub fn gen_start() -> GenStart {
 
 type GenFut = core::pin::Pin<Box<dyn core::future::Future<Output = Result<Val, RuntimeError>>>>;
 
-/// One poll of a generator body with the co's host pointer live for its
-/// duration.
+/// One poll of a generator/async-fn body with the co's host pointer live
+/// for its duration. Polls with the host's ambient waker (the executor's
+/// task waker during an async poll) so ordinary Rust futures awaited
+/// inside the body wake the right task; generator resumes have no ambient
+/// waker and get the noop.
 fn poll_gen(
     co: &GenCo,
     host: &mut Host,
     fut: &mut GenFut,
 ) -> core::task::Poll<Result<Val, RuntimeError>> {
     co.host.set(host.as_raw());
-    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    let waker = host.std_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
     let r = fut.as_mut().poll(&mut cx);
     co.host.set(core::ptr::null_mut());
     r
 }
 
-/// A live transpiled generator. `fut` is `None` once finished - and also
-/// while a resume is polling, so a re-entrant resume through the body's
-/// own calls reports exhaustion instead of polling recursively.
-pub struct TranspiledGen {
+/// A live transpiled coroutine (a `gen fn`'s generator or an `async fn`'s
+/// future - the kind decides how polls map onto the [`CoroStatus`]
+/// protocol). `fut` is `None` once finished - and also while a resume is
+/// polling, so a re-entrant resume through the body's own calls reports
+/// exhaustion instead of polling recursively.
+pub struct TranspiledCoro {
+    kind: CoroKind,
     co: Rc<GenCo>,
     fut: RefCell<Option<GenFut>>,
+    /// An async resolution produced while priming (a body that never
+    /// suspends) - delivered by the first real resume's Yielded step.
+    resolved: RefCell<Option<Val>>,
 }
 
-impl Generator for TranspiledGen {
-    fn resume(&self, host: &mut Host) {
+impl Coroutine for TranspiledCoro {
+    fn resume(&self, host: &mut Host, args: usize) -> CoroStatus {
+        debug_assert_eq!(args, 0, "gen/async coroutines take no resume arguments");
+        if let Some(v) = self.resolved.borrow_mut().take() {
+            // `fut` is already None, so the mandatory follow-up resume
+            // reports the final Done
+            host.stack().push(v);
+            return CoroStatus::Yielded;
+        }
         let taken = self.fut.borrow_mut().take();
         let Some(mut fut) = taken else {
-            host.stack().push(Val::new_uninit());
-            return;
+            // finished (or re-entrantly resumed): keeps reporting Done
+            return CoroStatus::Done;
         };
         match poll_gen(&self.co, host, &mut fut) {
-            core::task::Poll::Pending => {
-                let v = self.co.yielded.take().unwrap_or_else(Val::nil);
-                *self.fut.borrow_mut() = Some(fut);
-                host.stack().push(v);
-            }
-            core::task::Poll::Ready(Ok(_)) => {
-                // a generator's return value is discarded; the end is
-                // signalled by the uninit value
-                host.stack().push(Val::new_uninit());
-            }
+            core::task::Poll::Pending => match self.kind {
+                // a generator body suspends only at yields (the creation
+                // prime consumed `gen_start`), so the value is in the co
+                CoroKind::Gen => {
+                    let v = self.co.yielded.take().unwrap_or_else(Val::nil);
+                    *self.fut.borrow_mut() = Some(fut);
+                    host.stack().push(v);
+                    CoroStatus::Yielded
+                }
+                // an async body suspends only at awaits (the transpiler
+                // rejects `yield` in async bodies)
+                CoroKind::Async => {
+                    *self.fut.borrow_mut() = Some(fut);
+                    CoroStatus::Pending
+                }
+                // an async-gen body suspends at both - the co says which
+                // this one was: a parked value is a yield, nothing means
+                // an await came back pending
+                CoroKind::AsyncGen => {
+                    *self.fut.borrow_mut() = Some(fut);
+                    match self.co.yielded.take() {
+                        Some(v) => {
+                            host.stack().push(v);
+                            CoroStatus::Yielded
+                        }
+                        None => CoroStatus::Pending,
+                    }
+                }
+            },
+            core::task::Poll::Ready(Ok(v)) => match self.kind {
+                // a generator's return value is discarded - the end
+                // itself is the signal
+                CoroKind::Gen | CoroKind::AsyncGen => CoroStatus::Done,
+                // an async body's result is delivered as the one Yielded
+                // step; `fut` is consumed, so the mandatory follow-up
+                // resume reports the final Done
+                CoroKind::Async => {
+                    host.stack().push(v);
+                    CoroStatus::Yielded
+                }
+            },
             core::task::Poll::Ready(Err(e)) => {
                 report_error(host, &e);
-                host.stack().push(Val::new_uninit());
+                CoroStatus::Done
             }
         }
     }
 }
 
-/// Prime a freshly-built generator body (run parameter binding, up to the
-/// implicit [`gen_start`] suspension) and wrap it as a `Val::Gen`. A bind
-/// failure comes back as this call's error, matching walker/VM creation.
-pub fn gen_create(host: &mut Host, co: Rc<GenCo>, fut: GenFut) -> Result<Val, RuntimeError> {
+/// Prime a freshly-built coroutine body (run parameter binding, up to the
+/// implicit [`gen_start`] suspension) and wrap it as a `Val::Coro` of
+/// `kind`. A bind failure comes back as this call's error, matching
+/// walker/VM creation.
+pub fn coro_create(
+    host: &mut Host,
+    kind: CoroKind,
+    co: Rc<GenCo>,
+    fut: GenFut,
+) -> Result<Val, RuntimeError> {
     let mut fut = fut;
-    match poll_gen(&co, host, &mut fut) {
-        core::task::Poll::Pending => Ok(Val::from(ValEnum::Gen(RcGen::new(TranspiledGen {
+    let (fut, resolved) = match poll_gen(&co, host, &mut fut) {
+        core::task::Poll::Pending => (Some(fut), None),
+        core::task::Poll::Ready(Err(e)) => return Err(e),
+        // ran to completion while priming (a body that never suspends):
+        // a generator is simply exhausted; an async resolution is handed
+        // to the first real resume
+        core::task::Poll::Ready(Ok(v)) => match kind {
+            CoroKind::Gen | CoroKind::AsyncGen => (None, None),
+            CoroKind::Async => (None, Some(v)),
+        },
+    };
+    Ok(Val::from(ValEnum::Coro(RcCoro::new(
+        kind,
+        TranspiledCoro {
+            kind,
             co,
-            fut: RefCell::new(Some(fut)),
-        })))),
-        core::task::Poll::Ready(Err(e)) => Err(e),
-        // ran to completion while priming (empty body): already exhausted
-        core::task::Poll::Ready(Ok(_)) => Ok(Val::from(ValEnum::Gen(RcGen::new(TranspiledGen {
-            co,
-            fut: RefCell::new(None),
-        })))),
+            fut: RefCell::new(fut),
+            resolved: RefCell::new(resolved),
+        },
+    ))))
+}
+
+/// The future behind an `await` statement: resumes the awaited async
+/// coroutine once per poll of the enclosing body, completing when it
+/// delivers its resolution.
+pub struct AwaitVal<'a> {
+    co: &'a GenCo,
+    target: RcCoro,
+}
+
+impl core::future::Future for AwaitVal<'_> {
+    type Output = Result<Val, RuntimeError>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        // no self-references - `AwaitVal` is trivially `Unpin`
+        let this = self.get_mut();
+        let mut host = co_host(this.co);
+        match this.target.resume(&mut host, 0) {
+            // the leaf that reported pending grabbed the ambient waker
+            // itself; nothing to register here
+            CoroStatus::Pending => core::task::Poll::Pending,
+            CoroStatus::Yielded => {
+                let v = host.stack().pop();
+                match this.target.resume(&mut host, 0) {
+                    CoroStatus::Done => match check_host_error(&mut host) {
+                        Ok(()) => core::task::Poll::Ready(Ok(v)),
+                        Err(e) => core::task::Poll::Ready(Err(e)),
+                    },
+                    _ => core::task::Poll::Ready(Err(RuntimeError::Other(
+                        "async coroutine yielded more than once".into(),
+                    ))),
+                }
+            }
+            CoroStatus::Done => match check_host_error(&mut host) {
+                Ok(()) => core::task::Poll::Ready(Err(RuntimeError::Other(
+                    "async coroutine finished without a result".into(),
+                ))),
+                Err(e) => core::task::Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+pub fn await_val<'a>(co: &'a Rc<GenCo>, v: Val) -> Result<AwaitVal<'a>, RuntimeError> {
+    match v.unpack() {
+        ValEnum::Coro(target) if target.kind() == Some(CoroKind::Async) => {
+            Ok(AwaitVal { co, target })
+        }
+        _ => Err(RuntimeError::TypeError("await on non-async value".into())),
     }
 }
 
@@ -345,16 +460,51 @@ pub fn iter_new(v: &Val) -> Result<ValsIter, RuntimeError> {
 
 /// The next item, or `Ok(None)` at a clean end. A generator step that
 /// failed reports exhaustion with the host error pending - taken and
-/// propagated here.
+/// propagated here. Synchronous: an async-gen iterable's pending is an
+/// error here (see [`iter_next_async`]).
 #[inline]
 pub fn iter_next(host: &mut Host, iter: &mut ValsIter) -> Result<Option<Val>, RuntimeError> {
-    match iter.next(host) {
+    match iter.next(host)? {
         Some(v) => Ok(Some(v)),
         None => {
             check_host_error(host)?;
             Ok(None)
         }
     }
+}
+
+/// The awaitable [`iter_next`]: one iteration step per poll of the
+/// enclosing body, suspending it when an async-gen iterable reports
+/// pending (the leaf that reported it grabbed the ambient waker itself).
+pub struct IterNextFut<'a> {
+    co: &'a GenCo,
+    iter: &'a mut ValsIter,
+}
+
+impl core::future::Future for IterNextFut<'_> {
+    type Output = Result<Option<Val>, RuntimeError>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        // no self-references - `IterNextFut` is trivially `Unpin`
+        let this = self.get_mut();
+        let mut host = co_host(this.co);
+        match this.iter.step(&mut host) {
+            Err(e) => core::task::Poll::Ready(Err(e)),
+            Ok(ValsIterStep::Item(v)) => core::task::Poll::Ready(Ok(Some(v))),
+            Ok(ValsIterStep::End) => match check_host_error(&mut host) {
+                Ok(()) => core::task::Poll::Ready(Ok(None)),
+                Err(e) => core::task::Poll::Ready(Err(e)),
+            },
+            Ok(ValsIterStep::Pending) => core::task::Poll::Pending,
+        }
+    }
+}
+
+pub fn iter_next_async<'a>(co: &'a Rc<GenCo>, iter: &'a mut ValsIter) -> IterNextFut<'a> {
+    IterNextFut { co, iter }
 }
 
 // ---------------------------------------------------------------------

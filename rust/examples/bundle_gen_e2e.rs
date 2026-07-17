@@ -33,7 +33,12 @@ gen fn evens list:
         if (x & 1) == 0:
             yield x
 
-export { count, sum_upto, evens }
+gen fn framed n:
+    yield 100
+    yield from (count n)
+    yield 200
+
+export { count, sum_upto, evens, framed }
 ";
 
 /// The Raft program the host runtime executes against the linked bundle.
@@ -51,6 +56,9 @@ nums = [1, 2, 3, 4, 5, 6]
 esum = 0
 for e in (m.evens nums):
     esum = esum + e
+fsum = 0
+for v in (m.framed 3):
+    fsum = fsum + v
 ";
 
 fn main() {
@@ -79,6 +87,9 @@ fn main() {
     expect_int(&mut rt, &root, "rerun", 0);
     // yield under for/if inside a transpiled generator
     expect_int(&mut rt, &root, "esum", 12);
+    // yield from: a bundle generator delegating to another bundle
+    // generator, iterated from the host (100 + 0+1+2 + 200)
+    expect_int(&mut rt, &root, "fsum", 303);
     println!("bundle generator e2e passed");
 }
 

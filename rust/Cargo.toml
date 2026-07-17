@@ -8,5 +8,6 @@ description = "Raft-to-Rust transpiler and runtime support for transpiled bundle
 raft-ast = { path = "../ast" }
 
 [dev-dependencies]
+smol = "2.0"
 raft-core = { path = "../core" }
 raft-runtime = { path = "../runtime" }

@@ -92,10 +92,19 @@ fn main() {
             let mut stack = rt.stack();
             let top = stack.pop();
             let Some(mut vals_iter) = rt.try_(|| ValsIter::new(&top)) else { return Val::nil(); };
-            let mut host = rt.as_host();
-            let iter = vals_iter.iter(&mut host);
+            let mut items = Vec::new();
+            loop {
+                match vals_iter.next(&mut rt.as_host()) {
+                    Ok(Some(v)) => items.push(v),
+                    Ok(None) => break,
+                    Err(e) => {
+                        rt.set_error(e);
+                        return Val::nil();
+                    }
+                }
+            }
 
-            Val::list(iter)
+            Val::list(items)
         },
     );
 

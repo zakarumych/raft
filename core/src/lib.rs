@@ -35,7 +35,7 @@ use core::{
 
 use smallvec::SmallVec;
 
-use crate::rc::{Callable, DynRc, Rc, Resumable, erase, erase_fn, erase_gen};
+use crate::rc::{Callable, DynRc, Rc, Resumable, erase, erase_coro, erase_fn};
 
 /// Projects any concrete vtable down to the common `clone`/`drop`-shaped
 /// [`ffi::AnyVTable`] prefix every vtable embeds - what [`DynRc`] needs to
@@ -79,7 +79,7 @@ impl AnyVTable for raft_ffi::FnVTable {
     }
 }
 
-impl AnyVTable for raft_ffi::GenVTable {
+impl AnyVTable for raft_ffi::CoroVTable {
     #[inline(always)]
     fn any(&self) -> &raft_ffi::AnyVTable {
         &self.any
@@ -485,8 +485,8 @@ impl Val {
             ffi::MASK_TAG_FN => ValEnum::Fn(RcFn {
                 ptr: self.clone_heap::<raft_ffi::FnVTable, Void>(),
             }),
-            ffi::MASK_TAG_GEN => ValEnum::Gen(RcGen {
-                ptr: self.clone_heap::<raft_ffi::GenVTable, Void>(),
+            ffi::MASK_TAG_CORO => ValEnum::Coro(RcCoro {
+                ptr: self.clone_heap::<raft_ffi::CoroVTable, Void>(),
             }),
             ffi::MASK_TAG_OPAQUE => ValEnum::Opaque(RcOpaque {
                 ptr: self.clone_heap::<raft_ffi::AnyVTable, Void>(),
@@ -515,7 +515,7 @@ impl Val {
             ffi::MASK_TAG_RECORD => ValKind::Record,
             ffi::MASK_TAG_LIST => ValKind::List,
             ffi::MASK_TAG_FN => ValKind::Fn,
-            ffi::MASK_TAG_GEN => ValKind::Gen,
+            ffi::MASK_TAG_CORO => ValKind::Coro,
             ffi::MASK_TAG_OPAQUE => ValKind::Opaque,
             _ => unsafe { core::hint::unreachable_unchecked() },
         }
@@ -632,7 +632,7 @@ pub enum ValKind {
     List,
     Record,
     Fn,
-    Gen,
+    Coro,
     Opaque,
 }
 
@@ -660,7 +660,7 @@ impl From<ValEnum> for Val {
             ValEnum::Record(r) => Val::pack_heap(ffi::MASK_TAG_RECORD, r.ptr),
             ValEnum::List(l) => Val::pack_heap(ffi::MASK_TAG_LIST, l.ptr),
             ValEnum::Fn(f) => Val::pack_heap(ffi::MASK_TAG_FN, f.ptr),
-            ValEnum::Gen(g) => Val::pack_heap(ffi::MASK_TAG_GEN, g.ptr),
+            ValEnum::Coro(c) => Val::pack_heap(ffi::MASK_TAG_CORO, c.ptr),
             ValEnum::Opaque(o) => Val::pack_heap(ffi::MASK_TAG_OPAQUE, o.ptr),
         }
     }
@@ -683,7 +683,7 @@ impl Clone for Val {
             | ffi::MASK_TAG_RECORD
             | ffi::MASK_TAG_LIST
             | ffi::MASK_TAG_FN
-            | ffi::MASK_TAG_GEN
+            | ffi::MASK_TAG_CORO
             | ffi::MASK_TAG_OPAQUE => {
                 // SAFETY: heap tag confirmed; `RcInner<T>::strong` is
                 // `#[repr(C)]`'s first field regardless of `T` - the same
@@ -717,7 +717,7 @@ impl Drop for Val {
                 self.drop_heap::<raft_ffi::ListVTable, UnsafeCell<ffi::ListVal>>()
             }
             ffi::MASK_TAG_FN => self.drop_heap::<raft_ffi::FnVTable, Void>(),
-            ffi::MASK_TAG_GEN => self.drop_heap::<raft_ffi::GenVTable, Void>(),
+            ffi::MASK_TAG_CORO => self.drop_heap::<raft_ffi::CoroVTable, Void>(),
             ffi::MASK_TAG_OPAQUE => self.drop_heap::<raft_ffi::AnyVTable, Void>(),
             _ => {}
         }
@@ -734,7 +734,7 @@ pub enum ValEnum {
     List(RcList),
     Record(RcRecord),
     Fn(RcFn),
-    Gen(RcGen),
+    Coro(RcCoro),
     Opaque(RcOpaque),
     /// Internal sentinel: a local slot that has not been assigned yet
     /// (reads of it fall back to the global scope), or "not found" from
@@ -760,7 +760,7 @@ impl fmt::Debug for Val {
             ValEnum::List(l) => write!(f, "List({:?})", l),
             ValEnum::Record(r) => write!(f, "Record({:?})", r),
             ValEnum::Fn(_) => write!(f, "<fn>"),
-            ValEnum::Gen(_) => write!(f, "<gen>"),
+            ValEnum::Coro(c) => write!(f, "{c:?}"),
             ValEnum::Opaque(o) => write!(f, "Opaque({:p})", DynRc::data_ptr(&o.ptr).as_ptr()),
             ValEnum::Uninit => write!(f, "<uninit>"),
         }
@@ -777,7 +777,7 @@ impl fmt::Display for Val {
             ValEnum::List(l) => write!(f, "{}", l),
             ValEnum::Record(r) => write!(f, "{}", r),
             ValEnum::Fn(_) => write!(f, "<fn>"),
-            ValEnum::Gen(_) => write!(f, "<gen>"),
+            ValEnum::Coro(c) => write!(f, "{c:?}"),
             ValEnum::Opaque(o) => write!(f, "{:p}", DynRc::data_ptr(&o.ptr).as_ptr()),
             ValEnum::Uninit => write!(f, "<uninit>"),
         }
@@ -990,8 +990,8 @@ impl Val {
             (ValEnum::Fn(f1), ValEnum::Fn(f2)) => {
                 DynRc::ptr_eq(&f1.ptr, &f2.ptr).then_some(Ordering::Equal)
             }
-            (ValEnum::Gen(g1), ValEnum::Gen(g2)) => {
-                DynRc::ptr_eq(&g1.ptr, &g2.ptr).then_some(Ordering::Equal)
+            (ValEnum::Coro(c1), ValEnum::Coro(c2)) => {
+                DynRc::ptr_eq(&c1.ptr, &c2.ptr).then_some(Ordering::Equal)
             }
             (ValEnum::Opaque(o1), ValEnum::Opaque(o2)) => {
                 DynRc::ptr_eq(&o1.ptr, &o2.ptr).then_some(Ordering::Equal)
@@ -1897,14 +1897,98 @@ pub trait Function: Sized + 'static {
     }
 }
 
-pub trait Generator: Sized + 'static {
-    /// Resumes execution of the generator.
-    /// On yield pushes the yielded value onto the stack and returns.
-    /// On return pushes an uninit value onto the stack and returns.
-    fn resume(&self, host: &mut rc::Host);
+/// What flavor of coroutine a [`RcCoro`] is - read straight off the
+/// value's FFI-safe [`ffi::CoroHeader`] prefix. Decides the protocol its
+/// consumer holds it to (see [`CoroStatus`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroKind {
+    /// A `gen fn`'s coroutine: iteration expects `Yielded`s ended by one
+    /// `Done`; `Pending` is a protocol error.
+    Gen,
+    /// An `async fn`'s coroutine: awaiting expects `Pending`s (propagated
+    /// to the task) until one `Yielded` delivers the resolution, then one
+    /// final `Done`; `Done` before any yield is a protocol error (unless
+    /// the host error state says why).
+    Async,
+    /// An `async gen fn`'s coroutine - the combination: `Yielded` per
+    /// produced value, `Pending` when it must wait (propagated to the
+    /// driving task), `Done` at the end. Only iterable from an async
+    /// context, where pending can suspend the consumer.
+    AsyncGen,
+}
+
+impl CoroKind {
+    #[inline]
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CoroKind::Gen => ffi::CORO_KIND_GEN,
+            CoroKind::Async => ffi::CORO_KIND_ASYNC,
+            CoroKind::AsyncGen => ffi::CORO_KIND_ASYNC_GEN,
+        }
+    }
+
+    #[inline]
+    pub fn from_u8(byte: u8) -> Option<CoroKind> {
+        match byte {
+            ffi::CORO_KIND_GEN => Some(CoroKind::Gen),
+            ffi::CORO_KIND_ASYNC => Some(CoroKind::Async),
+            ffi::CORO_KIND_ASYNC_GEN => Some(CoroKind::AsyncGen),
+            _ => None,
+        }
+    }
+}
+
+/// What one [`Coroutine::resume`] step did - the typed view of the FFI
+/// status byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroStatus {
+    /// Finished: nothing was pushed, resuming again keeps returning this.
+    /// A failed coroutine also finishes this way, with the host's
+    /// pending-error state set.
+    Done,
+    /// Pushed exactly one value onto the host stack; may be resumed again.
+    Yielded,
+    /// Must wait before it can continue - resume after the waker (cloned
+    /// from the host's ambient one) signals. An immediate re-resume is
+    /// allowed but may keep coming back `Pending`. Nothing was pushed.
+    Pending,
+}
+
+impl CoroStatus {
+    #[inline]
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CoroStatus::Done => ffi::CORO_DONE,
+            CoroStatus::Yielded => ffi::CORO_YIELD,
+            CoroStatus::Pending => ffi::CORO_PENDING,
+        }
+    }
+
+    #[inline]
+    fn from_u8(byte: u8) -> CoroStatus {
+        match byte {
+            ffi::CORO_YIELD => CoroStatus::Yielded,
+            ffi::CORO_PENDING => CoroStatus::Pending,
+            _ => CoroStatus::Done,
+        }
+    }
+}
+
+/// One coroutine object - what calling a `gen fn`/`async fn` with a full
+/// argument set returns, and what host-provided suspendable leaves
+/// implement. The kind ([`CoroKind`], stamped into the value's header at
+/// wrap time) decides the consumer-side protocol; `resume` is the single
+/// execution entry point for every kind. The waker of the poll currently
+/// driving the host is ambient ([`rc::Host::waker`]) - a leaf that comes
+/// back `Pending` clones it out and wakes it when it can continue.
+pub trait Coroutine: Sized + 'static {
+    /// Advance the coroutine, with `args` arguments on the stack (0 for
+    /// today's generator and async kinds). See [`CoroStatus`] for what
+    /// each result means and leaves on the stack.
+    fn resume(&self, host: &mut rc::Host, args: usize) -> CoroStatus;
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen>")
+        write!(f, "<coro>")
     }
 }
 
@@ -2089,64 +2173,98 @@ impl fmt::Debug for RcFn {
 }
 
 // ---------------------------------------------------------------------
-// Generator/RcGen: Val::Gen's backing. Mirrors the Function/RcFn pair:
-// `Generator` is the public trait generator objects implement, bridged
-// into `rc::Resumable` (the minimal bound `rc::gen_vtable`/`erase_gen`
-// need). A generator object is what calling a `gen fn` with a full
-// argument set returns; each `resume` runs the body to its next `yield`.
+// CoroBox/RcCoro: Val::Coro's backing. Mirrors the Function/RcFn pair:
+// `Coroutine` is the public trait coroutine objects implement, boxed
+// together with the FFI-visible `CoroHeader` (the kind byte) in a
+// `CoroBox` that bridges into `rc::Resumable` (the minimal bound
+// `rc::coro_vtable`/`erase_coro` need). A coroutine object is what
+// calling a `gen fn`/`async fn` with a full argument set returns; each
+// `resume` runs the body to its next suspension point and reports how
+// it stopped as a `CoroStatus` byte.
 // ---------------------------------------------------------------------
 
-impl<G: Generator> Resumable for G {
+/// The heap payload behind every `Val::Coro`: the FFI-safe [`CoroHeader`]
+/// first (so foreign code can read the kind byte without knowing the
+/// concrete `C`), then the actual coroutine state.
+#[repr(C)]
+struct CoroBox<C> {
+    header: ffi::CoroHeader,
+    inner: C,
+}
+
+impl<C: Coroutine> Resumable for CoroBox<C> {
     #[inline]
-    unsafe fn resume_raw(this: raft_ffi::RcPtr<G>, host: &mut rc::Host) {
-        // SAFETY: `this` is the live, whole-provenance `RcInner<G>` box
-        // (caller's contract) - viewing it as a borrowed `Rc<G>` (in
+    unsafe fn resume_raw(this: raft_ffi::RcPtr<Self>, args: usize, host: &mut rc::Host) -> u8 {
+        // SAFETY: `this` is the live, whole-provenance `RcInner<CoroBox<C>>`
+        // box (caller's contract) - viewing it as a borrowed `Rc` (in
         // `ManuallyDrop`, so no double-decrement) for the call's duration.
-        let rc = ManuallyDrop::new(unsafe { Rc::<G>::from_raw_box(this.cast()) });
-        rc.resume(host);
+        let rc = ManuallyDrop::new(unsafe { Rc::<CoroBox<C>>::from_raw_box(this.cast()) });
+        rc.inner.resume(host, args).to_u8()
     }
 }
 
 #[repr(transparent)]
 #[derive(Clone)]
-pub struct RcGen {
-    ptr: DynRc<raft_ffi::GenVTable, Void>,
+pub struct RcCoro {
+    ptr: DynRc<raft_ffi::CoroVTable, Void>,
 }
 
-impl RcGen {
+impl RcCoro {
     #[inline]
-    pub fn new<G: Generator>(g: G) -> Self {
-        Self::from_rc(Rc::new(g))
+    pub fn new<C: Coroutine>(kind: CoroKind, c: C) -> Self {
+        RcCoro {
+            ptr: erase_coro(Rc::new(CoroBox {
+                header: ffi::CoroHeader { kind: kind.to_u8() },
+                inner: c,
+            })),
+        }
     }
 
+    /// The kind stamped into the value's header at creation. Decides which
+    /// resume protocol callers hold this coroutine to (see [`CoroStatus`]).
     #[inline]
-    pub fn from_rc<G: Generator>(rc: Rc<G>) -> Self {
-        RcGen { ptr: erase_gen(rc) }
+    pub fn kind(&self) -> Option<CoroKind> {
+        // SAFETY: the data pointer is the live `CoroBox<C>` payload, whose
+        // `repr(C)` layout starts with the `CoroHeader` regardless of `C`.
+        let kind = unsafe {
+            (*(DynRc::data_ptr(&self.ptr).as_ptr() as *const RcInner<ffi::CoroHeader>))
+                .value
+                .kind
+        };
+        CoroKind::from_u8(kind)
     }
 
-    /// Resume the generator: pushes exactly one value onto the host stack -
-    /// the yielded value, or the uninit value when the generator finished
-    /// (returned, ran off the end of its body, or failed - a failure
-    /// additionally leaves the host's pending-error state set, which
-    /// callers check after every resume).
+    /// Resume the coroutine. `args` is how many stack-top values it
+    /// consumes as resume arguments (0 for both current kinds). The
+    /// returned [`CoroStatus`] says how it stopped: [`CoroStatus::Yielded`]
+    /// pushed exactly one value onto the host stack; [`CoroStatus::Done`]
+    /// and [`CoroStatus::Pending`] pushed nothing. A failure sets the
+    /// host's pending-error state and reports `Done` - callers check that
+    /// state before treating `Done` as a clean end.
     #[inline]
-    pub fn resume(&self, host: &mut rc::Host) {
+    pub fn resume(&self, host: &mut rc::Host, args: usize) -> CoroStatus {
         let vtable = DynRc::vtable(&self.ptr);
         // SAFETY: as `RcFn::call`'s - raw place projection from the live
         // box pointer keeps whole-box provenance on `data`.
         let data = unsafe {
             raft_ffi::VoidPtr::new_unchecked(&raw mut (*DynRc::data_ptr(&self.ptr).as_ptr()).value)
         };
-        // SAFETY: crossing into the `extern "C"` `ResumeFn` ABI;
+        // SAFETY: crossing into the `extern "C"` `CoroResumeFn` ABI;
         // `host.as_raw()` is the exact valid, exclusively-borrowed
         // `RawHost` `host` wraps.
-        unsafe { (vtable.resume)(data, host.as_raw()) }
+        let status = unsafe { (vtable.resume)(data, args, host.as_raw()) };
+        CoroStatus::from_u8(status)
     }
 }
 
-impl fmt::Debug for RcGen {
+impl fmt::Debug for RcCoro {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<gen>")
+        match self.kind() {
+            Some(CoroKind::Gen) => write!(f, "<gen>"),
+            Some(CoroKind::Async) => write!(f, "<async>"),
+            Some(CoroKind::AsyncGen) => write!(f, "<async gen>"),
+            None => write!(f, "<coro>"),
+        }
     }
 }
 
@@ -2158,7 +2276,19 @@ impl fmt::Debug for RcGen {
 pub enum ValsIter {
     List(RcList, usize),
     Record(RcRecord, usize),
-    Gen(RcGen),
+    Coro(RcCoro),
+}
+
+/// What one [`ValsIter::step`] produced.
+pub enum ValsIterStep {
+    /// The next item.
+    Item(Val),
+    /// Clean exhaustion - or a failed coroutine step, with the host's
+    /// pending-error state set (callers check).
+    End,
+    /// An async-gen coroutine must wait before it can produce the next
+    /// item - suspend the (async) consumer and re-`step` later.
+    Pending,
 }
 
 impl ValsIter {
@@ -2166,34 +2296,67 @@ impl ValsIter {
         match v.unpack() {
             ValEnum::List(l) => Ok(ValsIter::List(l, 0)),
             ValEnum::Record(r) => Ok(ValsIter::Record(r, 0)),
-            ValEnum::Gen(g) => Ok(ValsIter::Gen(g)),
+            ValEnum::Coro(c) => match c.kind() {
+                Some(CoroKind::Gen) | Some(CoroKind::AsyncGen) => Ok(ValsIter::Coro(c)),
+                _ => Err(RuntimeError::TypeError(
+                    "cannot iterate an async coroutine".into(),
+                )),
+            },
             _ => Err(RuntimeError::TypeError(
                 "iteration on non-heap value".into(),
             )),
         }
     }
 
-    /// The next item, or `None` when exhausted. A generator step that
-    /// *fails* also comes back `None` (its resume pushed the uninit value)
-    /// with the host's pending-error state set - callers must check that
-    /// state after every `next` before treating `None` as a clean end.
-    pub fn next(&mut self, host: &mut rc::Host) -> Option<Val> {
+    /// One iteration step. `Pending` only ever comes from an async-gen
+    /// coroutine that must wait - consumers in an async context suspend on
+    /// it and re-`step` later; everywhere else it's an error (see
+    /// [`ValsIter::next`]). An `End` from a *failed* coroutine step leaves
+    /// the host's pending-error state set - callers check it before
+    /// treating `End` as a clean end.
+    pub fn step(&mut self, host: &mut rc::Host) -> Result<ValsIterStep, RuntimeError> {
         match self {
             ValsIter::List(l, pos) => {
-                let item = l.get(*pos)?;
+                let Some(item) = l.get(*pos) else {
+                    return Ok(ValsIterStep::End);
+                };
                 *pos += 1;
-                Some(item)
+                Ok(ValsIterStep::Item(item))
             }
             ValsIter::Record(r, pos) => {
-                let (key, value) = r.entry_at(*pos)?;
+                let Some((key, value)) = r.entry_at(*pos) else {
+                    return Ok(ValsIterStep::End);
+                };
                 *pos += 1;
-                Some(Val::record([(RcStr::new(key), value)]))
+                Ok(ValsIterStep::Item(Val::record([(RcStr::new(key), value)])))
             }
-            ValsIter::Gen(g) => {
-                g.resume(host);
-                let v = host.stack().pop();
-                if v.is_init() { Some(v) } else { None }
-            }
+            ValsIter::Coro(c) => match c.resume(host, 0) {
+                CoroStatus::Yielded => Ok(ValsIterStep::Item(host.stack().pop())),
+                CoroStatus::Done => Ok(ValsIterStep::End),
+                CoroStatus::Pending => match c.kind() {
+                    Some(CoroKind::AsyncGen) => Ok(ValsIterStep::Pending),
+                    _ => Err(RuntimeError::TypeError(
+                        "generator coroutine reported pending".into(),
+                    )),
+                },
+            },
+        }
+    }
+
+    /// The next item, or `Ok(None)` when exhausted - [`ValsIter::step`]
+    /// for synchronous consumers, where `Pending` (an async-gen coroutine
+    /// that must wait) has nowhere to suspend to and is an error. A
+    /// coroutine step that *fails* also comes back `Ok(None)` (resume
+    /// reported `Done` without pushing) with the host's pending-error
+    /// state set - callers must check that state after every `next` before
+    /// treating `None` as a clean end.
+    pub fn next(&mut self, host: &mut rc::Host) -> Result<Option<Val>, RuntimeError> {
+        match self.step(host)? {
+            ValsIterStep::Item(v) => Ok(Some(v)),
+            ValsIterStep::End => Ok(None),
+            ValsIterStep::Pending => Err(RuntimeError::TypeError(
+                "cannot iterate an async generator outside an async context".into(),
+            )),
         }
     }
 
@@ -2208,9 +2371,9 @@ pub struct IterVals<'a, 'b> {
 }
 
 impl Iterator for IterVals<'_, '_> {
-    type Item = Val;
+    type Item = Result<Val, RuntimeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next(self.host)
+        self.iter.next(self.host).transpose()
     }
 }

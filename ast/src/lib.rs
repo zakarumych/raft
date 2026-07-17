@@ -254,6 +254,11 @@ pub enum ExprKind {
     Field(Rc<Expr>, Ident),
     Index(Rc<Expr>, Rc<Expr>),
     Parenthesized(Rc<Expr>),
+    /// `await <expr>` - poll the async value to completion, suspending
+    /// the enclosing async function while it's pending. Grammar-restricted
+    /// to two positions: a whole expression statement, or an assignment's
+    /// entire right-hand side. Only meaningful inside an `async fn` body.
+    Await(Rc<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -376,6 +381,10 @@ pub enum StmtKind {
     /// producing the value (`Nil` when omitted). Only meaningful inside a
     /// `gen fn` body; the runtimes reject it anywhere else.
     Yield(Option<Expr>),
+    /// `yield from <expr>` - evaluate `<expr>` to an iterable (generator,
+    /// list, or record - the same protocol as `for`), yield every value
+    /// it produces, then continue. Same placement rules as `Yield`.
+    YieldFrom(Expr),
     Break,
     Continue,
     Fn {

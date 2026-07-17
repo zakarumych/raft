@@ -1,7 +1,7 @@
 //! FFI layer is strictly no_std, and has zero dependencies.
 //! It declares ABI for dynamically loaded Raft modules.
 #![no_std]
-use core::{cell::Cell, ffi::c_void, ptr::NonNull};
+use core::{cell::Cell, ffi::c_void, ptr::NonNull, sync::atomic::AtomicUsize};
 
 pub type Void = c_void;
 
@@ -58,6 +58,10 @@ pub type RecordVal = RawVec<RawFieldVal>;
 #[repr(C)]
 pub struct RawHost {
     pub stack: RawStack,
+    /// The waker of the poll currently driving this host, or null outside
+    /// any poll. Borrowed - set by the executor for a poll's duration; a
+    /// consumer that wants to keep it must `clone` through its vtable.
+    pub waker: *mut WakerHeader,
 }
 
 pub type DestroyFn = unsafe extern "C" fn(RcPtr<Void>);
@@ -75,7 +79,53 @@ pub type PushFn = unsafe extern "C" fn(VoidPtr, RawVal);
 pub type PopFn = unsafe extern "C" fn(VoidPtr) -> RawVal;
 pub type StackGrowFn = unsafe extern "C" fn(*mut RawStack, usize);
 pub type CallFn = unsafe extern "C" fn(VoidPtr, usize, *mut RawHost) -> usize;
-pub type ResumeFn = unsafe extern "C" fn(VoidPtr, *mut RawHost);
+
+/// Resume a coroutine with `args` arguments on the stack (0 for today's
+/// generator and async kinds), returning a [`CORO_DONE`]/[`CORO_YIELD`]/
+/// [`CORO_PENDING`] status byte.
+pub type CoroResumeFn = unsafe extern "C" fn(VoidPtr, usize, *mut RawHost) -> u8;
+
+/// The coroutine finished. Nothing was pushed; resuming again keeps
+/// returning this and does nothing. A failed coroutine also finishes this
+/// way, with the host's pending-error state set.
+pub const CORO_DONE: u8 = 0;
+
+/// The coroutine pushed exactly one value onto the host stack and may be
+/// resumed again.
+pub const CORO_YIELD: u8 = 1;
+
+/// The coroutine must wait before it can continue - resume it after its
+/// waker (cloned from the host's ambient one) signals. Resuming
+/// immediately is allowed but may keep returning this, wasting work.
+/// Nothing was pushed.
+pub const CORO_PENDING: u8 = 2;
+
+/// What flavor of coroutine a `MASK_TAG_CORO` value is - the first field
+/// of every coroutine payload (see [`CoroHeader`]). Decides the protocol
+/// its consumer holds it to:
+///
+/// - [`CORO_KIND_GEN`] (`gen fn`): iteration expects `CORO_YIELD`s ended
+///   by one `CORO_DONE`; `CORO_PENDING` is a protocol error.
+/// - [`CORO_KIND_ASYNC`] (`async fn`): awaiting expects `CORO_PENDING`s
+///   (propagated to the task) until one `CORO_YIELD` delivers the
+///   resolution, then one final `CORO_DONE`; `CORO_DONE` before any yield
+///   is a protocol error (unless the host error state says why).
+/// - [`CORO_KIND_ASYNC_GEN`] (`async gen fn`): the combination -
+///   `CORO_YIELD` per produced value, `CORO_PENDING` when it must wait
+///   (propagated to the driving task), `CORO_DONE` at the end. Only
+///   iterable from an async context, where pending can suspend the
+///   consumer.
+pub const CORO_KIND_GEN: u8 = 0;
+pub const CORO_KIND_ASYNC: u8 = 1;
+pub const CORO_KIND_ASYNC_GEN: u8 = 2;
+
+/// The FFI-safe prefix every coroutine payload starts with - consumers on
+/// either side of the boundary read the kind straight off the value,
+/// without a vtable call.
+#[repr(C)]
+pub struct CoroHeader {
+    pub kind: u8,
+}
 
 #[repr(C, align(16))]
 pub struct AnyVTable {
@@ -127,9 +177,52 @@ pub struct FnVTable {
 }
 
 #[repr(C, align(16))]
-pub struct GenVTable {
+pub struct CoroVTable {
     pub any: AnyVTable,
-    pub resume: ResumeFn,
+    pub resume: CoroResumeFn,
+}
+
+// ---------------------------------------------------------------------
+// Async: wakers and pollable values across the FFI boundary.
+//
+// `core::task::Waker`'s `RawWakerVTable` is plain-Rust-ABI fn pointers -
+// not stable across a cdylib boundary - so a waker crosses as a *thin*
+// pointer to a [`WakerHeader`], whose first field is its own repr(C)
+// vtable (this crate's usual pattern, prefix-style instead of a fat
+// handle). The host's executor owns the concrete allocation behind it
+// (refcounted task waker: task id + weak queue handle); everyone else
+// only ever touches it through the vtable. The waker of the poll
+// currently driving a host is ambient - [`RawHost::waker`] - rather than
+// threaded through every call: a leaf async value that needs to wake its
+// task later `clone`s it out of the host and stores the owned pointer.
+//
+// Adapting to a real `core::task::Waker` (for polling ordinary Rust
+// futures) is a thin round trip: the `RawWaker` data pointer IS the
+// `WakerHeader` pointer, and one static `RawWakerVTable` forwards each
+// operation through the header's own vtable. No boxing per hop.
+//
+// Single-threaded contract: the host executor is not thread-safe; a
+// waker must only be cloned, woken and dropped on the host's own thread,
+// despite `core::task::Waker`'s nominal `Send + Sync`.
+// ---------------------------------------------------------------------
+
+/// The prefix every FFI waker allocation starts with: its vtable. The
+/// rest of the allocation is implementation-private to whoever built it.
+#[repr(C)]
+pub struct WakerHeader {
+    pub vtable: *const WakerVTable,
+    pub strong: AtomicUsize,
+}
+
+pub type WakerPtr = NonNull<WakerHeader>;
+
+pub type WakerWakeFn = unsafe extern "C" fn(WakerPtr);
+pub type WakerDestroyFn = unsafe extern "C" fn(WakerPtr);
+
+#[repr(C, align(16))]
+pub struct WakerVTable {
+    pub wake: WakerWakeFn,
+    pub destroy: WakerDestroyFn,
 }
 
 /// Bits occupied by the MASK_TAG_* values in a ValTag.
@@ -163,8 +256,9 @@ pub const MASK_TAG_FN: usize = 0b1100;
 /// ValTag contains vtable for opaque object.
 pub const MASK_TAG_OPAQUE: usize = 0b1101;
 
-/// ValTag contains vtable for generator object.
-pub const MASK_TAG_GEN: usize = 0b1110;
+/// ValTag contains vtable for a coroutine object (generator or async -
+/// see [`CoroHeader`], whose kind byte distinguishes them).
+pub const MASK_TAG_CORO: usize = 0b1110;
 
 #[repr(C)]
 pub struct RawTag {

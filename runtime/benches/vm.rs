@@ -443,7 +443,7 @@ fn pipeline(c: &mut Criterion) {
 /// Generator create/resume overhead with real per-step work: a Fibonacci
 /// `gen fn` carrying state across yields, consumed by a `for` - one
 /// resume per item, plus one generator creation per call.
-const GENERATOR: &str = "gen fn fib_gen n:
+const FIB_GENERATOR: &str = "gen fn fib_gen n:
     a = 0
     b = 1
     i = 0
@@ -461,7 +461,7 @@ fn consume n:
     total
 ";
 
-const GENERATOR_PY: &str = "def fib_gen(n):
+const FIB_GENERATOR_PY: &str = "def fib_gen(n):
     a = 0
     b = 1
     i = 0
@@ -479,12 +479,12 @@ def consume(n):
     return total
 ";
 
-fn generator(c: &mut Criterion) {
+fn fib_generator(c: &mut Criterion) {
     // sanity: all execution modes must agree on the result being timed
     let results: Vec<String> = [
-        runtime_with(GENERATOR, false),
-        runtime_with(GENERATOR, true),
-        runtime_oxidized("gen-check", GENERATOR),
+        runtime_with(FIB_GENERATOR, false),
+        runtime_with(FIB_GENERATOR, true),
+        runtime_oxidized("gen-check", FIB_GENERATOR),
     ]
     .into_iter()
     .map(|(mut rt, frame)| {
@@ -500,8 +500,8 @@ fn generator(c: &mut Criterion) {
         "walker/oxidized disagree on generator"
     );
 
-    bench_modes(c, "gen-fib-50", GENERATOR, "consume 50\n");
-    bench_python(c, "gen-fib-50", GENERATOR_PY, "consume(50)\n");
+    bench_modes(c, "gen-fib-50", FIB_GENERATOR, "consume 50\n");
+    bench_python(c, "gen-fib-50", FIB_GENERATOR_PY, "consume(50)\n");
 
     fn consume(n: usize) -> i64 {
         // Rust's own lazy-iterator counterpart of the Fibonacci generator
@@ -524,6 +524,97 @@ fn generator(c: &mut Criterion) {
     }
 
     bench_rust(c, "gen-fib-50", black_box(&consume), 50);
+}
+
+/// Generator create/resume overhead with real per-step work: a Fibonacci
+/// `gen fn` carrying state across yields, consumed by a `for` - one
+/// resume per item, plus one generator creation per call.
+const COLLATZ_GENERATOR: &str = "gen fn collatz_gen n:
+    while n != 1:
+        yield n
+        if (n & 1) == 0:
+            n = n / 2
+        else:
+            n = 3 * n + 1
+    yield 1
+
+fn consume n:
+    total = 0
+    for x in (collatz_gen n):
+        total = total + x
+    total
+";
+
+const COLLATZ_GENERATOR_PY: &str = "def collatz_gen(n):
+    while n != 1:
+        yield n
+        if (n & 1) == 0:
+            n = n // 2
+        else:
+            n = 3 * n + 1
+    yield 1
+
+def consume(n):
+    total = 0
+    for x in collatz_gen(n):
+        total = total + x
+    return total
+";
+
+fn collatz_generator(c: &mut Criterion) {
+    // sanity: all execution modes must agree on the result being timed
+    let results: Vec<String> = [
+        runtime_with(COLLATZ_GENERATOR, false),
+        runtime_with(COLLATZ_GENERATOR, true),
+        runtime_oxidized("gen-check", COLLATZ_GENERATOR),
+    ]
+    .into_iter()
+    .map(|(mut rt, frame)| {
+        for stmt in &parse("r = consume 27\n") {
+            rt.exec_stmt(stmt, frame.clone()).unwrap();
+        }
+        format!("{}", frame.get_var("r", &mut rt))
+    })
+    .collect();
+    assert_eq!(results[0], results[1], "walker/VM disagree on generator");
+    assert_eq!(
+        results[0], results[2],
+        "walker/oxidized disagree on generator"
+    );
+
+    bench_modes(c, "gen-collatz-27", COLLATZ_GENERATOR, "consume 27\n");
+    bench_python(c, "gen-collatz-27", COLLATZ_GENERATOR_PY, "consume(27)\n");
+
+    fn consume(n: i64) -> i64 {
+        // Rust's own lazy-iterator counterpart of the Fibonacci generator
+        struct Collatz {
+            n: Option<i64>,
+        }
+        impl Iterator for Collatz {
+            type Item = i64;
+
+            fn next(&mut self) -> Option<i64> {
+                if let Some(n) = self.n {
+                    if n == 1 {
+                        self.n = None;
+                        return Some(1);
+                    }
+                    let out = n;
+                    if (n & 1) == 0 {
+                        self.n = Some(n / 2);
+                    } else {
+                        self.n = Some(3 * n + 1);
+                    }
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+        }
+        Collatz { n: Some(n) }.sum()
+    }
+
+    bench_rust(c, "gen-collatz-27", black_box(&consume), 27);
 }
 
 /// Full application vs a curried chain of partial applications.
@@ -612,6 +703,6 @@ fn compile(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches, fib, fib_module, tight_loop, collatz, pipeline, generator, calls, binding, compile
+    benches, fib, fib_module, tight_loop, collatz, pipeline, fib_generator, collatz_generator, calls, binding, compile
 );
 criterion_main!(benches);

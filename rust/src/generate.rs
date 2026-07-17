@@ -155,6 +155,7 @@ fn assigned_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
             | StmtKind::Yield(_)
+            | StmtKind::YieldFrom(_)
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -201,6 +202,7 @@ fn expr_reads(expr: &Expr, out: &mut BTreeSet<String>) {
             expr_reads(idx, out);
         }
         ExprKind::Parenthesized(e) => expr_reads(e, out),
+        ExprKind::Await(e) => expr_reads(e, out),
     }
 }
 
@@ -269,7 +271,9 @@ fn stmt_reads(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) => expr_reads(e, out),
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom(e) => {
+            expr_reads(e, out)
+        }
         StmtKind::Return(None)
         | StmtKind::Yield(None)
         | StmtKind::Break
@@ -379,6 +383,18 @@ enum BodyKind {
 /// across an await - see `bundle_support`'s `co_host`).
 const GEN_HOST: &str = "(&mut support::co_host(&__co))";
 
+/// The spelling of one iteration step over `it`: bodies that can await go
+/// through the awaitable `iter_next_async` (so an async-gen iterable's
+/// pending suspends the enclosing body); everywhere else the synchronous
+/// `iter_next`, where pending is an error.
+fn iter_next_call(b: &Body, it: &str) -> String {
+    if b.mode.awaits() {
+        format!("support::iter_next_async(&__co, &mut {it}).await?")
+    } else {
+        format!("support::iter_next({}, &mut {it})?", b.host)
+    }
+}
+
 /// Emission state for one Rust function body being generated.
 struct Body {
     buf: String,
@@ -390,11 +406,34 @@ struct Body {
     loops: Vec<Option<String>>,
     /// The spelling of "a `&mut Host` for the current statement" - the
     /// `host` parameter for ordinary bodies, [`GEN_HOST`] inside a
-    /// generator's async body.
+    /// generator's/async fn's async-block body.
     host: &'static str,
-    /// Whether this is a `gen fn`'s async body - the only place `yield`
-    /// generates; anywhere else it's a transpile error.
-    is_gen: bool,
+    /// What kind of body this is - `yield`/`yield from` only generate in
+    /// a `Gen` body, `await` only in an `Async` one; anywhere else
+    /// they're transpile errors.
+    mode: BodyMode,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BodyMode {
+    Plain,
+    Gen,
+    Async,
+    AsyncGen,
+}
+
+impl BodyMode {
+    /// `yield`/`yield from` allowed in this body?
+    fn yields(self) -> bool {
+        matches!(self, BodyMode::Gen | BodyMode::AsyncGen)
+    }
+
+    /// `await` allowed in this body (which also means iteration must go
+    /// through the awaitable `iter_next_async`, so an async-gen iterable's
+    /// pending can suspend the enclosing body)?
+    fn awaits(self) -> bool {
+        matches!(self, BodyMode::Async | BodyMode::AsyncGen)
+    }
 }
 
 impl Body {
@@ -406,7 +445,7 @@ impl Body {
             kind,
             loops: Vec::new(),
             host: "host",
-            is_gen: false,
+            mode: BodyMode::Plain,
         }
     }
 
@@ -549,7 +588,7 @@ impl BundleGenerator {
         let _ = writeln!(src, "use raft_core::rc::Host;");
         let _ = writeln!(
             src,
-            "use raft_core::{{ffi, AtomId, Function, Generator, Number, RcFn, RcGen, RcStr, RuntimeError, Val, ValEnum, ValsIter}};"
+            "use raft_core::{{ffi, AtomId, CoroKind, CoroStatus, Coroutine, Function, Number, RcCoro, RcFn, RcStr, RuntimeError, Val, ValEnum, ValsIter, ValsIterStep}};"
         );
         let _ = writeln!(src);
         let _ = writeln!(
@@ -896,6 +935,29 @@ impl ModuleCx<'_> {
 
     fn gen_stmt(&mut self, b: &mut Body, stmt: &Stmt) -> Result<(), GenError> {
         match stmt.kind() {
+            // `await e` / `x = await e` - the two grammatical positions an
+            // await can occupy; anywhere else the generic paths reach
+            // gen_expr's Await arm, which rejects it.
+            StmtKind::Expr(e)
+                if b.mode.awaits() && matches!(e.kind(), ExprKind::Await(_)) =>
+            {
+                let ExprKind::Await(inner) = e.kind() else {
+                    unreachable!()
+                };
+                let t = self.gen_expr(b, inner, false)?;
+                b.line(format!("last = support::await_val(&__co, {t})?.await?;"));
+            }
+            StmtKind::AssignPat { target, value }
+                if b.mode.awaits() && matches!(value.kind(), ExprKind::Await(_)) =>
+            {
+                let ExprKind::Await(inner) = value.kind() else {
+                    unreachable!()
+                };
+                let t = self.gen_expr(b, inner, false)?;
+                let v = b.temp(format!("support::await_val(&__co, {t})?.await?"));
+                self.gen_bind(b, target, &v)?;
+                b.line("last = Val::nil();");
+            }
             StmtKind::Expr(e) => {
                 let t = self.gen_expr(b, e, true)?;
                 b.line(format!("last = {t};"));
@@ -1005,9 +1067,9 @@ impl ModuleCx<'_> {
                 let item = b.fresh("_item");
                 let it = b.fresh("_it");
                 b.line(format!("let mut {it} = support::iter_new(&{t_iter})?;"));
-                let host = b.host;
                 b.line(format!(
-                    "while let Some({item}) = support::iter_next({host}, &mut {it})? {{"
+                    "while let Some({item}) = {} {{",
+                    iter_next_call(b, &it)
                 ));
                 b.indent += 1;
                 b.loops.push(flag.clone());
@@ -1045,7 +1107,7 @@ impl ModuleCx<'_> {
                 }
             }
             StmtKind::Yield(expr) => {
-                if !b.is_gen {
+                if !b.mode.yields() {
                     return Err(GenError::new("yield statement outside of generator"));
                 }
                 let t = match expr {
@@ -1053,6 +1115,24 @@ impl ModuleCx<'_> {
                     None => b.temp("Val::nil()"),
                 };
                 b.line(format!("support::gen_yield(&__co, {t}).await;"));
+                b.line("last = Val::nil();");
+            }
+            StmtKind::YieldFrom(expr) => {
+                if !b.mode.yields() {
+                    return Err(GenError::new("yield statement outside of generator"));
+                }
+                let t = self.gen_expr(b, expr, false)?;
+                let it = b.fresh("_it");
+                b.line(format!("let mut {it} = support::iter_new(&{t})?;"));
+                let yv = b.fresh("_yv");
+                b.line(format!(
+                    "while let Some({yv}) = {} {{",
+                    iter_next_call(b, &it)
+                ));
+                b.indent += 1;
+                b.line(format!("support::gen_yield(&__co, {yv}).await;"));
+                b.indent -= 1;
+                b.line("}");
                 b.line("last = Val::nil();");
             }
             StmtKind::Break => match b.loops.last() {
@@ -1079,17 +1159,19 @@ impl ModuleCx<'_> {
                 b.line("last = Val::nil();");
             }
             StmtKind::Fn { name, cat: raft_ast::FnCat::Generator, params, body } => {
-                let t = self.gen_gen_closure(b, params, body)?;
+                let t = self.gen_coro_closure(b, params, body, BodyMode::Gen)?;
                 self.gen_write(b, name.name(), &t);
                 b.line("last = Val::nil();");
             }
-            StmtKind::Fn {
-                cat: raft_ast::FnCat::Async | raft_ast::FnCat::AsyncGenerator,
-                ..
-            } => {
-                return Err(GenError::new(
-                    "async fn transpilation is not yet implemented",
-                ));
+            StmtKind::Fn { name, cat: raft_ast::FnCat::Async, params, body } => {
+                let t = self.gen_coro_closure(b, params, body, BodyMode::Async)?;
+                self.gen_write(b, name.name(), &t);
+                b.line("last = Val::nil();");
+            }
+            StmtKind::Fn { name, cat: raft_ast::FnCat::AsyncGenerator, params, body } => {
+                let t = self.gen_coro_closure(b, params, body, BodyMode::AsyncGen)?;
+                self.gen_write(b, name.name(), &t);
+                b.line("last = Val::nil();");
             }
         }
         Ok(())
@@ -1145,20 +1227,29 @@ impl ModuleCx<'_> {
         Ok(t)
     }
 
-    /// Generate a nested Raft `gen fn` as a creation closure: a normal
-    /// `support::fn_val` function value whose full application pops its
-    /// arguments and builds a suspended generator over an `async move`
-    /// state machine (see `bundle_support`'s generator section). The body
-    /// is generated by the same `gen_stmt` machinery as any function -
-    /// only the host spelling ([`GEN_HOST`]) and the `yield` statement
-    /// differ - so nested closures, captures and control flow all work
-    /// unchanged inside it.
-    fn gen_gen_closure(
+    /// Generate a nested Raft `gen fn`/`async fn`/`async gen fn` as a
+    /// creation closure: a normal `support::fn_val` function value whose
+    /// full application pops its arguments and builds a suspended,
+    /// primed coroutine of the matching kind over an `async move` state
+    /// machine (see `bundle_support`'s coroutine section). The body is
+    /// generated by the same `gen_stmt` machinery as any function - only
+    /// the host spelling ([`GEN_HOST`]) and the `yield`/`await`
+    /// statements differ - so nested closures, captures and control flow
+    /// all work unchanged inside it.
+    fn gen_coro_closure(
         &mut self,
         b: &mut Body,
         params: &[Pat],
         stmts: &[Stmt],
+        mode: BodyMode,
     ) -> Result<String, GenError> {
+        let kind = match mode {
+            BodyMode::Gen => "CoroKind::Gen",
+            BodyMode::Async => "CoroKind::Async",
+            BodyMode::AsyncGen => "CoroKind::AsyncGen",
+            BodyMode::Plain => unreachable!("plain fns take gen_fn_closure"),
+        };
+
         let mut param_binds = BTreeSet::new();
         for p in params {
             pat_binds(p, &mut param_binds);
@@ -1167,14 +1258,14 @@ impl ModuleCx<'_> {
         assigned_names(stmts, &mut locals);
 
         // the async body: scope locals (and the capture struct, if any)
-        // live inside the future, persisting across yields
+        // live inside the future, persisting across suspensions
         let mut fb = Body::new(BodyKind::Fn, b.indent + 3);
-        fb.is_gen = true;
+        fb.mode = mode;
         fb.host = GEN_HOST;
         self.open_scope(&mut fb, &locals, param_binds, stmts);
 
         // bind the argument values moved into the future; runs during
-        // creation (gen_create polls to the gen_start suspension), so a
+        // creation (coro_create polls to the gen_start suspension), so a
         // pattern-match failure is a creation-time error
         for (i, param) in params.iter().enumerate() {
             let arg = format!("_arg{i}");
@@ -1187,7 +1278,7 @@ impl ModuleCx<'_> {
         }
         fb.line("Ok(last)");
 
-        let scope = self.scopes.pop().expect("gen fn scope");
+        let scope = self.scopes.pop().expect("coro fn scope");
 
         let t = b.fresh("_t");
         b.line(format!("let {t} = {{"));
@@ -1215,7 +1306,9 @@ impl ModuleCx<'_> {
         b.line("let __fut = Box::pin(async move {");
         b.buf.push_str(&fb.buf);
         b.line("});");
-        b.line("support::gen_create(host, __co_outer, __fut)");
+        b.line(format!(
+            "support::coro_create(host, {kind}, __co_outer, __fut)"
+        ));
         b.indent -= 1;
         b.line("})");
         b.indent -= 1;
@@ -1300,6 +1393,11 @@ impl ModuleCx<'_> {
                 b.temp(format!("support::index_of(&{t}, &{ti})?"))
             }
             ExprKind::Parenthesized(inner) => self.gen_expr(b, inner, true)?,
+            // awaits generate only at their two statement-level positions
+            // (see gen_stmt) - reaching here means misuse
+            ExprKind::Await(_) => {
+                return Err(GenError::new("await outside of async function"));
+            }
         };
         Ok(t)
     }
@@ -1675,7 +1773,7 @@ mod tests {
         assert!(src.contains("let __co = support::gen_co();"));
         assert!(src.contains("let __fut = Box::pin(async move {"));
         assert!(src.contains("support::gen_start().await;"));
-        assert!(src.contains("support::gen_create(host, __co_outer, __fut)"));
+        assert!(src.contains("support::coro_create(host, CoroKind::Gen, __co_outer, __fut)"));
         // yield awaits the poll-once future
         assert!(src.contains("support::gen_yield(&__co, "));
         // generator bodies re-derive the host per statement, never holding
@@ -1684,6 +1782,70 @@ mod tests {
         // for loops go through the host-aware iteration protocol
         assert!(src.contains("support::iter_new(&"));
         assert!(src.contains("support::iter_next(host, &mut "));
+    }
+
+    #[test]
+    fn yield_from_transpiles_to_a_delegation_loop() {
+        let module = parse_module(
+            "gen fn inner n:\n    yield n\ngen fn outer n:\n    yield from (inner n)\nexport { outer }\n",
+        );
+        let mut generator = BundleGenerator::new();
+        let src = generator.add_module("delegate", &module).unwrap().to_owned();
+
+        assert!(src.contains("support::iter_new(&"));
+        assert!(src.contains("while let Some(_yv"));
+        assert!(src.contains(").await;"));
+
+        // yield from outside a generator is a transpile error
+        let bad = parse_module("fn f xs:\n    yield from xs\nexport { f }\n");
+        let mut g2 = BundleGenerator::new();
+        assert!(g2.add_module("bad", &bad).is_err());
+    }
+
+    #[test]
+    fn async_fns_transpile_to_awaitable_state_machines() {
+        let module = parse_module(
+            "async fn add_async a b:\n    return a + b\nasync fn compose x:\n    y = await (add_async x 1)\n    return y\nexport { compose }\n",
+        );
+        let mut generator = BundleGenerator::new();
+        let src = generator.add_module("asyncs", &module).unwrap().to_owned();
+
+        // creation closure builds and primes an async state machine
+        assert!(src.contains("support::coro_create(host, CoroKind::Async, __co_outer, __fut)"));
+        assert!(src.contains("support::gen_start().await;"));
+        // await is a real await on the polled Val::Async
+        assert!(src.contains("support::await_val(&__co, "));
+        assert!(src.contains(")?.await?"));
+    }
+
+    #[test]
+    fn async_gen_fns_transpile_with_awaitable_iteration() {
+        let module = parse_module(
+            "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (leaf i)\n        yield v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    for x in (agen n):\n        s = s + x\n    return s\nexport { agen, consume }\n",
+        );
+        let mut generator = BundleGenerator::new();
+        let src = generator.add_module("agens", &module).unwrap().to_owned();
+
+        // the async gen body both yields and awaits inside one state machine
+        assert!(src.contains("support::coro_create(host, CoroKind::AsyncGen, __co_outer, __fut)"));
+        assert!(src.contains("support::gen_yield(&__co, "));
+        assert!(src.contains("support::await_val(&__co, "));
+        // the consuming async fn iterates through the awaitable step, so
+        // the async gen's pending suspends it
+        assert!(src.contains("support::iter_next_async(&__co, &mut "));
+        assert!(src.contains(").await? {"));
+    }
+
+    #[test]
+    fn await_outside_async_is_a_transpile_error() {
+        let module = parse_module("fn f x:\n    await x\nexport { f }\n");
+        let mut generator = BundleGenerator::new();
+        assert!(generator.add_module("bad", &module).is_err());
+
+        // await inside a generator body is also rejected
+        let module = parse_module("gen fn g x:\n    await x\nexport { g }\n");
+        let mut generator = BundleGenerator::new();
+        assert!(generator.add_module("bad2", &module).is_err());
     }
 
     #[test]
