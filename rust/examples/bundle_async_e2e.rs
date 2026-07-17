@@ -38,7 +38,20 @@ async fn slow_sum n:
         i = i + 1
     return total
 
-export { add_async, compose, slow_sum }
+async gen fn napping_squares n:
+    i = 0
+    while i < n:
+        v = await (nap i)
+        yield v * v
+        i = i + 1
+
+async fn sum_squares n:
+    s = 0
+    async for x in (napping_squares n):
+        s = s + x
+    return s
+
+export { add_async, compose, slow_sum, sum_squares }
 ";
 
 /// The Raft program the host runtime executes against the linked bundle.
@@ -46,6 +59,7 @@ const SCRIPT: &str = "\
 m = import \"asyncs\"
 fut1 = m.compose 5
 fut2 = m.slow_sum 4
+fut3 = m.sum_squares 4
 ";
 
 /// Pending once, waking its own task before suspending - so resolving it
@@ -104,6 +118,12 @@ fn main() {
     let fut2 = root.get_var("fut2", &mut rt);
     let v2 = smol::block_on(rt.eval_async(fut2)).expect("slow_sum resolves");
     assert_eq!(format!("{v2}"), "6", "slow_sum 4");
+
+    // a bundle async gen (yields between pending awaits) iterated by a
+    // bundle async fn: 0+1+4+9, one executor round trip per element
+    let fut3 = root.get_var("fut3", &mut rt);
+    let v3 = smol::block_on(rt.eval_async(fut3)).expect("sum_squares resolves");
+    assert_eq!(format!("{v3}"), "14", "sum_squares 4");
 
     println!("bundle async e2e passed");
 }

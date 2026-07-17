@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 raft-ast = { path = "../ast" }
 raft-runtime = { path = "../runtime" }
+smol = "2.0"

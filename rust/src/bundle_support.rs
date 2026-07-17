@@ -277,7 +277,7 @@ fn poll_gen(
     fut: &mut GenFut,
 ) -> core::task::Poll<Result<Val, RuntimeError>> {
     co.host.set(host.as_raw());
-    let waker = host.std_waker();
+    let waker = host.rust_waker();
     let mut cx = core::task::Context::from_waker(&waker);
     let r = fut.as_mut().poll(&mut cx);
     co.host.set(core::ptr::null_mut());

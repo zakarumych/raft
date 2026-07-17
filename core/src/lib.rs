@@ -169,6 +169,13 @@ impl Number {
             }
         }
     }
+
+    pub fn as_int(self) -> i64 {
+        match self {
+            Number::Integer(i) => i,
+            Number::Float(f) => f as i64,
+        }
+    }
 }
 
 impl fmt::Debug for Number {

@@ -144,6 +144,10 @@ pub enum Instr {
     /// `→ item` *or* jump - advance the innermost iterator: push the next
     /// item, or (when exhausted) close the iterator and jump to `t`.
     IterNext(u32),
+    /// [`Instr::IterNext`] for `async for`/`async yield from`: a pending
+    /// iterable suspends the enclosing (async) frame, re-running this
+    /// instruction on resume, instead of erroring.
+    IterNextAsync(u32),
     /// `→ Nil` - push the `Nil` atom.
     Nil,
     /// `→ True` - push the `True` atom.
@@ -264,9 +268,10 @@ mod opcode {
     pub const JUMP: u8 = AWAIT + 1;
     pub const JUMP_IF_FALSE: u8 = JUMP + 1;
     pub const ITER_NEXT: u8 = JUMP_IF_FALSE + 1;
+    pub const ITER_NEXT_ASYNC: u8 = ITER_NEXT + 1;
 
     /// `True`/`False` are common enough to deserve their own opcodes, and
-    pub const NIL: u8 = ITER_NEXT + 1;
+    pub const NIL: u8 = ITER_NEXT_ASYNC + 1;
     pub const TRUE: u8 = NIL + 1;
     pub const FALSE: u8 = TRUE + 1;
 
@@ -584,7 +589,7 @@ fn instr_len(i: &Instr) -> usize {
 
         Instr::Unary(_) | Instr::Binary(_) | Instr::BinaryInt(..) => 0,
 
-        Instr::Jump(_) | Instr::JumpIfFalse(_) | Instr::IterNext(_) => 4,
+        Instr::Jump(_) | Instr::JumpIfFalse(_) | Instr::IterNext(_) | Instr::IterNextAsync(_) => 4,
         Instr::Int(n) => int_payload_len(*n),
         Instr::Nil
         | Instr::True
@@ -688,6 +693,10 @@ pub fn encode(instrs: &[Instr]) -> Code {
             Instr::IterInit => bytes.push(opcode::ITER_INIT),
             Instr::IterNext(t) => {
                 bytes.push(opcode::ITER_NEXT);
+                bytes.extend_from_slice(&offsets[t as usize].to_le_bytes());
+            }
+            Instr::IterNextAsync(t) => {
+                bytes.push(opcode::ITER_NEXT_ASYNC);
                 bytes.extend_from_slice(&offsets[t as usize].to_le_bytes());
             }
             Instr::IterPop => bytes.push(opcode::ITER_POP),
@@ -838,6 +847,7 @@ impl Code {
                 opcode::JUMP => Instr::Jump(read_u32(code, &mut pc)?),
                 opcode::JUMP_IF_FALSE => Instr::JumpIfFalse(read_u32(code, &mut pc)?),
                 opcode::ITER_NEXT => Instr::IterNext(read_u32(code, &mut pc)?),
+                opcode::ITER_NEXT_ASYNC => Instr::IterNextAsync(read_u32(code, &mut pc)?),
                 opcode::LOAD_CAP..opcode::LOAD_CAP_END => Instr::LoadCap(SlotId(decode_operand(
                     op - opcode::LOAD_CAP,
                     code,
@@ -1872,7 +1882,10 @@ impl Compiler<'_> {
 
     fn patch(&mut self, at: usize, target: u32) {
         match &mut self.code[at] {
-            Instr::Jump(t) | Instr::JumpIfFalse(t) | Instr::IterNext(t) => *t = target,
+            Instr::Jump(t)
+            | Instr::JumpIfFalse(t)
+            | Instr::IterNext(t)
+            | Instr::IterNextAsync(t) => *t = target,
             other => unreachable!("patching non-jump instruction {:?}", other),
         }
     }
@@ -2175,12 +2188,23 @@ impl Compiler<'_> {
                 iterable,
                 body,
                 else_branch,
+                awaits,
             } => {
+                if *awaits && !self.mode.awaits() {
+                    return Err(CompileError::new(
+                        statement.span(),
+                        "async for outside of async function",
+                    ));
+                }
                 self.compile_expr(iterable, true)?;
                 self.emit(Instr::IterInit);
 
                 let head = self.here();
-                let next = self.emit(Instr::IterNext(0));
+                let next = self.emit(if *awaits {
+                    Instr::IterNextAsync(0)
+                } else {
+                    Instr::IterNext(0)
+                });
                 self.compile_bind(target);
 
                 self.loops.push(LoopCtx {
@@ -2235,11 +2259,17 @@ impl Compiler<'_> {
                     self.emit(Instr::Nil); // a yield statement's own value is nil
                 }
             }
-            StmtKind::YieldFrom(expr) => {
+            StmtKind::YieldFrom { expr, awaits } => {
                 if !self.mode.yields() {
                     return Err(CompileError::new(
                         statement.span(),
                         "yield statement outside of generator",
+                    ));
+                }
+                if *awaits && self.mode != FnMode::AsyncGen {
+                    return Err(CompileError::new(
+                        statement.span(),
+                        "async yield from outside of async generator",
                     ));
                 }
                 // pure desugar - a bind-less `for` whose body is a yield:
@@ -2248,7 +2278,11 @@ impl Compiler<'_> {
                 self.compile_expr(expr, true)?;
                 self.emit(Instr::IterInit);
                 let head = self.here();
-                let next = self.emit(Instr::IterNext(0));
+                let next = self.emit(if *awaits {
+                    Instr::IterNextAsync(0)
+                } else {
+                    Instr::IterNext(0)
+                });
                 self.emit(Instr::Yield);
                 self.emit(Instr::Jump(head));
                 let exit = self.here();
@@ -3415,9 +3449,30 @@ fn run_frame(
                         iters.pop();
                         pc = t as usize;
                     }
-                    // an async-gen iterable must wait - suspend the
-                    // enclosing frame, re-running this instruction (opcode
-                    // byte + 4-byte target) on the next resume; the open
+                    // plain `for`/`yield from` never awaits
+                    ValsIterStep::Pending => {
+                        return Err(RuntimeError::TypeError(
+                            "async generator iteration requires `async for`".into(),
+                        ));
+                    }
+                }
+            }
+            opcode::ITER_NEXT_ASYNC => {
+                let t = read_u32(code, &mut pc)?;
+                let iter = iters.last_mut().ok_or_else(|| {
+                    core::hint::cold_path();
+                    RuntimeError::Other("vm: no active iterator".into())
+                })?;
+                match iter.step(&mut rt.as_host())? {
+                    ValsIterStep::Item(item) => rt.stack().push(item),
+                    ValsIterStep::End => {
+                        rt.status.clone()?;
+                        iters.pop();
+                        pc = t as usize;
+                    }
+                    // the iterable must wait - suspend the enclosing
+                    // frame, re-running this instruction (opcode byte +
+                    // 4-byte target) on the next resume; the open
                     // iterator rides the saved iterator stack
                     ValsIterStep::Pending => {
                         return Ok(FrameExit::Pending { pc: pc - 5 });
@@ -5126,7 +5181,7 @@ for x in (top):
             // the consuming async fn's `for` suspends on that pending and
             // resumes through the waker
             let (mut rt, frame) = run_mode(
-                "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (sleepy)\n        yield i + v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    for x in (agen n):\n        s = s + x\n    return s\n",
+                "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (sleepy)\n        yield i + v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    async for x in (agen n):\n        s = s + x\n    return s\n",
                 compiled,
             )
             .expect("definitions succeed");
@@ -5145,7 +5200,7 @@ for x in (top):
     fn async_gen_delegation_via_yield_from_in_both_modes() {
         for compiled in [false, true] {
             let (mut rt, frame) = run_mode(
-                "async gen fn inner:\n    yield 2\n    yield 3\nasync gen fn outer:\n    yield 1\n    yield from (inner)\nasync fn consume:\n    s = 0\n    for x in (outer):\n        s = s + x\n    return s\n",
+                "async gen fn inner:\n    yield 2\n    yield 3\nasync gen fn outer:\n    yield 1\n    async yield from (inner)\nasync fn consume:\n    s = 0\n    async for x in (outer):\n        s = s + x\n    return s\n",
                 compiled,
             )
             .expect("definitions succeed");
@@ -5214,6 +5269,55 @@ for x in (top):
             let err = rt.spawn(g).expect_err("spawn of an async gen must fail");
             assert!(
                 format!("{err}").contains("async"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+
+            // a plain `for` never awaits - a pending async gen errors even
+            // inside an async fn
+            let (mut rt, frame) = run_mode(
+                "async gen fn agen:\n    x = await (never)\n    yield x\nasync fn consume:\n    for x in (agen):\n        x\n    return 0\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            rt.register_function("never", 0, Some(0), |_rt, _args| crate::async_val(Never));
+            let stmts = ast_from_str("fut = (consume)\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let fut = frame.get_var("fut", &mut rt);
+            let err = smol::block_on(rt.eval_async(fut))
+                .expect_err("plain for over a pending async gen must fail");
+            assert!(
+                format!("{err}").contains("async for"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+
+            // `async for` outside an async context
+            let (mut rt, frame) = run_mode(
+                "fn f xs:\n    async for x in xs:\n        x\n    return 0\nl = [1]\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("f l\n");
+            let err = rt
+                .exec_stmt(&stmts[0], frame.clone())
+                .expect_err("async for in a plain fn must fail");
+            assert!(
+                format!("{err}").contains("async for"),
+                "unexpected: {err} (compiled={compiled})"
+            );
+
+            // `async yield from` in a plain gen fn
+            let (mut rt, frame) = run_mode(
+                "gen fn g xs:\n    async yield from xs\nl = [1]\n",
+                compiled,
+            )
+            .expect("definitions succeed");
+            let stmts = ast_from_str("generator = g l\nfor x in (generator):\n    x\n");
+            rt.exec_stmt(&stmts[0], frame.clone()).unwrap();
+            let err = rt
+                .exec_stmt(&stmts[1], frame.clone())
+                .expect_err("async yield from in a gen fn must fail");
+            assert!(
+                format!("{err}").contains("async yield from"),
                 "unexpected: {err} (compiled={compiled})"
             );
         }

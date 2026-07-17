@@ -865,6 +865,7 @@ fn stmt_for_block_else_block() {
             iterable,
             body: loop_branch,
             else_branch: Some(else_branch),
+            awaits: false,
         } => {
             // target should be identifier pattern 'a'
             match &target.kind() {
@@ -901,6 +902,7 @@ fn stmt_for_inline_else_next_line() {
             iterable,
             body: loop_branch,
             else_branch: Some(else_branch),
+            awaits: false,
         } => {
             match &target.kind() {
                 PatKind::Ident(id) => assert_eq!(id.name(), "a"),
@@ -993,7 +995,7 @@ fn yield_parses_inline_and_in_blocks() {
 fn stmt_yield_from() {
     let statement = tokens_from_str("yield from source").parse_stmt().unwrap();
     match statement.kind() {
-        StmtKind::YieldFrom(e) => {
+        StmtKind::YieldFrom { expr: e, awaits: false } => {
             assert!(matches!(e.kind(), ExprKind::Ident(i) if i.name() == "source"));
         }
         _ => panic!("expected yield from statement"),
@@ -1012,6 +1014,48 @@ fn stmt_yield_from() {
     ));
     // `from` is reserved now: rejected in statement position
     assert!(tokens_from_str("from = 1").parse_stmt().is_err());
+}
+
+#[test]
+fn stmt_async_for_and_async_yield_from() {
+    // `async for` marks awaiting iteration
+    let statement = tokens_from_str("async for a in arr:\n    b")
+        .parse_stmt()
+        .unwrap();
+    assert!(matches!(
+        statement.kind(),
+        StmtKind::For { awaits: true, .. }
+    ));
+
+    // `async yield from` marks awaiting delegation
+    let statement = tokens_from_str("async yield from source")
+        .parse_stmt()
+        .unwrap();
+    match statement.kind() {
+        StmtKind::YieldFrom { expr, awaits: true } => {
+            assert!(matches!(expr.kind(), ExprKind::Ident(i) if i.name() == "source"));
+        }
+        _ => panic!("expected async yield from statement"),
+    }
+
+    // single-line branch position parses too
+    let statement = tokens_from_str("gen fn g s:\n    if s: async yield from s")
+        .parse_stmt()
+        .unwrap();
+    let StmtKind::Fn { body, .. } = statement.kind() else {
+        panic!("expected fn statement");
+    };
+    let StmtKind::If { then_branch, .. } = body[0].kind() else {
+        panic!("expected if statement");
+    };
+    assert!(matches!(
+        then_branch[0].kind(),
+        StmtKind::YieldFrom { awaits: true, .. }
+    ));
+
+    // `async yield` (no from) and stray `async` are parse errors
+    assert!(tokens_from_str("async yield 1").parse_stmt().is_err());
+    assert!(tokens_from_str("async x = 1").parse_stmt().is_err());
 }
 
 #[test]

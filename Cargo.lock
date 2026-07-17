@@ -776,6 +776,7 @@ version = "0.1.0"
 dependencies = [
  "raft-ast",
  "raft-runtime",
+ "smol",
 ]
 
 [[package]]

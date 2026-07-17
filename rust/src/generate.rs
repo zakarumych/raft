@@ -155,7 +155,7 @@ fn assigned_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
             | StmtKind::Yield(_)
-            | StmtKind::YieldFrom(_)
+            | StmtKind::YieldFrom { .. }
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -271,9 +271,9 @@ fn stmt_reads(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom(e) => {
-            expr_reads(e, out)
-        }
+        StmtKind::Return(Some(e))
+        | StmtKind::Yield(Some(e))
+        | StmtKind::YieldFrom { expr: e, .. } => expr_reads(e, out),
         StmtKind::Return(None)
         | StmtKind::Yield(None)
         | StmtKind::Break
@@ -383,12 +383,13 @@ enum BodyKind {
 /// across an await - see `bundle_support`'s `co_host`).
 const GEN_HOST: &str = "(&mut support::co_host(&__co))";
 
-/// The spelling of one iteration step over `it`: bodies that can await go
-/// through the awaitable `iter_next_async` (so an async-gen iterable's
-/// pending suspends the enclosing body); everywhere else the synchronous
-/// `iter_next`, where pending is an error.
-fn iter_next_call(b: &Body, it: &str) -> String {
-    if b.mode.awaits() {
+/// The spelling of one iteration step over `it`: awaiting sites (`async
+/// for` / `async yield from`) go through the awaitable `iter_next_async`
+/// (so an async-gen iterable's pending suspends the enclosing body);
+/// everywhere else the synchronous `iter_next`, where pending is an
+/// error. Callers verify an awaiting site sits in a body that can await.
+fn iter_next_call(b: &Body, it: &str, awaits: bool) -> String {
+    if awaits {
         format!("support::iter_next_async(&__co, &mut {it}).await?")
     } else {
         format!("support::iter_next({}, &mut {it})?", b.host)
@@ -1057,7 +1058,11 @@ impl ModuleCx<'_> {
                 iterable,
                 body,
                 else_branch,
+                awaits,
             } => {
+                if *awaits && !b.mode.awaits() {
+                    return Err(GenError::new("async for outside of async function"));
+                }
                 let flag = else_branch.as_ref().map(|_| {
                     let flag = b.fresh("_broke");
                     b.line(format!("let mut {flag} = false;"));
@@ -1069,7 +1074,7 @@ impl ModuleCx<'_> {
                 b.line(format!("let mut {it} = support::iter_new(&{t_iter})?;"));
                 b.line(format!(
                     "while let Some({item}) = {} {{",
-                    iter_next_call(b, &it)
+                    iter_next_call(b, &it, *awaits)
                 ));
                 b.indent += 1;
                 b.loops.push(flag.clone());
@@ -1117,9 +1122,14 @@ impl ModuleCx<'_> {
                 b.line(format!("support::gen_yield(&__co, {t}).await;"));
                 b.line("last = Val::nil();");
             }
-            StmtKind::YieldFrom(expr) => {
+            StmtKind::YieldFrom { expr, awaits } => {
                 if !b.mode.yields() {
                     return Err(GenError::new("yield statement outside of generator"));
+                }
+                if *awaits && b.mode != BodyMode::AsyncGen {
+                    return Err(GenError::new(
+                        "async yield from outside of async generator",
+                    ));
                 }
                 let t = self.gen_expr(b, expr, false)?;
                 let it = b.fresh("_it");
@@ -1127,7 +1137,7 @@ impl ModuleCx<'_> {
                 let yv = b.fresh("_yv");
                 b.line(format!(
                     "while let Some({yv}) = {} {{",
-                    iter_next_call(b, &it)
+                    iter_next_call(b, &it, *awaits)
                 ));
                 b.indent += 1;
                 b.line(format!("support::gen_yield(&__co, {yv}).await;"));
@@ -1821,7 +1831,7 @@ mod tests {
     #[test]
     fn async_gen_fns_transpile_with_awaitable_iteration() {
         let module = parse_module(
-            "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (leaf i)\n        yield v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    for x in (agen n):\n        s = s + x\n    return s\nexport { agen, consume }\n",
+            "async gen fn agen n:\n    i = 0\n    while i < n:\n        v = await (leaf i)\n        yield v\n        i = i + 1\nasync fn consume n:\n    s = 0\n    async for x in (agen n):\n        s = s + x\n    return s\nexport { agen, consume }\n",
         );
         let mut generator = BundleGenerator::new();
         let src = generator.add_module("agens", &module).unwrap().to_owned();
@@ -1834,6 +1844,16 @@ mod tests {
         // the async gen's pending suspends it
         assert!(src.contains("support::iter_next_async(&__co, &mut "));
         assert!(src.contains(").await? {"));
+
+        // `async for` outside an async body is a transpile error
+        let bad = parse_module("fn f xs:\n    async for x in xs:\n        x\nexport { f }\n");
+        let mut g2 = BundleGenerator::new();
+        assert!(g2.add_module("bad", &bad).is_err());
+
+        // `async yield from` outside an async gen body is a transpile error
+        let bad = parse_module("gen fn g xs:\n    async yield from xs\nexport { g }\n");
+        let mut g3 = BundleGenerator::new();
+        assert!(g3.add_module("bad2", &bad).is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
-use std::{io::Write, rc::Rc};
+use std::{io::Write, pin::Pin, rc::Rc, task::{Context, Poll}};
 
 use raft_ast::{lexer::LexErrorKind, parser::ParseErrorKind};
-use raft_runtime::{Exec, Val, ValsIter};
+use raft_runtime::{Exec, Number, RcStr, Val, ValEnum, ValsIter, async_val};
 
 fn main() {
     std::io::stdout().write_all(b"Raft REPL\n").unwrap();
@@ -40,6 +40,47 @@ fn main() {
             Val::nil()
         },
     );
+
+    // print takes any number of arguments, quit takes exactly none
+    rt.register_function("timeout", 1, Some(1), |rt, _args| {
+        struct Timeout {
+            deadline: std::time::Instant,
+        }
+
+        impl Future for Timeout {
+            type Output = Result<Val, raft_runtime::RuntimeError>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if std::time::Instant::now() >= self.deadline {
+                    Poll::Ready(Ok(Val::nil()))
+                } else {
+                    let dur = self.deadline - std::time::Instant::now();
+
+                    let waker = cx.waker().clone();
+
+                    std::thread::spawn(move || {
+                        std::thread::sleep(dur);
+                        waker.wake();
+                    });
+
+                    Poll::Pending
+                }
+            }
+        }
+
+        let duration= match rt.stack().pop().unpack() {
+            ValEnum::Number(Number::Integer(secs)) => std::time::Duration::from_secs(secs as u64),
+            ValEnum::Number(Number::Float(f)) => std::time::Duration::from_secs_f64(f),
+            _ => {
+                rt.set_error(raft_runtime::RuntimeError::Other(RcStr::new("Invalid timeout argument type")));
+                return Val::nil();
+            }
+        };
+
+        let deadline = std::time::Instant::now() + duration;
+
+        async_val(Timeout { deadline })
+    });
 
     // import "name" loads ./name.raft (or ./name) as a module: the file is
     // executed once, its `export { .. }` becomes the module object, and
@@ -138,7 +179,7 @@ fn main() {
                         lines.clear();
 
                         for statement in &stmts {
-                            match rt.exec_stmt(&statement, root.clone()) {
+                            match smol::block_on(rt.exec_async(&statement, root.clone())) {
                                 Ok(Exec::Value(value)) => {
                                     if value != Val::nil() {
                                         println!("{}", value);

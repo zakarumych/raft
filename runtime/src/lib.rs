@@ -271,7 +271,9 @@ enum GenFrame {
     },
     /// An active `yield from` - each step yields the delegate iterator's
     /// next value directly; exhaustion pops the frame and continues.
-    Delegate { iter: ValsIter },
+    /// `awaits` (`async yield from`) allows a pending iterable to suspend
+    /// the machine instead of erroring.
+    Delegate { iter: ValsIter, awaits: bool },
     /// An active `await` - `stmts[idx]` is the awaiting statement (a bare
     /// `await` expression statement, or an assignment whose whole RHS is
     /// one). Each step re-resumes `future`: `Pending` suspends the
@@ -437,7 +439,8 @@ fn machine_step(
                     }
                     continue;
                 }
-                Some(GenFrame::Delegate { iter }) => {
+                Some(GenFrame::Delegate { iter, awaits }) => {
+                    let awaits = *awaits;
                     match iter.step(&mut rt.as_host())? {
                         ValsIterStep::Item(item) => return Ok(MachineStep::Yielded(item)),
                         ValsIterStep::End => {
@@ -446,13 +449,13 @@ fn machine_step(
                             rt.status.clone()?;
                             frames.pop();
                         }
-                        // an async-gen delegate must wait - suspend the
-                        // machine (the frame stays; re-stepping re-steps
-                        // the iterator)
+                        // a pending delegate suspends the machine only
+                        // under `async yield from` (the frame stays;
+                        // re-stepping re-steps the iterator)
                         ValsIterStep::Pending => {
-                            if kind == CoroKind::Gen {
+                            if !awaits {
                                 return Err(RuntimeError::TypeError(
-                                    "cannot iterate an async generator outside an async context"
+                                    "async generator delegation requires `async yield from`"
                                         .into(),
                                 ));
                             }
@@ -482,7 +485,7 @@ fn machine_step(
                 Some(GenFrame::For { stmts, idx, iter }) => {
                     let (stmts, at) = (stmts.clone(), *idx);
                     let StmtKind::For {
-                        target, body, else_branch, ..
+                        target, body, else_branch, awaits, ..
                     } = stmts[at].kind() else {
                         unreachable!("GenFrame::For must point at a for statement")
                     };
@@ -506,14 +509,13 @@ fn machine_step(
                                 });
                             }
                         }
-                        // an async-gen iterable must wait - suspend the
-                        // machine (the frame stays; re-stepping re-steps
-                        // the iterator)
+                        // a pending iterable suspends the machine only
+                        // under `async for` (the frame stays; re-stepping
+                        // re-steps the iterator)
                         ValsIterStep::Pending => {
-                            if kind == CoroKind::Gen {
+                            if !awaits {
                                 return Err(RuntimeError::TypeError(
-                                    "cannot iterate an async generator outside an async context"
-                                        .into(),
+                                    "async generator iteration requires `async for`".into(),
                                 ));
                             }
                             return Ok(MachineStep::Pending);
@@ -537,15 +539,23 @@ fn machine_step(
                     };
                     return Ok(MachineStep::Yielded(v));
                 }
-                StmtKind::YieldFrom(expr) => {
+                StmtKind::YieldFrom { expr, awaits } => {
                     if kind == CoroKind::Async {
                         return Err(RuntimeError::Other(
                             "yield statement outside of generator".into(),
                         ));
                     }
+                    if *awaits && kind != CoroKind::AsyncGen {
+                        return Err(RuntimeError::Other(
+                            "async yield from outside of async generator".into(),
+                        ));
+                    }
                     let iter_val = rt.eval(expr, frame)?;
                     let iter = ValsIter::new(&iter_val)?;
-                    frames.push(GenFrame::Delegate { iter });
+                    frames.push(GenFrame::Delegate {
+                        iter,
+                        awaits: *awaits,
+                    });
                 }
                 // `await e` / `x = await e` - suspension points, stepped
                 // here rather than delegated to the walker
@@ -633,7 +643,12 @@ fn machine_step(
                 StmtKind::While { .. } => {
                     frames.push(GenFrame::While { stmts: stmts.clone(), idx });
                 }
-                StmtKind::For { iterable, .. } => {
+                StmtKind::For { iterable, awaits, .. } => {
+                    if *awaits && kind == CoroKind::Gen {
+                        return Err(RuntimeError::Other(
+                            "async for outside of async function".into(),
+                        ));
+                    }
                     let iter_val = rt.eval_impl(iterable, frame, true)?;
                     let iter = ValsIter::new(&iter_val)?;
                     frames.push(GenFrame::For {
@@ -830,6 +845,7 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
             iterable,
             body,
             else_branch,
+            awaits: _,
         } => {
             collect_reads_expr(iterable, out);
             for s in body.iter() {
@@ -841,7 +857,7 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom(e) => {
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom { expr: e, .. } => {
             collect_reads_expr(e, out)
         }
         StmtKind::Return(None)
@@ -982,7 +998,7 @@ impl SlotTable {
             | StmtKind::AssignIndex { .. }
             | StmtKind::Return(_)
             | StmtKind::Yield(_)
-            | StmtKind::YieldFrom(_)
+            | StmtKind::YieldFrom { .. }
             | StmtKind::Break
             | StmtKind::Continue => {}
         }
@@ -1812,7 +1828,13 @@ impl Runtime {
                 iterable,
                 body,
                 else_branch,
+                awaits,
             } => {
+                if *awaits {
+                    return Err(RuntimeError::Other(
+                        "async for outside of async function".into(),
+                    ));
+                }
                 let iter_val = self.eval_impl(iterable, &frame, true)?;
                 let mut values = ValsIter::new(&iter_val)?;
 
@@ -1844,7 +1866,7 @@ impl Runtime {
                 let v = self.eval_impl(expr, &frame, false)?;
                 Ok(Exec::Return(v))
             }
-            StmtKind::Yield(_) | StmtKind::YieldFrom(_) => Err(RuntimeError::Other(
+            StmtKind::Yield(_) | StmtKind::YieldFrom { .. } => Err(RuntimeError::Other(
                 "yield statement outside of generator".into(),
             )),
             StmtKind::Break => Ok(Exec::Break),
@@ -1933,6 +1955,28 @@ impl Runtime {
                 Ok(Exec::Value(Val::nil()))
             }
         }
+    }
+
+    /// Like [`Runtime::exec_stmt`], but `await`, `async for` and `async
+    /// yield from` are allowed rather than rejected: `stmt` runs as the
+    /// sole statement of an async body (the same machine an `async fn`
+    /// call suspends into), so a real awaited future's `Pending` suspends
+    /// this future instead of erroring. `stmt` need not contain any of
+    /// those forms - an ordinary statement just runs to completion on the
+    /// first poll, same as `exec_stmt` would. Callers drive the returned
+    /// future with their own executor (e.g. `smol::block_on`). As in an
+    /// async fn body, a bare `return` resolves the statement to that value
+    /// (there's no separate `Exec::Return` out of this machine); `break`/
+    /// `continue` outside a loop still surface as errors.
+    pub async fn exec_async(&mut self, stmt: &Stmt, frame: Rc<Frame>) -> Result<Exec, RuntimeError> {
+        let body: Rc<[Stmt]> = Rc::from([stmt.clone()]);
+        let coro = AstCoroutine {
+            kind: CoroKind::Async,
+            frame,
+            state: RefCell::new(GenState::initial(body)),
+        };
+        let future = Val::from(ValEnum::Coro(RcCoro::new(CoroKind::Async, coro)));
+        self.eval_async(future).await.map(Exec::Value)
     }
 
     /// Register an already-built module object under `name` - e.g. one

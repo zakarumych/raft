@@ -1355,7 +1355,7 @@ impl Stmt {
                         let expr = Expr::parse(stream)?;
                         return Ok(Stmt {
                             span: kw_span.join(expr.span),
-                            kind: StmtKind::YieldFrom(expr),
+                            kind: StmtKind::YieldFrom { expr, awaits: false },
                         });
                     }
 
@@ -1384,6 +1384,30 @@ impl Stmt {
                             span,
                             kind: ExprKind::Await(Rc::new(expr)),
                         }),
+                    });
+                }
+                // `async yield from <expr>` - the only `async`-prefixed
+                // form that fits on a single line
+                Keyword::Async => {
+                    stream.advance();
+                    stream.skip_comments();
+                    let Some((Keyword::Yield, yield_span)) = Keyword::peek(stream) else {
+                        return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));
+                    };
+                    stream.advance();
+                    stream.skip_comments();
+                    let Some((Keyword::From, _)) = Keyword::peek(stream) else {
+                        return Err(ParseError::new(
+                            ParseErrorKind::UnexpectedToken,
+                            kw_span.join(yield_span),
+                        ));
+                    };
+                    stream.advance();
+                    stream.skip_comments();
+                    let expr = Expr::parse(stream)?;
+                    return Ok(Stmt {
+                        span: kw_span.join(expr.span),
+                        kind: StmtKind::YieldFrom { expr, awaits: true },
                     });
                 }
                 Keyword::Break => {
@@ -1437,7 +1461,7 @@ impl Stmt {
                         let expr = Expr::parse(stream)?;
                         return Ok(Stmt {
                             span: kw_span.join(expr.span),
-                            kind: StmtKind::YieldFrom(expr),
+                            kind: StmtKind::YieldFrom { expr, awaits: false },
                         });
                     }
 
@@ -1492,7 +1516,7 @@ impl Stmt {
                 }
                 Keyword::For => {
                     stream.advance();
-                    return Self::parse_for(stream, kw_span);
+                    return Self::parse_for(stream, kw_span, false);
                 }
                 Keyword::Fn => {
                     stream.advance();
@@ -1628,7 +1652,7 @@ impl Stmt {
         })
     }
 
-    pub fn parse_for(stream: &mut TokenStream, for_span: Span) -> ParseResult<Self> {
+    pub fn parse_for(stream: &mut TokenStream, for_span: Span, awaits: bool) -> ParseResult<Self> {
         let target = Pat::parse(stream)?;
 
         match Keyword::peek(stream) {
@@ -1663,6 +1687,7 @@ impl Stmt {
                 iterable,
                 body: body.into(),
                 else_branch: else_branch.map(|b| b.into()),
+                awaits,
             },
         })
     }
@@ -1753,6 +1778,32 @@ impl Stmt {
             Some((Keyword::Gen, gen_span)) => {
                 stream.advance();
                 Self::parse_gen(stream, true, async_span.join(gen_span))
+            }
+            // `async for <pat> in <iterable>:` - awaiting iteration
+            Some((Keyword::For, for_span)) => {
+                stream.advance();
+                Self::parse_for(stream, async_span.join(for_span), true)
+            }
+            // `async yield from <expr>` - awaiting delegation
+            Some((Keyword::Yield, yield_span)) => {
+                stream.advance();
+                stream.skip_comments();
+                match Keyword::peek(stream) {
+                    Some((Keyword::From, _)) => {
+                        stream.advance();
+                        stream.skip_comments();
+                        let expr = Expr::parse(stream)?;
+                        Ok(Stmt {
+                            span: async_span.join(expr.span),
+                            kind: StmtKind::YieldFrom { expr, awaits: true },
+                        })
+                    }
+                    // a plain yield can't await anything
+                    _ => Err(ParseError::new(
+                        ParseErrorKind::UnexpectedToken,
+                        async_span.join(yield_span),
+                    )),
+                }
             }
             Some((_, kw_span)) => {
                 return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span));

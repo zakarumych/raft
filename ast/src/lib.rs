@@ -375,6 +375,10 @@ pub enum StmtKind {
         iterable: Expr,
         body: Rc<[Stmt]>,
         else_branch: Option<Rc<[Stmt]>>,
+        /// `async for` - when the iterable is an async generator that must
+        /// wait, suspend the enclosing async body instead of erroring.
+        /// Only meaningful inside an `async fn`/`async gen fn`.
+        awaits: bool,
     },
     Return(Option<Expr>),
     /// `yield <expr>` / bare `yield` - suspend the enclosing generator,
@@ -384,7 +388,10 @@ pub enum StmtKind {
     /// `yield from <expr>` - evaluate `<expr>` to an iterable (generator,
     /// list, or record - the same protocol as `for`), yield every value
     /// it produces, then continue. Same placement rules as `Yield`.
-    YieldFrom(Expr),
+    /// `async yield from` (`awaits`) additionally suspends the enclosing
+    /// async generator when the iterable must wait - only meaningful
+    /// inside an `async gen fn`.
+    YieldFrom { expr: Expr, awaits: bool },
     Break,
     Continue,
     Fn {
