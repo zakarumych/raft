@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use raft_runtime::{BundleBuilder, Exec, Frame, Runtime, RuntimeError, Val, ValEnum, async_val};
+use raft_runtime::{BundleBuilder, Exec, Frame, Runtime, RuntimeError, Val, async_val};
 
 /// The Raft module that gets transpiled into the bundle.
 const ASYNC_RAFT: &str = "\
@@ -56,7 +56,7 @@ export { add_async, compose, slow_sum, sum_squares }
 
 /// The Raft program the host runtime executes against the linked bundle.
 const SCRIPT: &str = "\
-m = import \"asyncs\"
+import asyncs as m
 fut1 = m.compose 5
 fut2 = m.slow_sum 4
 fut3 = m.sum_squares 4
@@ -85,7 +85,6 @@ impl Future for Nap {
 
 fn main() {
     let mut rt = Runtime::new();
-    register_import(&mut rt);
     rt.register_function("nap", 1, Some(1), |rt, _args| {
         let v = rt.stack().pop();
         async_val(Nap {
@@ -126,29 +125,6 @@ fn main() {
     assert_eq!(format!("{v3}"), "14", "sum_squares 4");
 
     println!("bundle async e2e passed");
-}
-
-fn register_import(rt: &mut Runtime) {
-    // import "name" resolves against the runtime's registered modules -
-    // which is where linked bundles' modules land
-    rt.register_function("import", 1, Some(1), |rt, _args| {
-        let name_val = rt.stack().pop();
-        let ValEnum::String(name) = name_val.unpack() else {
-            rt.set_error(RuntimeError::TypeError(
-                "import expects a module name string".into(),
-            ));
-            return Val::nil();
-        };
-        match rt.module(name.as_str()) {
-            Some(module) => module,
-            None => {
-                rt.set_error(RuntimeError::Other(
-                    format!("no module named '{name}' registered").into(),
-                ));
-                Val::nil()
-            }
-        }
-    });
 }
 
 fn parse_stmts(source: &str) -> Vec<raft_ast::Stmt> {

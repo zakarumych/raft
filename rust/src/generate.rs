@@ -150,6 +150,7 @@ fn assigned_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             StmtKind::Fn { name, .. } => {
                 out.insert(name.name().to_owned());
             }
+            StmtKind::Import { binding, .. } => pat_binds(binding, out),
             StmtKind::Expr(_)
             | StmtKind::AssignField { .. }
             | StmtKind::AssignIndex { .. }
@@ -281,6 +282,7 @@ fn stmt_reads(stmt: &Stmt, out: &mut BTreeSet<String>) {
         StmtKind::Fn { params, body, .. } => {
             out.extend(fn_free_names(params, body));
         }
+        StmtKind::Import { .. } => {}
     }
 }
 
@@ -547,7 +549,16 @@ impl BundleGenerator {
         let mut src = String::new();
         let _ = writeln!(src, "//! Transpiled from Raft module `{name}`.");
         let _ = writeln!(src);
-        let _ = writeln!(src, "use super::*;");
+
+        let _ = writeln!(
+            src,
+            "use core::{{cell::{{Cell, RefCell, UnsafeCell}}, cmp::Ordering, pin::Pin, future::Future}};"
+        );
+        let _ = writeln!(
+            src,
+            "use raft_core::{{ffi, AtomId, CoroKind, CoroStatus, Coroutine, Function, Number, RcCoro, RcFn, RcStr, RuntimeError, Val, ValEnum, ValsIter, ValsIterStep}};"
+        );
+
         for def in &cx.structs {
             let _ = writeln!(src);
             src.push_str(def);
@@ -579,18 +590,17 @@ impl BundleGenerator {
         );
         let _ = writeln!(
             src,
-            "#![allow(unused_variables, unused_mut, unused_assignments, unused_imports, unused_parens, unreachable_code, dead_code)]"
+            "#![no_std]"
         );
-        let _ = writeln!(src);
-        let _ = writeln!(src, "use std::cell::{{Cell, RefCell, UnsafeCell}};");
-        let _ = writeln!(src, "use std::cmp::Ordering;");
-        let _ = writeln!(src, "use std::rc::Rc;");
-        let _ = writeln!(src);
-        let _ = writeln!(src, "use raft_core::rc::Host;");
         let _ = writeln!(
             src,
-            "use raft_core::{{ffi, AtomId, CoroKind, CoroStatus, Coroutine, Function, Number, RcCoro, RcFn, RcStr, RuntimeError, Val, ValEnum, ValsIter, ValsIterStep}};"
+            "#![allow(unused_variables, unused_mut, unused_assignments, unused_imports, unused_parens, unreachable_code, dead_code)]"
         );
+        let _ = writeln!(
+            src,
+            "extern crate alloc;"
+        );
+        let _ = writeln!(src);
         let _ = writeln!(src);
         let _ = writeln!(
             src,
@@ -626,7 +636,6 @@ impl BundleGenerator {
         let _ = writeln!(src, "];");
         let _ = writeln!(src);
         let _ = writeln!(src, "mod support {{");
-        let _ = writeln!(src, "    use super::*;");
         let _ = writeln!(src);
         let _ = writeln!(
             src,
@@ -659,8 +668,25 @@ impl BundleGenerator {
         for (name, _) in &self.modules {
             let _ = writeln!(src, "pub mod {name};");
         }
+
+        struct ModuleNames<'a> {
+            modules: &'a [(String, String)],
+        }
+
+        impl core::fmt::Display for ModuleNames<'_> {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "[")?;
+                for (name, _) in self.modules {
+                    write!(f, "\"{}\",", name.escape_default())?;
+                }
+                write!(f, "]")
+            }
+        }
+
+        let names = ModuleNames { modules: &self.modules };
+
         let _ = writeln!(src);
-        let _ = writeln!(src, "raft_core::ffi::raft_bundle!((bundle, ffi_host) => {{");
+        let _ = writeln!(src, "raft_core::ffi::raft_bundle!({names} (bundle, ffi_host) => {{", );
         let _ = writeln!(src, "    support::init(ffi_host);");
         let _ = writeln!(
             src,
@@ -1183,6 +1209,13 @@ impl ModuleCx<'_> {
                 self.gen_write(b, name.name(), &t);
                 b.line("last = Val::nil();");
             }
+            // `import` resolves modules via the host runtime's lookup dirs
+            // and cdylib linking, neither of which a transpiled bundle -
+            // itself a cdylib, with no host runtime of its own - can do at
+            // its own init time. Not supported inside transpiled code yet.
+            StmtKind::Import { .. } => {
+                return Err(GenError::new("import is not supported inside a transpiled bundle"));
+            }
         }
         Ok(())
     }
@@ -1697,7 +1730,7 @@ mod tests {
         assert!(lib.contains("mod support {"));
         assert!(lib.contains("pub struct TranspiledFn<F>"));
         assert!(lib.contains("pub mod math;"));
-        assert!(lib.contains("raft_core::ffi::raft_bundle!((bundle, ffi_host) => {"));
+        assert!(lib.contains("raft_core::ffi::raft_bundle!([\"math\",] (bundle, ffi_host) => {"));
         assert!(lib.contains("support::init(ffi_host);"));
         assert!(lib.contains("modules.push((RcStr::new(\"math\"), math::load(&mut host)?));"));
         assert!(lib.contains("bundle.modules = Val::record(modules).into_ffi();"));

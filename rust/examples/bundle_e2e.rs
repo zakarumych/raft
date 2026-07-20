@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use raft_core::{Number, Val, ValEnum};
-use raft_runtime::{BundleBuilder, Exec, Frame, Runtime, RuntimeError};
+use raft_runtime::{BundleBuilder, Exec, Frame, Runtime};
 
 /// The Raft module that gets transpiled into the bundle.
 const MATH_RAFT: &str = "\
@@ -31,14 +31,19 @@ export { add, fact }
 
 /// The Raft program the host runtime executes against the linked bundle.
 const SCRIPT: &str = "\
-math = import \"math\"
+import math
 answer = math.add (math.fact 3) 36
 print answer
 ";
 
 fn main() {
     let mut rt = Runtime::new();
-    register_host_fns(&mut rt);
+    rt.register_function("print", 0, None, |rt, args| {
+        for arg in rt.stack().drain_top(args).rev() {
+            println!("{}", arg);
+        }
+        Val::nil()
+    });
 
     // transpile + cargo build + link, all through the runtime
     let names = rt
@@ -60,36 +65,6 @@ fn main() {
         ValEnum::Number(Number::Integer(42)) => println!("bundle e2e passed: answer == 42"),
         other => panic!("expected 42, got {:?}", Val::from(other)),
     }
-}
-
-fn register_host_fns(rt: &mut Runtime) {
-    rt.register_function("print", 0, None, |rt, args| {
-        for arg in rt.stack().drain_top(args).rev() {
-            println!("{}", arg);
-        }
-        Val::nil()
-    });
-
-    // import "name" resolves against the runtime's registered modules -
-    // which is where linked bundles' modules land
-    rt.register_function("import", 1, Some(1), |rt, _args| {
-        let name_val = rt.stack().pop();
-        let ValEnum::String(name) = name_val.unpack() else {
-            rt.set_error(RuntimeError::TypeError(
-                "import expects a module name string".into(),
-            ));
-            return Val::nil();
-        };
-        match rt.module(name.as_str()) {
-            Some(module) => module,
-            None => {
-                rt.set_error(RuntimeError::Other(
-                    format!("no module named '{name}' registered").into(),
-                ));
-                Val::nil()
-            }
-        }
-    });
 }
 
 fn parse_stmts(source: &str) -> Vec<raft_ast::Stmt> {

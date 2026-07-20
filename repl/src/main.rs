@@ -82,49 +82,11 @@ fn main() {
         async_val(Timeout { deadline })
     });
 
-    // import "name" loads ./name.raft (or ./name) as a module: the file is
-    // executed once, its `export { .. }` becomes the module object, and
-    // repeated imports return the cached module
-    rt.register_function(
-        "import",
-        1, Some(1), |rt, args| {
-            let mut stack = rt.stack();
-            let mut popped = stack.drain_top(args);
-            let name = popped.next();
-            drop(popped);
-            drop(stack);
-            let Some(name) = name.and_then(|v| match v.unpack() {
-                raft_runtime::ValEnum::String(name) => Some(name),
-                _ => None,
-            }) else {
-                rt.set_error(raft_runtime::RuntimeError::TypeError(
-                    "import expects a module name string".into(),
-                ));
-                return Val::nil();
-            };
-
-            let path = format!("{name}.raft");
-            let source =
-                std::fs::read_to_string(&path).or_else(|_| std::fs::read_to_string(&name[..]));
-            let source = match source {
-                Ok(source) => source,
-                Err(e) => {
-                    rt.set_error(raft_runtime::RuntimeError::Other(
-                        format!("cannot read module '{name}': {e}").into(),
-                    ));
-                    return Val::nil();
-                }
-            };
-
-            match rt.load_module(&name, &source) {
-                Ok(module) => module,
-                Err(e) => {
-                    rt.set_error(e);
-                    Val::nil()
-                }
-            }
-        }
-    );
+    // `import modulename` is a language statement now (see
+    // `raft_ast::StmtKind::Import`): `Runtime::import` (backing
+    // `exec_stmt`'s handling of it) searches `module_dirs` for
+    // `modulename.raft` and `cdylib_dirs` for a bundle exposing it - both
+    // default to the current directory, which is all the REPL needs.
 
     rt.register_function(
         "list",
@@ -176,6 +138,7 @@ fn main() {
                 let mut stream = raft_ast::parser::TokenStream::new(tokens);
                 match raft_ast::Stmt::parse_many(&mut stream) {
                     Ok(stmts) => {
+                        rt.clear_error();
                         lines.clear();
 
                         for statement in &stmts {

@@ -87,6 +87,8 @@ pub enum Keyword {
     Async,
     Await,
     From,
+    Import,
+    As,
 }
 
 impl Keyword {
@@ -107,6 +109,8 @@ impl Keyword {
             "async" => Some(Keyword::Async),
             "await" => Some(Keyword::Await),
             "from" => Some(Keyword::From),
+            "import" => Some(Keyword::Import),
+            "as" => Some(Keyword::As),
             _ => None,
         }
     }
@@ -1424,11 +1428,45 @@ impl Stmt {
                         kind: StmtKind::Continue,
                     });
                 }
+                Keyword::Import => {
+                    stream.advance();
+                    return Self::parse_import(stream, kw_span);
+                }
                 _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }
         }
 
         Self::parse_simple(stream)
+    }
+
+    /// `import <ident>` - `stream` is positioned just past the `import`
+    /// keyword (already consumed, `import_span` is its span). Shared by
+    /// [`Self::parse`] and [`Self::parse_line`] since an import fits on one
+    /// line either way.
+    fn parse_import(stream: &mut TokenStream, import_span: Span) -> ParseResult<Self> {
+        stream.skip_comments();
+        let module = stream.parse_ident()?;
+        stream.skip_comments();
+
+        let binding = if let Some((Keyword::As, _as_span)) = Keyword::peek(stream) {
+            stream.advance();
+            stream.skip_comments();
+            let pat = Pat::parse(stream)?;
+            match pat.kind() {
+                // `as aliasname` or `as { pattern }` - anything else (a
+                // list pattern, a literal, ...) isn't a meaningful import
+                // target
+                PatKind::Ident(_) | PatKind::Record(_) => pat,
+                _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, pat.span())),
+            }
+        } else {
+            Pat::new(PatKind::Ident(module.clone()), module.span())
+        };
+
+        Ok(Stmt {
+            span: import_span.join(binding.span()),
+            kind: StmtKind::Import { module, binding },
+        })
     }
 
     pub fn parse(stream: &mut TokenStream) -> ParseResult<Self> {
@@ -1529,6 +1567,10 @@ impl Stmt {
                 Keyword::Async => {
                     stream.advance();
                     return Self::parse_async(stream, kw_span);
+                }
+                Keyword::Import => {
+                    stream.advance();
+                    return Self::parse_import(stream, kw_span);
                 }
                 _ => return Err(ParseError::new(ParseErrorKind::UnexpectedToken, kw_span)),
             }

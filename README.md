@@ -345,10 +345,18 @@ export { pi, sq, area }
 ```
 
 ```raft
-geo = import "geometry"
-geo.area 5          // 75
-{ sq } = geo        // record patterns destructure modules
+import geometry
+geometry.area 5           // 75
+
+import geometry as geo
+geo.area 5                 // same module, bound under a different name
+
+import geometry as { sq }  // record patterns destructure modules directly
 ```
+
+`import <name>` is a statement, not an expression: `<name>` is a bare
+module name (not a string), and the resulting module value is bound under
+`<name>` itself unless `as <alias>` or `as { pattern }` says otherwise.
 
 The export must be in tail position, which permits conditional exports:
 an `if`/`else` whose branches all end in an `export` is a valid module
@@ -356,9 +364,24 @@ tail. Module code reads the importer's globals (so host functions like
 `print` are available), but its own bindings never leak out; `_` aside,
 whatever is not exported is private. Circular imports are an error.
 
-`import` itself is a host function (the bundled REPL maps
-`import "name"` to loading `name.raft`); embedders wire their own source
-lookup and call `Runtime::load_module(name, source)`.
+Resolving `<name>` tries, in order:
+
+1. an already-loaded or [`register_module`](Runtime::register_module)ed
+   module by that name (repeated imports of the same name are always this
+   cache hit, never a re-execution);
+2. `<name>.raft` in each of `Runtime`'s `module_dirs`, parsed and executed
+   via `Runtime::load_module`;
+3. each of `Runtime`'s `cdylib_dirs`, in order, linking every dylib found
+   there and keeping the first one that exposes a module named `<name>` -
+   every module *that* bundle exposes gets registered, not just the one
+   asked for; bundles that don't expose it are unlinked again.
+
+Both lookup-directory lists default to just the current directory;
+`Runtime::add_module_dir`/`Runtime::add_cdylib_dir` (feature `std`/
+`bundle` respectively) extend them. Embedders that want to serve module
+source some other way can sidestep the search entirely by calling
+`Runtime::register_module`/`Runtime::load_module` directly before the
+Raft code that imports it runs.
 
 ### Embedding host functions
 
@@ -413,8 +436,9 @@ rt.register_function("add2", 2, Some(2), |rt, _args| {
 Stateful or allocation-sensitive callables can implement `Function`
 directly and be wrapped with `raft_core::RcFn::new`.
 
-The bundled REPL (`repl/src/main.rs`) registers `print`, `debugfmt`,
-`quit` and `import` this way.
+The bundled REPL (`repl/src/main.rs`) registers `print`, `debugfmt` and
+`quit` this way (`import` is a language statement, not a host function -
+see [Modules](#modules)).
 
 ### Execution modes: AST walking, bytecode, and transpiled Rust
 

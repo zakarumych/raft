@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 description = "Core Raft object model"
 
+[features]
+std = []
+
 [dependencies]
 raft-ffi = { path = "../ffi" }
 smallvec = { version = "1.0", default-features = false }

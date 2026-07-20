@@ -41,6 +41,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{cell::RefCell, fmt, task::Poll};
+use std::ptr::NonNull;
 use smallvec::SmallVec;
 
 use raft_ast::{
@@ -50,10 +51,10 @@ use raft_ast::{
 use crate::{
     Atom, ConstId, Context, FixedHashMap, Frame, Number, PatId, RcStrName, Runtime, RuntimeError,
     SlotId, SlotTable, StringId, Val, ValEnum, assign_field, assign_index, atom_val, eval_binary,
-    eval_unary, field_of, index_of, is_falsey, literal_value, new_list, new_record,
+    eval_unary, field_of, index_of, literal_value, new_list, new_record,
 };
 use raft_core::{
-    CoroKind, CoroStatus, Coroutine, Function, RcCoro, RcFn, RcStr, ValsIter, ValsIterStep, rc,
+    CoroKind, CoroStatus, Coroutine, Function, Host, RcCoro, RcFn, RcStr, ValsIter, ValsIterStep, 
 };
 
 /// Index into a *defining function's own* `consts`/`templates` arrays
@@ -912,8 +913,11 @@ impl fmt::Debug for Code {
 #[derive(Clone, Debug)]
 pub enum CompiledPat {
     Ignore,
-    /// Bind the whole value to frame slot `slot`.
+    /// Bind the whole value to stack slot `slot`.
     Var(SlotId),
+    /// Bind the whole value to captured slot `slot` of the enclosing call's
+    /// own reified [`CompiledFrame`] (some nested `fn` reads this name).
+    CapVar(SlotId),
     /// Match an atom by name.
     Atom(Atom),
     /// Match a number literal (see [`NumberPat`] for the semantics the
@@ -991,25 +995,34 @@ impl NumberPat {
 /// patterns exist, and an out-of-range number literal compiles to a
 /// pattern that matches nothing (`NumberPat::Never`) - the same non-match
 /// the tree walker produces for it.
-fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledPat {
-    fn slot_of(slots: &SlotTable, name: &str) -> SlotId {
-        slots
-            .get(name)
-            .expect("collect_slots missed a pattern name")
+fn compile_pat(pattern: &Pat, slots: &SlotTable, captured: &[bool], ctx: &mut Context) -> CompiledPat {
+    // resolves a bound name to `Var` (stack slot) or `CapVar` (this
+    // function's own reified frame), matching `compile_bind`'s choice for
+    // plain-identifier assignment targets
+    fn var_of(slots: &SlotTable, captured: &[bool], name: &str) -> CompiledPat {
+        let slot = slots.get(name).expect("collect_slots missed a pattern name");
+        if captured[slot.0 as usize] {
+            CompiledPat::CapVar(slot)
+        } else {
+            CompiledPat::Var(slot)
+        }
     }
 
     match pattern.kind() {
         PatKind::Ident(id) if id.name() == "_" => CompiledPat::Ignore,
-        PatKind::Ident(id) => CompiledPat::Var(slot_of(slots, id.name())),
+        PatKind::Ident(id) => var_of(slots, captured, id.name()),
         PatKind::Atom(a) => CompiledPat::Atom(crate::atom_from_name(ctx, a.name())),
         PatKind::Literal(lit) => match lit {
             Lit::Num(n) => CompiledPat::Number(NumberPat::from_literal(n)),
             Lit::Str(s) => CompiledPat::String(s.unescape().into()),
             Lit::Char(c) => CompiledPat::Char(c.unescape()),
         },
-        PatKind::List(items) => {
-            CompiledPat::List(items.iter().map(|p| compile_pat(p, slots, ctx)).collect())
-        }
+        PatKind::List(items) => CompiledPat::List(
+            items
+                .iter()
+                .map(|p| compile_pat(p, slots, captured, ctx))
+                .collect(),
+        ),
         PatKind::Record(fields) => {
             let fields = fields
                 .iter()
@@ -1017,9 +1030,9 @@ fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledP
                     let key = f.key().rc_str_name();
 
                     let pattern = match f.pattern() {
-                        Some(p) => compile_pat(p, slots, ctx),
+                        Some(p) => compile_pat(p, slots, captured, ctx),
                         // shorthand `{ x }` binds the field to its own name
-                        None => CompiledPat::Var(slot_of(slots, &key)),
+                        None => var_of(slots, captured, &key),
                     };
 
                     if let CompiledPat::Ignore = pattern {
@@ -1036,10 +1049,18 @@ fn compile_pat(pattern: &Pat, slots: &SlotTable, ctx: &mut Context) -> CompiledP
 }
 
 impl CompiledPat {
-    /// Match `val` against this pattern, binding variables into the slots
-    /// of the frame based at `base`. Mirrors `Runtime::bind_pattern` -
-    /// including its failure behavior of leaving earlier bindings in place.
-    pub fn bind(&self, rt: &mut Runtime, base: usize, val: &Val) -> Result<(), RuntimeError> {
+    /// Match `val` against this pattern, binding variables into either the
+    /// stack frame based at `base` (`Var`) or the enclosing call's own
+    /// reified frame (`CapVar`, requires `own`). Mirrors
+    /// `Runtime::bind_pattern` - including its failure behavior of leaving
+    /// earlier bindings in place.
+    pub fn bind(
+        &self,
+        rt: &mut Runtime,
+        base: usize,
+        own: Option<&CompiledFrame>,
+        val: &Val,
+    ) -> Result<(), RuntimeError> {
         fn fail() -> RuntimeError {
             RuntimeError::Other("pattern match failed".into())
         }
@@ -1048,6 +1069,11 @@ impl CompiledPat {
             CompiledPat::Ignore => Ok(()),
             CompiledPat::Var(slot) => {
                 rt.stack().set(base + slot.0 as usize, val.clone());
+                Ok(())
+            }
+            CompiledPat::CapVar(slot) => {
+                own.expect("vm: CapVar bind with no own frame")
+                    .set(*slot, val.clone());
                 Ok(())
             }
             CompiledPat::Atom(a) => match val.unpack() {
@@ -1069,7 +1095,7 @@ impl CompiledPat {
             CompiledPat::List(items) => match val.unpack() {
                 ValEnum::List(list) if list.len() == items.len() => {
                     for (p, v) in items.iter().zip(list.as_slice().iter()) {
-                        p.bind(rt, base, v)?;
+                        p.bind(rt, base, own, v)?;
                     }
                     Ok(())
                 }
@@ -1079,7 +1105,7 @@ impl CompiledPat {
                 ValEnum::Record(record) => {
                     for (key, pattern) in fields.iter() {
                         match record.get_field(key.as_str()) {
-                            Some(v) => pattern.bind(rt, base, &v)?,
+                            Some(v) => pattern.bind(rt, base, own, &v)?,
                             None => return Err(fail()),
                         }
                     }
@@ -1315,7 +1341,7 @@ impl CompiledFn {
     #[inline]
     pub fn into_coro_function(self, kind: CoroKind) -> Val {
         Val::from(ValEnum::Fn(RcFn::new(CompiledCoroFn {
-            f: rc::Rc::new(self),
+            f: Rc::new(self),
             kind,
         })))
     }
@@ -1388,7 +1414,7 @@ impl Function for CompiledFn {
     // Partial application is handled generically now (see `raft-core`'s
     // `call_dispatch`, which every `Function` impl goes through via the
     // `Callable` bridge) - this only ever runs with exactly `arity()` args.
-    fn call(&self, host: &mut rc::Host, args: usize) {
+    fn call(&self, host: &mut Host, args: usize) {
         debug_assert_eq!(args, self.arity());
 
         // SAFETY: as `AstFn::call`'s.
@@ -1501,6 +1527,43 @@ impl FnMode {
     }
 }
 
+/// Backing callee for a compiled `import` statement (see `compile_stmt`'s
+/// `StmtKind::Import` arm): a plain one-argument `Function` wrapping
+/// `Runtime::import`, invoked through the ordinary `Instr::Call` just like
+/// any other function value. This is what lets `import` compile at all -
+/// no new opcode, no compile-time side effects, just a call the compiler
+/// already knows how to emit; `Runtime::import`'s real work (filesystem
+/// search, cdylib linking) happens when that call actually runs, exactly
+/// once per statement execution, same as the AST walker.
+struct ImportFn;
+
+impl Function for ImportFn {
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn call(&self, host: &mut Host, args: usize) {
+        debug_assert_eq!(args, 1);
+        // SAFETY: as `AstFn::call`'s (runtime/src/lib.rs).
+        let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
+        let name_val = rt.stack().pop();
+        let ValEnum::String(name) = name_val.unpack() else {
+            rt.set_error(RuntimeError::TypeError(
+                "import expects a module name string".into(),
+            ));
+            return;
+        };
+        match rt.import(name.as_str()) {
+            Ok(module) => rt.stack().push(module),
+            Err(e) => rt.set_error(e),
+        }
+    }
+}
+
 pub fn compile_fn(
     rt: &mut Runtime,
     params: Rc<[Pat]>,
@@ -1579,22 +1642,6 @@ fn compile_fn_impl(
     }
     let owns_frame = captured.iter().any(|&c| c);
 
-    if owns_frame && body_has_destructuring(&params, body) {
-        // a captured local bound through list/record destructuring would
-        // need `Instr::Bind` to write a frame slot instead of a stack
-        // slot, which isn't supported yet - fall back to the AST walker
-        // for the whole function rather than risk it landing on the stack
-        let span = params
-            .first()
-            .map(|p| p.span())
-            .or_else(|| body.first().map(|s| s.span()))
-            .unwrap_or(Span::point(0));
-        return Err(CompileError::new(
-            span,
-            "captured locals bound through destructuring aren't supported yet",
-        ));
-    }
-
     // this function's own name schema - used both to compile nested `fn`
     // statements (so a grandchild resolves through *this* function's own
     // scope, not straight past it) and as this function's own by-name
@@ -1657,7 +1704,7 @@ fn compile_fn_impl(
             }
             _ => {
                 c.emit(Instr::LoadSlot(arg_slot));
-                let pattern = compile_pat(p, &c.slots, &mut c.rt.ctx);
+                let pattern = compile_pat(p, &c.slots, &c.captured, &mut c.rt.ctx);
                 let pattern = c.rt.ctx.pattern(pattern);
                 c.emit(Instr::Bind(pattern));
             }
@@ -1727,45 +1774,6 @@ struct LoopCtx {
     /// out of it must then push the loop's value (nil) for the function
     /// result.
     tail: bool,
-}
-
-/// Whether `params`/`body` bind any name through a destructuring pattern
-/// (list/record pattern, or a non-plain-ident `for` target) rather than a
-/// plain identifier. Doesn't recurse into nested `fn` bodies - their own
-/// destructuring is their own concern. Captured *destructured* names aren't
-/// supported yet (`Instr::Bind` always writes to a stack slot); a function
-/// that both owns a captured-frame and destructures anywhere falls back to
-/// the AST walker rather than risk a captured local silently living on the
-/// stack.
-fn body_has_destructuring(params: &[Pat], body: &[Stmt]) -> bool {
-    fn is_destructuring(p: &Pat) -> bool {
-        !matches!(p.kind(), PatKind::Ident(_))
-    }
-    fn stmts_have(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s.kind() {
-            StmtKind::AssignPat { target, .. } => is_destructuring(target),
-            StmtKind::For {
-                target,
-                body,
-                else_branch,
-                ..
-            } => {
-                is_destructuring(target)
-                    || stmts_have(body)
-                    || else_branch.as_deref().is_some_and(stmts_have)
-            }
-            StmtKind::If {
-                then_branch,
-                else_branch,
-                ..
-            } => stmts_have(then_branch) || else_branch.as_deref().is_some_and(stmts_have),
-            StmtKind::While {
-                body, else_branch, ..
-            } => stmts_have(body) || else_branch.as_deref().is_some_and(stmts_have),
-            _ => false,
-        })
-    }
-    params.iter().any(is_destructuring) || stmts_have(body)
 }
 
 /// Whether `name_id` resolves anywhere in `schema`'s compile-time-known
@@ -1952,7 +1960,7 @@ impl Compiler<'_> {
                 });
             }
             _ => {
-                let p = compile_pat(target, &self.slots, &mut self.rt.ctx);
+                let p = compile_pat(target, &self.slots, &self.captured, &mut self.rt.ctx);
                 let i = self.rt.ctx.pattern(p);
                 self.emit(Instr::Bind(i));
             }
@@ -2429,6 +2437,23 @@ impl Compiler<'_> {
                     self.emit(Instr::Nil); // definitions yield nil
                 }
             }
+            // `import` compiles to a call to the `ImportFn` builtin (see
+            // its doc comment) - an ordinary `Const` callee + `Const` arg +
+            // `Call`, exactly as `Expr::Apply` would compile `import_
+            // "geometry"` if that were surface syntax. `Runtime::import`'s
+            // actual work (filesystem search, cdylib linking) stays a
+            // *runtime* side effect of executing that call, same as it
+            // always was for the AST walker - compiling this statement
+            // itself does nothing but emit instructions.
+            StmtKind::Import { module, binding } => {
+                self.emit_const_value(Val::from(ValEnum::Fn(RcFn::new(ImportFn))));
+                self.emit_const_value(Val::string(module.name()));
+                self.emit(Instr::Call(1));
+                self.compile_bind(binding);
+                if tail {
+                    self.emit(Instr::Nil); // imports yield nil, like assignments
+                }
+            }
         }
         Ok(())
     }
@@ -2716,7 +2741,7 @@ pub fn run_recursive(rt: &mut Runtime, code: &[u8], f: &CompiledFn) -> Result<()
 /// handled by the generic dispatch before `call`, exactly as for
 /// [`CompiledFn`].
 struct CompiledCoroFn {
-    f: rc::Rc<CompiledFn>,
+    f: Rc<CompiledFn>,
     kind: CoroKind,
 }
 
@@ -2731,7 +2756,7 @@ impl Function for CompiledCoroFn {
         Some(self.f.arity())
     }
 
-    fn call(&self, host: &mut rc::Host, args: usize) {
+    fn call(&self, host: &mut Host, args: usize) {
         debug_assert_eq!(args, self.f.arity());
 
         // SAFETY: as `AstFn::call`'s.
@@ -2803,7 +2828,7 @@ enum VmGenState {
 /// peels the frame back off into the state for the next resume. The kind
 /// decides how frame exits map onto the [`CoroStatus`] protocol.
 struct VmCoroutine {
-    f: rc::Rc<CompiledFn>,
+    f: Rc<CompiledFn>,
     own: Option<Rc<CompiledFrame>>,
     kind: CoroKind,
     state: RefCell<VmGenState>,
@@ -2895,7 +2920,7 @@ impl VmCoroutine {
 }
 
 impl Coroutine for VmCoroutine {
-    fn resume(&self, host: &mut rc::Host, args: usize) -> CoroStatus {
+    fn resume(&self, host: &mut Host, args: usize) -> CoroStatus {
         // SAFETY: as `AstFn::call`'s.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
 
@@ -3132,7 +3157,7 @@ fn run_frame(
                         RuntimeError::Other("vm: pattern index out of range".into())
                     })?
                     .clone();
-                pattern.bind(rt, base, &v)?;
+                pattern.bind(rt, base, own.map(Rc::as_ref), &v)?;
             }
             opcode::MAKE_LIST..opcode::MAKE_LIST_END => {
                 let n = decode_operand(op - opcode::MAKE_LIST, code, &mut pc)?;
@@ -3401,14 +3426,9 @@ fn run_frame(
                 }
 
                 let fval = rt.stack().peek().clone();
-                // `f`'s own box address, matching what `RcFn::as_ptr()`
-                // returns for the `Rc<CompiledFn>` that was wrapped into
-                // this same value's `RcFn` at `into_function` time.
-                let f_box_ptr = (f as *const CompiledFn as *const u8).wrapping_sub(
-                    core::mem::offset_of!(raft_core::ffi::RcInner<CompiledFn>, value),
-                ) as *const ();
+
                 match fval.unpack() {
-                    ValEnum::Fn(fval) if fval.as_ptr() == f_box_ptr && f.arity == n => {
+                    ValEnum::Fn(fval) if (fval.as_ptr() == NonNull::from_ref(f).cast()) && f.arity == n => {
                         // Calls self: discard the callee we just peeked (we
                         // already know what it is) so the stack holds only
                         // the arguments run_recursive's floor expects.
@@ -3426,7 +3446,7 @@ fn run_frame(
             opcode::JUMP_IF_FALSE => {
                 let t = read_u32(code, &mut pc)?;
                 let c = rt.stack().pop();
-                if is_falsey(&c) {
+                if c.is_falsey() {
                     pc = t as usize;
                 }
             }
@@ -3929,6 +3949,68 @@ export { f }
     }
 
     #[test]
+    fn import_compiles_to_a_call() {
+        // `import` must not reject compilation (see `compile_stmt`'s
+        // `StmtKind::Import` arm) - it lowers to `Const(ImportFn) Const(name)
+        // Call(1)`, same shape as any other one-argument function call.
+        let src = "fn f:\n    import geometry\n    return geometry\n";
+        let stmts = ast_from_str(src);
+        let StmtKind::Fn { params, body, .. } = stmts[0].kind() else {
+            panic!("expected fn statement");
+        };
+        let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
+        let (compiled, _) = compile_fn(
+            &mut rt,
+            params.clone(),
+            body,
+            CompileParent::Walked(frame),
+            &[],
+        )
+        .expect("import should compile, not reject");
+        let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
+        assert!(
+            instrs.iter().any(|i| matches!(i, Instr::Call(1))),
+            "expected a Call(1) for the import builtin, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn import_record_pattern_compiles_when_capturing() {
+        // a function that both owns a captured frame (a nested `fn` reads
+        // one of its locals) and destructures an import via `as { .. }`
+        // must still compile - `Instr::Bind` targets `sq`'s captured slot
+        // (`CompiledPat::CapVar`) instead of a stack slot.
+        let src = "\
+fn f:
+    import geometry as { sq }
+    fn g:
+        return sq
+    return (g)
+";
+        let stmts = ast_from_str(src);
+        let StmtKind::Fn { params, body, .. } = stmts[0].kind() else {
+            panic!("expected fn statement");
+        };
+        let mut rt = Runtime::new();
+        let frame = Rc::new(Frame::new());
+        let (compiled, _) = compile_fn(
+            &mut rt,
+            params.clone(),
+            body,
+            CompileParent::Walked(frame),
+            &[],
+        )
+        .expect("captured destructuring import should compile, not reject");
+        assert!(compiled.owns_frame);
+        let instrs: Vec<Instr> = compiled.code.disassemble().map(|r| r.unwrap().1).collect();
+        assert!(
+            instrs.iter().any(|i| matches!(i, Instr::Bind(_))),
+            "expected a Bind for the record pattern, got {instrs:?}"
+        );
+    }
+
+    #[test]
     fn bytecode_roundtrips_through_the_encoder() {
         // every instruction kind, with operands spanning varint widths
         let instrs = vec![
@@ -4200,6 +4282,53 @@ export { f }
              f = make_adder 10\nr = f 5\n",
         );
         assert_eq!(int_var(&mut rt, &frame, "r"), 15);
+    }
+
+    #[test]
+    fn captured_local_bound_through_param_destructuring() {
+        // `a`/`b` are bound by unpacking the list parameter in the
+        // prologue (see `compile_fn_impl`'s param-binding loop) - a nested
+        // `fn` reading either forces `CompiledPat::Var` to become
+        // `CompiledPat::CapVar` so `Instr::Bind` writes the own-frame slot
+        // instead of the stack
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make [a, b]:\n    fn get:\n        return a + b\n    return get\n\
+             pair = [3, 4]\nf = make pair\nr = (f)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 7);
+    }
+
+    #[test]
+    fn captured_local_bound_through_list_destructuring() {
+        // same as above but via an `AssignPat` in the body rather than a
+        // parameter (`compile_bind`'s destructuring arm)
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make_pair pair:\n    [a, b] = pair\n    fn get:\n        return a + b\n    return get\n\
+             xs = [10, 20]\nf = make_pair xs\nr = (f)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 30);
+    }
+
+    #[test]
+    fn captured_local_bound_through_record_destructuring() {
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make_thing rec:\n    { x, y } = rec\n    fn get:\n        return x + y\n    return get\n\
+             f = make_thing { x: 1, y: 2 }\nr = (f)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 3);
+    }
+
+    #[test]
+    fn captured_local_bound_through_for_target_destructuring() {
+        // the `for` loop target itself is bound through the same
+        // `compile_bind` path as an `AssignPat`; `a`/`b` are captured by
+        // the nested `fn`, so it must see the last iteration's values
+        // through the own-frame slot, not a stale stack copy
+        let (mut rt, frame) = assert_modes_agree(
+            "fn make pairs:\n    for [a, b] in pairs:\n        total = a + b\n    fn get:\n        return a + b\n    return get\n\
+             xs = [[1, 2], [10, 20]]\nf = make xs\nr = (f)\n",
+        );
+        assert_eq!(int_var(&mut rt, &frame, "r"), 30);
     }
 
     #[test]

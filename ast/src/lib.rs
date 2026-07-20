@@ -400,6 +400,16 @@ pub enum StmtKind {
         params: Rc<[Pat]>,
         body: Rc<[Stmt]>,
     },
+    /// `import modulename` / `import modulename as aliasname` / `import
+    /// modulename as { pattern }`. `module` names the module to resolve
+    /// (cache, then `.raft` lookup dirs, then cdylib lookup dirs);
+    /// `binding` is where the resulting module value lands - a bare
+    /// `Ident` (defaulting to `module`'s own name when there's no `as`) or
+    /// a record pattern destructuring it.
+    Import {
+        module: Ident,
+        binding: Pat,
+    },
 }
 
 // Statements and blocks

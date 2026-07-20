@@ -29,7 +29,7 @@ use core::{
 use futures_util::task::AtomicWaker;
 
 use raft_core::{
-    CoroKind, CoroStatus, Coroutine, RcCoro, RuntimeError, Val, ValEnum, ffi, rc::FfiWaker,
+    CoroKind, CoroStatus, Coroutine, RcCoro, RuntimeError, Val, ValEnum, ffi, FfiWaker,
 };
 
 use crate::Runtime;
@@ -206,9 +206,7 @@ impl Runtime {
                         }
                         Ok(Poll::Pending) => {}
                         Err(e) => {
-                            if id != target {
-                                rt.tasks.remove(&target);
-                            }
+                            rt.tasks.remove(&id);
                             return Poll::Ready(Err(e));
                         }
                     }
@@ -239,7 +237,7 @@ impl<F> Coroutine for FutureAsync<F>
 where
     F: Future<Output = Result<Val, RuntimeError>> + 'static,
 {
-    fn resume(&self, host: &mut raft_core::rc::Host, args: usize) -> CoroStatus {
+    fn resume(&self, host: &mut raft_core::Host, args: usize) -> CoroStatus {
         debug_assert_eq!(args, 0, "async coroutines take no resume arguments");
         let Some(mut fut) = self.fut.borrow_mut().take() else {
             // resumed after the resolution was delivered (or after a failure):

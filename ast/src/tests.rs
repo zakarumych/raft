@@ -1087,3 +1087,81 @@ fn stmt_await_positions() {
     // `await` is reserved in statement position
     assert!(tokens_from_str("await = 1").parse_stmt().is_err());
 }
+
+#[test]
+fn stmt_import_bare() {
+    let statement = tokens_from_str("import geometry").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::Import { module, binding } => {
+            assert_eq!(module.name(), "geometry");
+            // no `as` - the binding defaults to an ident matching the
+            // module name
+            assert!(matches!(binding.kind(), PatKind::Ident(i) if i.name() == "geometry"));
+        }
+        _ => panic!("expected import statement"),
+    }
+}
+
+#[test]
+fn stmt_import_as_alias() {
+    let statement = tokens_from_str("import geometry as geo").parse_stmt().unwrap();
+    match statement.kind() {
+        StmtKind::Import { module, binding } => {
+            assert_eq!(module.name(), "geometry");
+            assert!(matches!(binding.kind(), PatKind::Ident(i) if i.name() == "geo"));
+        }
+        _ => panic!("expected import statement"),
+    }
+}
+
+#[test]
+fn stmt_import_as_record_pattern() {
+    let statement = tokens_from_str("import geometry as { sq, area }")
+        .parse_stmt()
+        .unwrap();
+    match statement.kind() {
+        StmtKind::Import { module, binding } => {
+            assert_eq!(module.name(), "geometry");
+            let PatKind::Record(fields) = binding.kind() else {
+                panic!("expected record pattern");
+            };
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].key().name(), "sq");
+            assert_eq!(fields[1].key().name(), "area");
+        }
+        _ => panic!("expected import statement"),
+    }
+}
+
+#[test]
+fn stmt_import_inline_after_colon() {
+    // `import` fits on an `if`/`while`/... one-line branch, same as
+    // `return`/`break`/`continue`
+    let statement = tokens_from_str("if flag: import geometry")
+        .parse_stmt()
+        .unwrap();
+    match statement.kind() {
+        StmtKind::If { then_branch, .. } => {
+            assert_eq!(then_branch.len(), 1);
+            assert!(matches!(then_branch[0].kind(), StmtKind::Import { .. }));
+        }
+        _ => panic!("expected if statement"),
+    }
+}
+
+#[test]
+fn stmt_import_as_rejects_non_ident_non_record_patterns() {
+    // a list pattern isn't a meaningful import target - only a plain
+    // alias or a record destructure are
+    assert!(tokens_from_str("import geometry as [a, b]")
+        .parse_stmt()
+        .is_err());
+    assert!(tokens_from_str("import geometry as 1").parse_stmt().is_err());
+}
+
+#[test]
+fn stmt_import_requires_bare_module_ident() {
+    // the old string-literal `import "name"` expression form is gone -
+    // `import` is a keyword expecting a bare module identifier
+    assert!(tokens_from_str("import \"geometry\"").parse_stmt().is_err());
+}

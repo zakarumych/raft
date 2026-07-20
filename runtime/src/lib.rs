@@ -3,13 +3,15 @@
 extern crate alloc;
 
 use alloc::{rc::Rc, vec::Vec};
-use raft_core::rc::Stack;
+use raft_core::{Atom, AtomId, ffi};
 
 use core::{cell::RefCell, cmp::Ordering, fmt, mem::ManuallyDrop, task::Poll};
 
 use smallvec::SmallVec;
 
-use raft_ast::{BinOpKind, Expr, ExprKind, FnCat, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind};
+use raft_ast::{
+    BinOpKind, Expr, ExprKind, FnCat, Lit, LitNum, Pat, PatKind, Stmt, StmtKind, UnOpKind,
+};
 
 use crate::{tasks::ReadyQueue, vm::CompiledPat};
 
@@ -30,7 +32,10 @@ pub use bundle::BundleBuilder;
 // `raft-core` now, so it can be shared unmodified by other execution modes.
 // Re-exported wholesale so existing call sites (`raft_runtime::Val`, etc.)
 // don't need to change.
-pub use raft_core::*;
+pub use raft_core::{
+    CoroKind, CoroStatus, Coroutine, FfiWaker, Function, Host, RcCoro, RcFn, RcList, RcRecord,
+    RcStr, RuntimeError, Stack, Val, ValEnum, ValsIter, ValsIterStep, Number       
+};
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 
@@ -102,7 +107,7 @@ impl Function for AstFn {
         Some(self.params.len())
     }
 
-    fn call(&self, host: &mut raft_core::rc::Host, args: usize) {
+    fn call(&self, host: &mut raft_core::Host, args: usize) {
         // SAFETY: every `Host` reaching a `Function::call` implemented in
         // this crate was built by casting a `&mut Runtime` to
         // `*mut ffi::RawHost` - `Runtime` is `#[repr(C)]` with
@@ -185,7 +190,7 @@ impl Function for AstCoroFn {
         Some(self.params.len())
     }
 
-    fn call(&self, host: &mut raft_core::rc::Host, args: usize) {
+    fn call(&self, host: &mut raft_core::Host, args: usize) {
         // SAFETY: as `AstFn::call`'s.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
 
@@ -335,7 +340,7 @@ struct AstCoroutine {
 }
 
 impl Coroutine for AstCoroutine {
-    fn resume(&self, host: &mut raft_core::rc::Host, args: usize) -> CoroStatus {
+    fn resume(&self, host: &mut raft_core::Host, args: usize) -> CoroStatus {
         // SAFETY: as `AstFn::call`'s.
         let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
 
@@ -418,12 +423,16 @@ fn machine_step(
                 Some(GenFrame::While { stmts, idx }) => {
                     let (stmts, at) = (stmts.clone(), *idx);
                     let StmtKind::While {
-                        cond, body, else_branch, ..
-                    } = stmts[at].kind() else {
+                        cond,
+                        body,
+                        else_branch,
+                        ..
+                    } = stmts[at].kind()
+                    else {
                         unreachable!("GenFrame::While must point at a while statement")
                     };
                     let cv = rt.eval(cond, frame)?;
-                    if is_falsey(&cv) {
+                    if cv.is_falsey() {
                         frames.pop();
                         if let Some(eb) = else_branch {
                             frames.push(GenFrame::Block {
@@ -455,8 +464,7 @@ fn machine_step(
                         ValsIterStep::Pending => {
                             if !awaits {
                                 return Err(RuntimeError::TypeError(
-                                    "async generator delegation requires `async yield from`"
-                                        .into(),
+                                    "async generator delegation requires `async yield from`".into(),
                                 ));
                             }
                             return Ok(MachineStep::Pending);
@@ -485,8 +493,13 @@ fn machine_step(
                 Some(GenFrame::For { stmts, idx, iter }) => {
                     let (stmts, at) = (stmts.clone(), *idx);
                     let StmtKind::For {
-                        target, body, else_branch, awaits, ..
-                    } = stmts[at].kind() else {
+                        target,
+                        body,
+                        else_branch,
+                        awaits,
+                        ..
+                    } = stmts[at].kind()
+                    else {
                         unreachable!("GenFrame::For must point at a for statement")
                     };
                     match iter.step(&mut rt.as_host())? {
@@ -570,9 +583,7 @@ fn machine_step(
                         future,
                     });
                 }
-                StmtKind::AssignPat { value, .. }
-                    if matches!(value.kind(), ExprKind::Await(_)) =>
-                {
+                StmtKind::AssignPat { value, .. } if matches!(value.kind(), ExprKind::Await(_)) => {
                     let ExprKind::Await(inner) = value.kind() else {
                         unreachable!()
                     };
@@ -628,7 +639,7 @@ fn machine_step(
                     else_branch,
                 } => {
                     let cv = rt.eval_impl(cond, frame, true)?;
-                    if !is_falsey(&cv) {
+                    if !cv.is_falsey() {
                         frames.push(GenFrame::Block {
                             stmts: then_branch.clone(),
                             idx: 0,
@@ -641,9 +652,14 @@ fn machine_step(
                     }
                 }
                 StmtKind::While { .. } => {
-                    frames.push(GenFrame::While { stmts: stmts.clone(), idx });
+                    frames.push(GenFrame::While {
+                        stmts: stmts.clone(),
+                        idx,
+                    });
                 }
-                StmtKind::For { iterable, awaits, .. } => {
+                StmtKind::For {
+                    iterable, awaits, ..
+                } => {
                     if *awaits && kind == CoroKind::Gen {
                         return Err(RuntimeError::Other(
                             "async for outside of async function".into(),
@@ -857,16 +873,16 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<RcStr>) {
                 }
             }
         }
-        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::YieldFrom { expr: e, .. } => {
-            collect_reads_expr(e, out)
-        }
-        StmtKind::Return(None)
-        | StmtKind::Yield(None)
-        | StmtKind::Break
-        | StmtKind::Continue => {}
+        StmtKind::Return(Some(e))
+        | StmtKind::Yield(Some(e))
+        | StmtKind::YieldFrom { expr: e, .. } => collect_reads_expr(e, out),
+        StmtKind::Return(None) | StmtKind::Yield(None) | StmtKind::Break | StmtKind::Continue => {}
         StmtKind::Fn { params, body, .. } => {
             out.extend(fn_outer_names(params, body));
         }
+        // `module` names the module to look up, not a scope read; `binding`
+        // is a bind target, not a read.
+        StmtKind::Import { .. } => {}
     }
 }
 
@@ -993,6 +1009,7 @@ impl SlotTable {
             StmtKind::Fn { name, .. } => {
                 self.add_name(name.rc_str_name());
             }
+            StmtKind::Import { binding, .. } => self.add_pat(binding),
             StmtKind::Expr(_)
             | StmtKind::AssignField { .. }
             | StmtKind::AssignIndex { .. }
@@ -1322,6 +1339,20 @@ pub struct Runtime {
     /// Contexts of modules currently loading, innermost last (cycle detection).
     loading: Vec<StringId>,
 
+    /// Directories [`Runtime::import`] searches for `<name>.raft` when
+    /// `name` isn't already cached/registered. Defaults to just the
+    /// current directory (see [`Runtime::new`]); grow it with
+    /// [`Runtime::add_module_dir`].
+    #[cfg(feature = "std")]
+    module_dirs: Vec<std::path::PathBuf>,
+
+    /// Directories [`Runtime::import`] scans for a cdylib bundle exposing
+    /// a still-unresolved module name, after `module_dirs` comes up empty.
+    /// Defaults to just the current directory; grow it with
+    /// [`Runtime::add_cdylib_dir`].
+    #[cfg(feature = "bundle")]
+    cdylib_dirs: Vec<std::path::PathBuf>,
+
     /// Error status.
     status: Result<(), RuntimeError>,
 
@@ -1397,6 +1428,10 @@ impl Runtime {
             global: HashMap::default(),
             modules: HashMap::default(),
             loading: Vec::new(),
+            #[cfg(feature = "std")]
+            module_dirs: std::env::current_dir().into_iter().collect(),
+            #[cfg(feature = "bundle")]
+            cdylib_dirs: std::env::current_dir().into_iter().collect(),
             status: Ok(()),
             compile_fns: false,
             ready: ReadyQueue::new(),
@@ -1429,8 +1464,8 @@ impl Runtime {
     /// comment) - this is the cast `AstFn`/`vm::CompiledFn`'s
     /// `Function::call` reverses via `Host::as_raw`.
     #[inline]
-    pub fn as_host(&mut self) -> raft_core::rc::Host<'_> {
-        unsafe { raft_core::rc::Host::from_raw(self as *mut Runtime as *mut ffi::RawHost) }
+    pub fn as_host(&mut self) -> raft_core::Host<'_> {
+        unsafe { raft_core::Host::from_raw(self as *mut Runtime as *mut ffi::RawHost) }
     }
 
     /// Choose how `fn` statements executed from here on are realized:
@@ -1453,6 +1488,11 @@ impl Runtime {
     }
 
     #[inline]
+    pub fn clear_error(&mut self) {
+        self.status = Ok(());
+    }
+
+    #[inline]
     pub fn try_<T>(&mut self, f: impl FnOnce() -> Result<T, RuntimeError>) -> Option<T> {
         if self.status.is_err() {
             return None;
@@ -1468,7 +1508,10 @@ impl Runtime {
     }
 
     #[inline]
-    pub fn try_with<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, RuntimeError>) -> Option<T> {
+    pub fn try_with<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, RuntimeError>,
+    ) -> Option<T> {
         if self.status.is_err() {
             return None;
         }
@@ -1520,7 +1563,7 @@ impl Runtime {
     ) where
         F: Fn(&mut Runtime, usize) -> Val + 'static,
     {
-        let wrapped = move |host: &mut raft_core::rc::Host, args: usize| -> Val {
+        let wrapped = move |host: &mut raft_core::Host, args: usize| -> Val {
             // SAFETY: as `AstFn::call`'s.
             let rt: &mut Runtime = unsafe { &mut *(host.as_raw() as *mut Runtime) };
             f(rt, args)
@@ -1539,7 +1582,10 @@ impl Runtime {
     /// Get variable: check local first, then global.
     pub fn get_var(&mut self, name: impl IntoStringId) -> Val {
         let name = name.into_id(&mut self.ctx);
-        self.global.get(&name).cloned().unwrap_or_else(|| Val::from(ValEnum::Uninit))
+        self.global
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| Val::from(ValEnum::Uninit))
     }
 
     pub fn eval(&mut self, expr: &Expr, frame: &Frame) -> Result<Val, RuntimeError> {
@@ -1562,9 +1608,7 @@ impl Runtime {
                 // then from the global scope if uninitialized.
                 let val = frame
                     .get_var(name, self)
-                    .init_or_else(|| {
-                        RuntimeError::UnboundIdentifier(i.rc_str_name())
-                    })?;
+                    .init_or_else(|| RuntimeError::UnboundIdentifier(i.rc_str_name()))?;
 
                 if call_fn {
                     self.call_ast(val, 0)
@@ -1587,9 +1631,7 @@ impl Runtime {
                     let val = match f.value() {
                         None => frame
                             .get_var(key.clone(), self)
-                            .init_or_else(|| {
-                                RuntimeError::UnboundIdentifier(key.clone())
-                            })?,
+                            .init_or_else(|| RuntimeError::UnboundIdentifier(key.clone()))?,
                         Some(value) => self.eval(value, frame)?,
                     };
 
@@ -1767,6 +1809,11 @@ impl Runtime {
                 self.bind_pattern(target, &val, &frame)?;
                 Ok(Exec::Value(Val::nil()))
             }
+            StmtKind::Import { module, binding } => {
+                let val = self.import(module.name())?;
+                self.bind_pattern(binding, &val, &frame)?;
+                Ok(Exec::Value(Val::nil()))
+            }
             StmtKind::AssignField {
                 target,
                 field,
@@ -1794,7 +1841,7 @@ impl Runtime {
                 else_branch,
             } => {
                 let cv = self.eval_impl(cond, &frame, true)?;
-                if !is_falsey(&cv) {
+                if !cv.is_falsey() {
                     self.exec_block(then_branch, frame.clone())
                 } else {
                     if let Some(eb) = else_branch {
@@ -1810,7 +1857,7 @@ impl Runtime {
                 else_branch,
             } => loop {
                 let cv = self.eval_impl(cond, &frame, true)?;
-                if is_falsey(&cv) {
+                if cv.is_falsey() {
                     if let Some(eb) = else_branch {
                         break self.exec_block(eb, frame.clone());
                     }
@@ -1941,9 +1988,11 @@ impl Runtime {
                                 vm::CompileParent::Walked(frame.clone()),
                             ) {
                                 Ok(compiled) => compiled,
-                                Err(_) => {
-                                    async_gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
-                                }
+                                Err(_) => async_gen_fn_from_ast(
+                                    params.clone(),
+                                    body.clone(),
+                                    frame.clone(),
+                                ),
                             }
                         } else {
                             async_gen_fn_from_ast(params.clone(), body.clone(), frame.clone())
@@ -1968,7 +2017,11 @@ impl Runtime {
     /// async fn body, a bare `return` resolves the statement to that value
     /// (there's no separate `Exec::Return` out of this machine); `break`/
     /// `continue` outside a loop still surface as errors.
-    pub async fn exec_async(&mut self, stmt: &Stmt, frame: Rc<Frame>) -> Result<Exec, RuntimeError> {
+    pub async fn exec_async(
+        &mut self,
+        stmt: &Stmt,
+        frame: Rc<Frame>,
+    ) -> Result<Exec, RuntimeError> {
         let body: Rc<[Stmt]> = Rc::from([stmt.clone()]);
         let coro = AstCoroutine {
             kind: CoroKind::Async,
@@ -1992,6 +2045,64 @@ impl Runtime {
     pub fn module(&mut self, name: impl IntoStringId) -> Option<Val> {
         let id = name.into_id(&mut self.ctx);
         self.modules.get(&id).cloned()
+    }
+
+    /// Add a directory [`Runtime::import`] searches for `<name>.raft`
+    /// files. Searched in the order added, after the current directory
+    /// (present by default - see [`Runtime::new`]).
+    #[cfg(feature = "std")]
+    pub fn add_module_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.module_dirs.push(dir.into());
+    }
+
+    /// Add a directory [`Runtime::import`] scans for cdylib bundles.
+    /// Searched in the order added, after the current directory (present
+    /// by default - see [`Runtime::new`]).
+    #[cfg(feature = "bundle")]
+    pub fn add_cdylib_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.cdylib_dirs.push(dir.into());
+    }
+
+    /// Resolve `name` the way an `import` statement does: the cached or
+    /// [registered](Runtime::register_module) module if there is one,
+    /// else the first `<name>.raft` found in `module_dirs` (feature
+    /// `std`), parsed and executed via [`Runtime::load_module`], else the
+    /// first `cdylib_dirs` bundle found exposing a module by this name
+    /// (feature `bundle`) - every module such a bundle exposes gets
+    /// registered, not just this one; candidates it doesn't expose are
+    /// unlinked again. Errors if nothing resolves it.
+    pub fn import(&mut self, name: &str) -> Result<Val, RuntimeError> {
+        let id = self.ctx.string(name);
+        if let Some(module) = self.modules.get(&id) {
+            return Ok(module.clone());
+        }
+
+        #[cfg(feature = "std")]
+        if let Some(source) = self.find_module_file(name) {
+            return self.load_module(name, &source);
+        }
+
+        #[cfg(feature = "bundle")]
+        if let Some(module) = self.find_cdylib_module(name)? {
+            return Ok(module);
+        }
+
+        Err(RuntimeError::Other(
+            format!("module '{name}' not found").into(),
+        ))
+    }
+
+    /// Search `module_dirs` in order for `<name>.raft`, returning the
+    /// first one's contents.
+    #[cfg(feature = "std")]
+    fn find_module_file(&self, name: &str) -> Option<String> {
+        for dir in &self.module_dirs {
+            let path = dir.join(format!("{name}.raft"));
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                return Some(source);
+            }
+        }
+        None
     }
 
     /// Parse, execute and cache a module. `source` is a block of Raft code
@@ -2316,9 +2427,7 @@ fn assign_index(objv: Val, idxv: Val, val: Val) -> Result<(), RuntimeError> {
             list.set(ui, val);
             Ok(())
         }
-        (ValEnum::Record(_), _) => {
-            Err(RuntimeError::IndexError("indexing non-list object".into()))
-        }
+        (ValEnum::Record(_), _) => Err(RuntimeError::IndexError("indexing non-list object".into())),
         _ => Err(RuntimeError::TypeError(
             "index must be integer and target must be object".into(),
         )),
@@ -2419,26 +2528,26 @@ unsafe extern "C" fn ffi_intern_atom(host: *mut ffi::RawHost, ptr: *const u8, le
 
 unsafe extern "C" fn ffi_getvar(host: *mut ffi::RawHost, id: usize) -> ffi::RawVal {
     let rt = unsafe { ffi_runtime(host) };
-    rt.get_var(StringId(id as u32)).into_ffi()
+    rt.get_var(StringId(id as u32)).into_raw()
 }
 
 unsafe extern "C" fn ffi_setvar(host: *mut ffi::RawHost, id: usize, val: ffi::RawVal) {
     let rt = unsafe { ffi_runtime(host) };
-    let val = unsafe { Val::from_ffi(val) };
+    let val = unsafe { Val::from_raw(val) };
     rt.set_var(StringId(id as u32), val);
 }
 
 unsafe extern "C" fn ffi_set_error(host: *mut ffi::RawHost, msg: ffi::RawVal) {
     let rt = unsafe { ffi_runtime(host) };
-    let msg = unsafe { Val::from_ffi(msg) };
+    let msg = unsafe { Val::from_raw(msg) };
     rt.set_error(RuntimeError::Other(alloc::format!("{msg}").into()));
 }
 
 unsafe extern "C" fn ffi_take_error(host: *mut ffi::RawHost) -> ffi::RawVal {
     let rt = unsafe { ffi_runtime(host) };
     match rt.take_error() {
-        Some(e) => Val::string(&alloc::format!("{e}")).into_ffi(),
-        None => Val::new_uninit().into_ffi(),
+        Some(e) => Val::string(&alloc::format!("{e}")).into_raw(),
+        None => Val::new_uninit().into_raw(),
     }
 }
 
@@ -2710,5 +2819,167 @@ mod tests {
         let _ = rt.exec_block(module.stmts(), frame.clone()).unwrap();
         // break inside loop should prevent else from running
         assert!(!frame.get_var("finished", &mut rt).is_init());
+    }
+
+    #[test]
+    fn import_binds_registered_module_under_its_own_name() {
+        let mut rt = Runtime::new();
+        let mut fields = FixedHashMap::default();
+        fields.insert(
+            RcStr::new("pi"),
+            Val::from(ValEnum::Number(Number::Integer(3))),
+        );
+        rt.register_module("geometry", Val::record(fields));
+
+        let block = ast_from_str("import geometry");
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        match frame.get_var("geometry", &mut rt).unpack() {
+            ValEnum::Record(record) => match record.get_field("pi").unwrap().unpack() {
+                ValEnum::Number(Number::Integer(i)) => assert_eq!(i, 3),
+                _ => panic!("expected integer pi"),
+            },
+            _ => panic!("expected geometry to bind the module record"),
+        }
+    }
+
+    #[test]
+    fn import_as_alias_binds_alias_not_module_name() {
+        let mut rt = Runtime::new();
+        rt.register_module("geometry", Val::record(FixedHashMap::default()));
+
+        let block = ast_from_str("import geometry as geo");
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        assert!(frame.get_var("geo", &mut rt).is_init());
+        assert!(!frame.get_var("geometry", &mut rt).is_init());
+    }
+
+    #[test]
+    fn import_as_record_pattern_destructures_module() {
+        let mut rt = Runtime::new();
+        let mut fields = FixedHashMap::default();
+        fields.insert(
+            RcStr::new("sq"),
+            Val::from(ValEnum::Number(Number::Integer(9))),
+        );
+        rt.register_module("geometry", Val::record(fields));
+
+        let block = ast_from_str("import geometry as { sq }");
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        match frame.get_var("sq", &mut rt).unpack() {
+            ValEnum::Number(Number::Integer(i)) => assert_eq!(i, 9),
+            _ => panic!("expected sq destructured from the module"),
+        }
+        // the module itself isn't bound under its own name when destructured
+        assert!(!frame.get_var("geometry", &mut rt).is_init());
+    }
+
+    #[test]
+    fn import_unknown_module_errors() {
+        let mut rt = Runtime::new();
+        let block = ast_from_str("import nonexistent_raft_test_module");
+        let frame = Rc::new(Frame::new());
+        assert!(rt.exec_block(block.stmts(), frame).is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn import_finds_and_loads_raft_file_from_module_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "raft-import-test-{}-{}",
+            std::process::id(),
+            "finds_and_loads"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("geometry.raft"),
+            "pi = 3\nfn sq x:\n    return x * x\nexport { pi, sq }\n",
+        )
+        .unwrap();
+
+        let mut rt = Runtime::new();
+        rt.add_module_dir(dir.clone());
+
+        let block = ast_from_str("import geometry\nnine = geometry.sq 3");
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        match frame.get_var("nine", &mut rt).unpack() {
+            ValEnum::Number(Number::Integer(i)) => assert_eq!(i, 9),
+            _ => panic!("expected geometry.sq 3 == 9"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_works_inside_compiled_fn() {
+        // `import` inside a compiled `fn` body compiles to a call to the
+        // `vm::ImportFn` builtin (see `vm::Compiler::compile_stmt`'s
+        // `StmtKind::Import` arm) rather than rejecting - see
+        // `vm::tests::import_compiles_to_a_call` for the white-box check
+        // that this actually compiled rather than silently falling back.
+        let mut rt = Runtime::new();
+        rt.set_compile_fns(true);
+        rt.register_module("geometry", Val::record(FixedHashMap::default()));
+
+        let block = ast_from_str("fn f:\n    import geometry\n    return geometry\nr = (f)\n");
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        assert!(matches!(
+            frame.get_var("r", &mut rt).unpack(),
+            ValEnum::Record(_)
+        ));
+    }
+
+    #[test]
+    fn import_with_record_pattern_compiles_when_capturing() {
+        // a compiled function that both owns a captured-frame (something
+        // nested reads one of its locals) AND destructures anywhere still
+        // compiles - `Instr::Bind` targets the captured slot directly
+        // (`CompiledPat::CapVar`) instead of a stack slot. This is a
+        // black-box check that the *result* is correct (`Val`'s `Debug`
+        // doesn't distinguish compiled from walked `Fn` values, so it can't
+        // check *how* it ran); `vm::tests::
+        // import_record_pattern_compiles_when_capturing` white-box-checks
+        // that it actually compiled.
+        let mut rt = Runtime::new();
+        rt.set_compile_fns(true);
+        let mut fields = FixedHashMap::default();
+        fields.insert(
+            RcStr::new("sq"),
+            Val::from(ValEnum::Number(Number::Integer(9))),
+        );
+        rt.register_module("geometry", Val::record(fields));
+
+        let src = "\
+fn f:
+    import geometry as { sq }
+    fn g:
+        return sq
+    return (g)
+r = (f)
+";
+        let block = ast_from_str(src);
+        let frame = Rc::new(Frame::new());
+        rt.exec_block(block.stmts(), frame.clone()).unwrap();
+
+        let fval = frame.get_var("f", &mut rt);
+        assert_ne!(
+            alloc::format!("{fval:?}"),
+            "<fn 0>",
+            "expected f to fall back to the walker, not compile"
+        );
+
+        match frame.get_var("r", &mut rt).unpack() {
+            ValEnum::Number(Number::Integer(i)) => assert_eq!(i, 9),
+            _ => panic!("expected g's captured read of sq to see 9"),
+        }
     }
 }

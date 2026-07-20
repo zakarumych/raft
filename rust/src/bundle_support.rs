@@ -7,6 +7,11 @@
 // only here (`Val::into_ffi`/`Val::from_ffi`); generated module code never
 // touches a raw value.
 
+use alloc::{format, boxed::Box};
+use core::{cell::{Cell, RefCell, UnsafeCell}, cmp::Ordering, pin::Pin, future::Future, task::Poll};
+
+use raft_core::{ffi, AtomId, CoroKind, CoroStatus, Coroutine, Function, Number, RcCoro, RcFn, RcStr, RuntimeError, Val, ValEnum, ValsIter, ValsIterStep};
+
 struct BundleState {
     /// The host's callback table. Only the *function pointers* are ever
     /// used after init - `RaftFFIHost::raw` is valid during the init call
@@ -210,21 +215,21 @@ pub struct GenYield<'a> {
     value: Option<Val>,
 }
 
-impl core::future::Future for GenYield<'_> {
+impl Future for GenYield<'_> {
     type Output = ();
 
     fn poll(
-        self: core::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<()> {
+    ) -> Poll<()> {
         // no self-references - `GenYield` is trivially `Unpin`
         let this = self.get_mut();
         match this.value.take() {
             Some(v) => {
                 this.co.yielded.set(Some(v));
-                core::task::Poll::Pending
+                Poll::Pending
             }
-            None => core::task::Poll::Ready(()),
+            None => Poll::Ready(()),
         }
     }
 }
@@ -243,19 +248,19 @@ pub struct GenStart {
     polled: bool,
 }
 
-impl core::future::Future for GenStart {
+impl Future for GenStart {
     type Output = ();
 
     fn poll(
-        self: core::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<()> {
+    ) -> Poll<()> {
         let this = self.get_mut();
         if this.polled {
-            core::task::Poll::Ready(())
+            Poll::Ready(())
         } else {
             this.polled = true;
-            core::task::Poll::Pending
+            Poll::Pending
         }
     }
 }
@@ -264,7 +269,7 @@ pub fn gen_start() -> GenStart {
     GenStart { polled: false }
 }
 
-type GenFut = core::pin::Pin<Box<dyn core::future::Future<Output = Result<Val, RuntimeError>>>>;
+type GenFut = Pin<Box<dyn Future<Output = Result<Val, RuntimeError>>>>;
 
 /// One poll of a generator/async-fn body with the co's host pointer live
 /// for its duration. Polls with the host's ambient waker (the executor's
@@ -275,7 +280,7 @@ fn poll_gen(
     co: &GenCo,
     host: &mut Host,
     fut: &mut GenFut,
-) -> core::task::Poll<Result<Val, RuntimeError>> {
+) -> Poll<Result<Val, RuntimeError>> {
     co.host.set(host.as_raw());
     let waker = host.rust_waker();
     let mut cx = core::task::Context::from_waker(&waker);
@@ -313,7 +318,7 @@ impl Coroutine for TranspiledCoro {
             return CoroStatus::Done;
         };
         match poll_gen(&self.co, host, &mut fut) {
-            core::task::Poll::Pending => match self.kind {
+            Poll::Pending => match self.kind {
                 // a generator body suspends only at yields (the creation
                 // prime consumed `gen_start`), so the value is in the co
                 CoroKind::Gen => {
@@ -342,7 +347,7 @@ impl Coroutine for TranspiledCoro {
                     }
                 }
             },
-            core::task::Poll::Ready(Ok(v)) => match self.kind {
+            Poll::Ready(Ok(v)) => match self.kind {
                 // a generator's return value is discarded - the end
                 // itself is the signal
                 CoroKind::Gen | CoroKind::AsyncGen => CoroStatus::Done,
@@ -354,7 +359,7 @@ impl Coroutine for TranspiledCoro {
                     CoroStatus::Yielded
                 }
             },
-            core::task::Poll::Ready(Err(e)) => {
+            Poll::Ready(Err(e)) => {
                 report_error(host, &e);
                 CoroStatus::Done
             }
@@ -374,12 +379,12 @@ pub fn coro_create(
 ) -> Result<Val, RuntimeError> {
     let mut fut = fut;
     let (fut, resolved) = match poll_gen(&co, host, &mut fut) {
-        core::task::Poll::Pending => (Some(fut), None),
-        core::task::Poll::Ready(Err(e)) => return Err(e),
+        Poll::Pending => (Some(fut), None),
+        Poll::Ready(Err(e)) => return Err(e),
         // ran to completion while priming (a body that never suspends):
         // a generator is simply exhausted; an async resolution is handed
         // to the first real resume
-        core::task::Poll::Ready(Ok(v)) => match kind {
+        Poll::Ready(Ok(v)) => match kind {
             CoroKind::Gen | CoroKind::AsyncGen => (None, None),
             CoroKind::Async => (None, Some(v)),
         },
@@ -403,37 +408,37 @@ pub struct AwaitVal<'a> {
     target: RcCoro,
 }
 
-impl core::future::Future for AwaitVal<'_> {
+impl Future for AwaitVal<'_> {
     type Output = Result<Val, RuntimeError>;
 
     fn poll(
-        self: core::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
+    ) -> Poll<Self::Output> {
         // no self-references - `AwaitVal` is trivially `Unpin`
         let this = self.get_mut();
         let mut host = co_host(this.co);
         match this.target.resume(&mut host, 0) {
             // the leaf that reported pending grabbed the ambient waker
             // itself; nothing to register here
-            CoroStatus::Pending => core::task::Poll::Pending,
+            CoroStatus::Pending => Poll::Pending,
             CoroStatus::Yielded => {
                 let v = host.stack().pop();
                 match this.target.resume(&mut host, 0) {
                     CoroStatus::Done => match check_host_error(&mut host) {
-                        Ok(()) => core::task::Poll::Ready(Ok(v)),
-                        Err(e) => core::task::Poll::Ready(Err(e)),
+                        Ok(()) => Poll::Ready(Ok(v)),
+                        Err(e) => Poll::Ready(Err(e)),
                     },
-                    _ => core::task::Poll::Ready(Err(RuntimeError::Other(
+                    _ => Poll::Ready(Err(RuntimeError::Other(
                         "async coroutine yielded more than once".into(),
                     ))),
                 }
             }
             CoroStatus::Done => match check_host_error(&mut host) {
-                Ok(()) => core::task::Poll::Ready(Err(RuntimeError::Other(
+                Ok(()) => Poll::Ready(Err(RuntimeError::Other(
                     "async coroutine finished without a result".into(),
                 ))),
-                Err(e) => core::task::Poll::Ready(Err(e)),
+                Err(e) => Poll::Ready(Err(e)),
             },
         }
     }
@@ -481,24 +486,24 @@ pub struct IterNextFut<'a> {
     iter: &'a mut ValsIter,
 }
 
-impl core::future::Future for IterNextFut<'_> {
+impl Future for IterNextFut<'_> {
     type Output = Result<Option<Val>, RuntimeError>;
 
     fn poll(
-        self: core::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
+    ) -> Poll<Self::Output> {
         // no self-references - `IterNextFut` is trivially `Unpin`
         let this = self.get_mut();
         let mut host = co_host(this.co);
         match this.iter.step(&mut host) {
-            Err(e) => core::task::Poll::Ready(Err(e)),
-            Ok(ValsIterStep::Item(v)) => core::task::Poll::Ready(Ok(Some(v))),
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(ValsIterStep::Item(v)) => Poll::Ready(Ok(Some(v))),
             Ok(ValsIterStep::End) => match check_host_error(&mut host) {
-                Ok(()) => core::task::Poll::Ready(Ok(None)),
-                Err(e) => core::task::Poll::Ready(Err(e)),
+                Ok(()) => Poll::Ready(Ok(None)),
+                Err(e) => Poll::Ready(Err(e)),
             },
-            Ok(ValsIterStep::Pending) => core::task::Poll::Pending,
+            Ok(ValsIterStep::Pending) => Poll::Pending,
         }
     }
 }

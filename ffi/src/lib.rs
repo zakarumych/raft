@@ -6,7 +6,7 @@ use core::{cell::Cell, ffi::c_void, ptr::NonNull, sync::atomic::AtomicUsize};
 pub type Void = c_void;
 
 #[repr(C)]
-pub struct LenVal {
+pub struct RawStringVal {
     pub len: usize,
     pub val: [u8; 0],
 }
@@ -50,10 +50,10 @@ pub struct RawVec<T> {
 pub type RawStack = RawVec<RawVal>;
 
 /// A list's backing store: elements, growable in place (see [`RawVec`]).
-pub type ListVal = RawVec<RawVal>;
+pub type RawListVal = RawVec<RawVal>;
 
 /// A record's backing store: name/value fields, growable in place.
-pub type RecordVal = RawVec<RawFieldVal>;
+pub type RawRecordVal = RawVec<RawFieldVal>;
 
 #[repr(C)]
 pub struct RawHost {
@@ -78,12 +78,12 @@ pub type SwapByNameFn = unsafe extern "C" fn(VoidPtr, *const u8, usize, RawVal) 
 pub type PushFn = unsafe extern "C" fn(VoidPtr, RawVal);
 pub type PopFn = unsafe extern "C" fn(VoidPtr) -> RawVal;
 pub type StackGrowFn = unsafe extern "C" fn(*mut RawStack, usize);
-pub type CallFn = unsafe extern "C" fn(VoidPtr, usize, *mut RawHost) -> usize;
+pub type CallFn = unsafe extern "C" fn(RcPtr<Void>, usize, *mut RawHost) -> usize;
 
 /// Resume a coroutine with `args` arguments on the stack (0 for today's
 /// generator and async kinds), returning a [`CORO_DONE`]/[`CORO_YIELD`]/
 /// [`CORO_PENDING`] status byte.
-pub type CoroResumeFn = unsafe extern "C" fn(VoidPtr, usize, *mut RawHost) -> u8;
+pub type CoroResumeFn = unsafe extern "C" fn(RcPtr<Void>, usize, *mut RawHost) -> u8;
 
 /// The coroutine finished. Nothing was pushed; resuming again keeps
 /// returning this and does nothing. A failed coroutine also finishes this
@@ -299,7 +299,7 @@ impl RawVal {
 ///
 /// On initialization, the bundle must check that the version of the FFI crate it was compiled against
 /// matches the version of the FFI crate in the host process.
-pub const FFI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+pub const FFI_VERSION: &core::ffi::CStr = unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) };
 
 /// Intern a name (`ptr`/`len` UTF-8 bytes) in the host, returning its id -
 /// a `StringId` for identifier names, an `AtomId` for atom names.
@@ -359,12 +359,18 @@ pub type RaftFFIVersionFn = unsafe extern "C" fn() -> *const u8;
 
 /// Type signature for the function that initializes the Raft bundle in the cdylib.
 pub type RaftFFIInitBundleFn =
-    unsafe extern "C" fn(&mut RaftFFIBundle, &RaftFFIHost, *mut u8, i32) -> i32;
+    unsafe extern "C" fn(&mut RaftFFIBundle, &RaftFFIHost, *mut u8, usize) -> i32;
+
+/// Type signature for the function that returns the name of a module in the Raft bundle, given its index.
+/// If index is out of bounds, the function writes a null pointer.
+pub type RaftFFIModuleNameFn = unsafe extern "C" fn(u32, *mut *const u8) -> usize;
 
 /// Name of the function that initializes the Raft bundle in the cdylib.
 pub const INIT_RAFT_BUNDLE_FN_NAME: &str = "raft_ffi_init_bundle";
 
 pub const FFI_VERSION_STATIC_NAME: &str = "raft_ffi_version";
+
+pub const MODULE_NAME_FN_NAME: &str = "raft_ffi_module_name";
 
 #[doc(hidden)]
 pub mod for_macro {
@@ -372,8 +378,8 @@ pub mod for_macro {
 
     struct ErrorBuffer {
         buf: *mut u8,
-        len: i32,
-        used: i32,
+        len: usize,
+        used: usize,
     }
 
     impl Write for ErrorBuffer {
@@ -389,17 +395,17 @@ pub mod for_macro {
                     fitting_len,
                 );
             }
-            self.used += fitting_len as i32;
+            self.used += fitting_len;
             Ok(())
         }
     }
 
     pub trait InitResult {
-        fn into_code(self, error_buf: *mut u8, error_buf_len: i32) -> i32;
+        fn into_code(self, error_buf: *mut u8, error_buf_len: usize) -> i32;
     }
 
     impl InitResult for () {
-        fn into_code(self, _error_buf: *mut u8, _error_buf_len: i32) -> i32 {
+        fn into_code(self, _error_buf: *mut u8, _error_buf_len: usize) -> i32 {
             0
         }
     }
@@ -408,7 +414,7 @@ pub mod for_macro {
     where
         T: core::fmt::Display,
     {
-        fn into_code(self, error_buf: *mut u8, error_buf_len: i32) -> i32 {
+        fn into_code(self, error_buf: *mut u8, error_buf_len: usize) -> i32 {
             match self {
                 Ok(_) => 0,
                 Err(code) => {
@@ -418,7 +424,7 @@ pub mod for_macro {
                         used: 0,
                     };
                     let _ = core::write!(&mut buf, "{}", code);
-                    -buf.used
+                    -(buf.used as i32)
                 }
             }
         }
@@ -427,7 +433,7 @@ pub mod for_macro {
 
 #[macro_export]
 macro_rules! raft_bundle {
-    (($bundle:pat, $host:pat) => $code:block) => {
+    ([ $($module:literal),+ $(,)? ] ($bundle:pat, $host:pat) => $code:block) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn raft_ffi_version() -> *const u8 {
             const _: $crate::RaftFFIVersionFn = raft_ffi_version;
@@ -435,12 +441,28 @@ macro_rules! raft_bundle {
             $crate::FFI_VERSION.as_ptr()
         }
 
+        pub unsafe extern "C" fn raft_ffi_module_name(idx: u32, ptr: *mut *const u8) -> usize {
+            const _: $crate::RaftFFIModuleNameFn = raft_ffi_module_name;
+            const MODULE_NAMES: &'static [&'static str] = &[$($module),+];
+            match usize::try_from(idx) {
+                Some(idx) if idx < MODULE_NAMES.len() => {
+                    let name = MODULE_NAMES[idx];
+                    *ptr = name.as_ptr();
+                    name.len()
+                }
+                _ => {
+                    *ptr = core::ptr::null();
+                    0
+                }
+            }
+        }
+
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn raft_ffi_init_bundle(
             bundle: &mut $crate::RaftFFIBundle,
             host: &$crate::RaftFFIHost,
             error_buf: *mut u8,
-            error_buf_len: i32,
+            error_buf_len: usize,
         ) -> i32 {
             const _: $crate::RaftFFIInitBundleFn = raft_ffi_init_bundle;
 

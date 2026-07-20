@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-std = ["raft-ast/std", "amity/parking_lot"]
+std = ["raft-ast/std", "amity/parking_lot", "raft-core/std"]
 # Transpiled-bundle support: Runtime can generate bundle crates from Raft
 # sources (via raft-rust), build them with cargo, and link the produced
 # cdylibs (holding them for its own lifetime).
