@@ -46,7 +46,7 @@ pub use self::{
     host::{Host, Stack},
     iter::{IterVals, ValsIter, ValsIterStep},
     list::RcList,
-    num::Number,
+    num::{Number, float_int_cmp, float_int_eq},
     opaque::{RcOpaque, erase},
     rc::{DynRc, Rc},
     record::RcRecord,

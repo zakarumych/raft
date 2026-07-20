@@ -204,12 +204,12 @@ impl PartialOrd<Number> for f64 {
     }
 }
 
-fn float_int_cmp(f: f64, i: i64) -> Option<Ordering> {
+pub fn float_int_cmp(f: f64, i: i64) -> Option<Ordering> {
     if f.is_nan() {
         return None;
     }
 
-    let upper_bound = (i64::MAX as u64 + 1) as f64;
+    let upper_bound = -(i64::MIN as f64);
     let lower_bound = i64::MIN as f64;
 
     if f >= upper_bound {
@@ -233,12 +233,12 @@ fn float_int_cmp(f: f64, i: i64) -> Option<Ordering> {
     }
 }
 
-fn float_int_eq(f: f64, i: i64) -> bool {
+pub fn float_int_eq(f: f64, i: i64) -> bool {
     if f.is_nan() {
         return false;
     }
 
-    let upper_bound = (i64::MAX as u64 + 1) as f64;
+    let upper_bound = -(i64::MIN as f64);
     let lower_bound = i64::MIN as f64;
 
     if f >= upper_bound {

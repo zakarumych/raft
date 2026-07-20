@@ -299,7 +299,11 @@ impl RawVal {
 ///
 /// On initialization, the bundle must check that the version of the FFI crate it was compiled against
 /// matches the version of the FFI crate in the host process.
-pub const FFI_VERSION: &core::ffi::CStr = unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) };
+pub const FFI_VERSION: &core::ffi::CStr = unsafe {
+    core::ffi::CStr::from_bytes_with_nul_unchecked(
+        concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes(),
+    )
+};
 
 /// Intern a name (`ptr`/`len` UTF-8 bytes) in the host, returning its id -
 /// a `StringId` for identifier names, an `AtomId` for atom names.
@@ -438,20 +442,21 @@ macro_rules! raft_bundle {
         pub unsafe extern "C" fn raft_ffi_version() -> *const u8 {
             const _: $crate::RaftFFIVersionFn = raft_ffi_version;
 
-            $crate::FFI_VERSION.as_ptr()
+            $crate::FFI_VERSION.as_ptr() as *const u8
         }
 
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn raft_ffi_module_name(idx: u32, ptr: *mut *const u8) -> usize {
             const _: $crate::RaftFFIModuleNameFn = raft_ffi_module_name;
             const MODULE_NAMES: &'static [&'static str] = &[$($module),+];
             match usize::try_from(idx) {
-                Some(idx) if idx < MODULE_NAMES.len() => {
+                Ok(idx) if idx < MODULE_NAMES.len() => {
                     let name = MODULE_NAMES[idx];
-                    *ptr = name.as_ptr();
+                    unsafe { *ptr = name.as_ptr(); }
                     name.len()
                 }
                 _ => {
-                    *ptr = core::ptr::null();
+                    unsafe { *ptr = core::ptr::null(); }
                     0
                 }
             }

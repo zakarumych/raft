@@ -4,13 +4,22 @@
 // walker: `apply`/`call_bare` are `apply_value_ast`/`call_ast`, and the
 // `field_of`/`assign_index`/comparison helpers copy the walker's shared
 // semantics helpers verbatim. `Val`s cross the FFI boundary as `RawVal`
-// only here (`Val::into_ffi`/`Val::from_ffi`); generated module code never
+// only here (`Val::into_raw`/`Val::from_raw`); generated module code never
 // touches a raw value.
 
-use alloc::{format, boxed::Box};
-use core::{cell::{Cell, RefCell, UnsafeCell}, cmp::Ordering, pin::Pin, future::Future, task::Poll};
+use alloc::{boxed::Box, format};
+use core::{
+    cell::{Cell, RefCell, UnsafeCell},
+    cmp::Ordering,
+    future::Future,
+    pin::Pin,
+    task::Poll,
+};
 
-use raft_core::{ffi, AtomId, CoroKind, CoroStatus, Coroutine, Function, Number, RcCoro, RcFn, RcStr, RuntimeError, Val, ValEnum, ValsIter, ValsIterStep};
+use raft_core::{
+    AtomId, CoroKind, CoroStatus, Coroutine, Function, Host, Number, Rc, RcCoro, RcFn, RcStr,
+    RuntimeError, Val, ValEnum, ValsIter, ValsIterStep, ffi,
+};
 
 struct BundleState {
     /// The host's callback table. Only the *function pointers* are ever
@@ -81,7 +90,7 @@ pub fn global_get(host_view: &mut Host<'_>, idx: u32) -> Val {
     // then crossing into the host's `GetVarFn` ABI with the live host
     // pointer; ownership of the returned value transfers to us.
     unsafe {
-        Val::from_ffi((h.getvar)(
+        Val::from_raw((h.getvar)(
             host_view.as_raw(),
             (*STATE.name_ids.get())[idx as usize],
         ))
@@ -99,7 +108,7 @@ pub fn report_error(host_view: &mut Host<'_>, e: &RuntimeError) {
     let msg = Val::string(&format!("{e}"));
     // SAFETY: crossing into the host's `SetErrorFn` ABI with the live host
     // pointer; ownership of the message transfers to the host.
-    unsafe { (h.set_error)(host_view.as_raw(), msg.into_ffi()) }
+    unsafe { (h.set_error)(host_view.as_raw(), msg.into_raw()) }
 }
 
 /// Did the last dispatched call leave the host in an error state? Takes
@@ -111,7 +120,7 @@ fn check_host_error(host_view: &mut Host<'_>) -> Result<(), RuntimeError> {
     // SAFETY: crossing into the host's `TakeErrorFn` ABI with the live
     // host pointer; ownership of the returned message (if any) transfers
     // to us.
-    let pending = unsafe { Val::from_ffi((h.take_error)(host_view.as_raw())) };
+    let pending = unsafe { Val::from_raw((h.take_error)(host_view.as_raw())) };
     if pending.is_init() {
         Err(RuntimeError::Other(format!("{pending}").into()))
     } else {
@@ -218,10 +227,7 @@ pub struct GenYield<'a> {
 impl Future for GenYield<'_> {
     type Output = ();
 
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> Poll<()> {
         // no self-references - `GenYield` is trivially `Unpin`
         let this = self.get_mut();
         match this.value.take() {
@@ -251,10 +257,7 @@ pub struct GenStart {
 impl Future for GenStart {
     type Output = ();
 
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if this.polled {
             Poll::Ready(())
@@ -276,11 +279,7 @@ type GenFut = Pin<Box<dyn Future<Output = Result<Val, RuntimeError>>>>;
 /// task waker during an async poll) so ordinary Rust futures awaited
 /// inside the body wake the right task; generator resumes have no ambient
 /// waker and get the noop.
-fn poll_gen(
-    co: &GenCo,
-    host: &mut Host,
-    fut: &mut GenFut,
-) -> Poll<Result<Val, RuntimeError>> {
+fn poll_gen(co: &GenCo, host: &mut Host, fut: &mut GenFut) -> Poll<Result<Val, RuntimeError>> {
     co.host.set(host.as_raw());
     let waker = host.rust_waker();
     let mut cx = core::task::Context::from_waker(&waker);
@@ -411,10 +410,7 @@ pub struct AwaitVal<'a> {
 impl Future for AwaitVal<'_> {
     type Output = Result<Val, RuntimeError>;
 
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
         // no self-references - `AwaitVal` is trivially `Unpin`
         let this = self.get_mut();
         let mut host = co_host(this.co);
@@ -489,10 +485,7 @@ pub struct IterNextFut<'a> {
 impl Future for IterNextFut<'_> {
     type Output = Result<Option<Val>, RuntimeError>;
 
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
         // no self-references - `IterNextFut` is trivially `Unpin`
         let this = self.get_mut();
         let mut host = co_host(this.co);
@@ -733,14 +726,7 @@ pub fn match_number(pat: &NumberPat, v: &Val) -> bool {
         (NumberPat::Float(p), Number::Float(f)) => *p == f || (p.is_nan() && f.is_nan()),
         (NumberPat::Float(_), Number::Integer(_)) => false,
         (NumberPat::Numeric(p), Number::Integer(i)) => *p == i,
-        (NumberPat::Numeric(p), Number::Float(f)) => {
-            // integral f64 values in [-2^63, 2^63) convert to i64 exactly;
-            // the range guard keeps `as`-cast saturation from faking
-            // equality (2^63 is not i64::MAX)
-            const LO: f64 = i64::MIN as f64; // -2^63, exactly representable
-            const HI: f64 = -(i64::MIN as f64); // 2^63
-            f.is_finite() && f.fract() == 0.0 && f >= LO && f < HI && (f as i64) == *p
-        }
+        (NumberPat::Numeric(p), Number::Float(f)) => raft_core::float_int_eq(f, *p),
         (NumberPat::Never, _) => false,
     }
 }
